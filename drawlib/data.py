@@ -9,7 +9,7 @@ import warp as wp
 
 
 class PointCloudData:
-    NUM_POINTS    = 250_000
+    NUM_POINTS    = 1_000_000
     CUBE_HALF     = 1.0
     INITIAL_SPEED = 0.05   # small random starting velocity magnitude
 

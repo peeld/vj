@@ -44,6 +44,30 @@ import warp as wp
 from drawlib.warp_feedback import FeedbackLoop, FeedbackParams, SMEAR_PATTERNS
 
 
+# ── Fullscreen-quad shaders (shared by all effects that blit to screen) ────────
+
+_QUAD_VERT = """
+#version 330
+in vec2 in_pos;
+out vec2 uv;
+void main() {
+    uv = vec2(in_pos.x * 0.5 + 0.5,
+              0.5 - in_pos.y * 0.5);
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+}
+"""
+_QUAD_FRAG = """
+#version 330
+uniform sampler2D tex;
+in  vec2 uv;
+out vec4 f_color;
+void main() { f_color = texture(tex, uv); }
+"""
+
+_QUAD_VERTS = np.array(
+    [-1.0, -1.0,  1.0, -1.0,  -1.0,  1.0,  1.0,  1.0], dtype=np.float32
+)
+
 # ── Warp device ────────────────────────────────────────────────────────────────
 wp.init()
 DEVICE = "cuda" if wp.get_cuda_device_count() > 0 else "cpu"
@@ -227,12 +251,15 @@ class FeedbackPostEffect(PostEffect):
         self._blend_mode_idx = BLEND_MODES.index(blend_mode) \
                                if blend_mode in BLEND_MODES else 0
 
-        self._ctx:         moderngl.Context  | None = None
-        self._loop:        FeedbackLoop      | None = None
-        self._display_tex: moderngl.Texture  | None = None
-        self._scene_gpu:   wp.array          | None = None  # float32 RGBA, top-down
-        self._raw_gpu:     wp.array          | None = None  # uint8  RGBA, bottom-up (GL)
-        self._result_u8:   wp.array          | None = None  # uint8  RGB,  no alpha
+        self._ctx:         moderngl.Context       | None = None
+        self._loop:        FeedbackLoop           | None = None
+        self._display_tex: moderngl.Texture       | None = None
+        self._fbo:         moderngl.Framebuffer   | None = None
+        self._quad_prog:   moderngl.Program       | None = None
+        self._quad_vao:    moderngl.VertexArray   | None = None
+        self._scene_gpu:   wp.array               | None = None  # float32 RGBA, top-down
+        self._raw_gpu:     wp.array               | None = None  # uint8  RGBA, bottom-up (GL)
+        self._result_u8:   wp.array               | None = None  # uint8  RGB,  no alpha
 
     # ── PostEffect interface ──────────────────────────────────────────────────
 
@@ -242,6 +269,8 @@ class FeedbackPostEffect(PostEffect):
         self._display_tex = ctx.texture((w, h), 3)
         self._loop.set_smear_pattern(self._smear_pattern_name)
         self._alloc_scratch(w, h)
+        self._build_fbo(w, h)
+        self._build_quad(ctx)
 
     def _alloc_scratch(self, w: int, h: int) -> None:
         """Pre-allocate per-frame scratch buffers so process() does zero allocation."""
@@ -249,6 +278,37 @@ class FeedbackPostEffect(PostEffect):
         self._raw_gpu   = wp.zeros(n * 4, dtype=wp.uint8,   device=DEVICE)
         self._scene_gpu = wp.zeros(n * 4, dtype=wp.float32, device=DEVICE)
         self._result_u8 = wp.zeros(n * 3, dtype=wp.uint8,   device=DEVICE)
+
+    def _build_fbo(self, w: int, h: int) -> None:
+        self._fbo = self._ctx.framebuffer(
+            color_attachments=[self._ctx.texture((w, h), 4)],
+            depth_attachment=self._ctx.depth_texture((w, h)),
+        )
+
+    def _build_quad(self, ctx: moderngl.Context) -> None:
+        vbo = ctx.buffer(_QUAD_VERTS.tobytes())
+        self._quad_prog = ctx.program(vertex_shader=_QUAD_VERT, fragment_shader=_QUAD_FRAG)
+        self._quad_vao  = ctx.vertex_array(self._quad_prog, [(vbo, "2f", "in_pos")])
+
+    @property
+    def fbo(self) -> moderngl.Framebuffer:
+        """Off-screen FBO. Bind it, draw the scene into it, then call blit_to_screen()."""
+        return self._fbo
+
+    def bind_scene_fbo(self) -> None:
+        """Activate the off-screen FBO and clear it, ready for scene drawing."""
+        self._fbo.use()
+        self._ctx.enable(moderngl.DEPTH_TEST)
+        self._ctx.clear(0.04, 0.04, 0.06, 1.0)
+
+    def blit_to_screen(self, screen: moderngl.Framebuffer) -> None:
+        """Blit the last processed texture to *screen* via the fullscreen quad."""
+        screen.use()
+        self._ctx.disable(moderngl.DEPTH_TEST)
+        self._ctx.clear(0.0, 0.0, 0.0, 1.0)
+        self._display_tex.use(0)
+        self._quad_prog["tex"].value = 0
+        self._quad_vao.render(moderngl.TRIANGLE_STRIP)
 
     def process(
         self,
@@ -300,6 +360,7 @@ class FeedbackPostEffect(PostEffect):
         self._loop.set_smear_pattern(self._smear_pattern_name)
         if self._ctx is not None:
             self._display_tex = self._ctx.texture((w, h), 3)
+            self._build_fbo(w, h)
         self._alloc_scratch(w, h)
 
     def on_key(self, key, action, keys) -> None:

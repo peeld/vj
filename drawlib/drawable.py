@@ -339,3 +339,42 @@ class ShapeDrawable(Drawable):
         self.prog["mvp"].write(mvp.tobytes())
         self.prog["point_size"].value = point_size
         self.vao.render(moderngl.POINTS)
+
+
+# ---------------------------------------------------------------------------
+# Ribbons  (filled triangle-mesh strips — same shader as Lines)
+# ---------------------------------------------------------------------------
+
+class RibbonDrawable(Drawable):
+    """
+    Renders filled quad-strip ribbons as indexed triangles.
+    Same vertex shader as LinesDrawable; just uses TRIANGLES mode.
+    Geometry is static (CPU-built once); regenerate by calling setup() again.
+    """
+
+    def setup(self, vertices: np.ndarray, colors: np.ndarray, indices: np.ndarray):
+        self.prog = self.ctx.program(
+            vertex_shader=_LINES_VERT,
+            fragment_shader=_LINES_FRAG,
+        )
+        self._vbo_pos = self.ctx.buffer(vertices.tobytes())
+        self._vbo_col = self.ctx.buffer(colors.tobytes())
+        self._ibo     = self.ctx.buffer(indices.tobytes())
+        self.vao = self.ctx.vertex_array(
+            self.prog,
+            [
+                (self._vbo_pos, "3f", "in_position"),
+                (self._vbo_col, "4f", "in_color"),
+            ],
+            self._ibo,
+        )
+
+    def update(self, vertices: np.ndarray = None, colors: np.ndarray = None):
+        if vertices is not None:
+            self._vbo_pos.write(vertices.tobytes())
+        if colors is not None:
+            self._vbo_col.write(colors.tobytes())
+
+    def draw(self, mvp: np.ndarray, **kwargs):
+        self.prog["mvp"].write(mvp.tobytes())
+        self.vao.render(moderngl.TRIANGLES)

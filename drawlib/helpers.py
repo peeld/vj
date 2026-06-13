@@ -142,3 +142,19 @@ def axes(
     indices = np.array([0, 1,  2, 3,  4, 5], dtype=np.uint32)
 
     return verts, colors, indices
+
+
+def build_wireframe(half: float):
+    """Return (vertices, colors, indices) numpy arrays for a unit wireframe cube."""
+    h = half
+    vertices = np.array([
+        [-h,-h,-h], [ h,-h,-h], [ h, h,-h], [-h, h,-h],
+        [-h,-h, h], [ h,-h, h], [ h, h, h], [-h, h, h],
+    ], dtype=np.float32)
+    indices = np.array([
+        0,1, 1,2, 2,3, 3,0,
+        4,5, 5,6, 6,7, 7,4,
+        0,4, 1,5, 2,6, 3,7,
+    ], dtype=np.uint32)
+    colors = np.full((8, 4), [1.0, 1.0, 1.0, 0.45], dtype=np.float32)
+    return vertices, colors, indices
