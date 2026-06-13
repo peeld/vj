@@ -1,8 +1,9 @@
 """
-gui3.py – CircleAxisGUI
+gui3.py - CircleAxisGUI
 Random-sized circles centred on the X axis (in YZ-planes perpendicular to it),
-with radial spokes through each circle and diagonal traversal lines woven
-between them.
+with diagonal traversal lines woven between them.  Each circle also has 64
+turbine-blade squares at its edge that fan-pitch from 0->360 degrees and spin
+continuously like a jet-engine fan.
 
 Controls:
   R          -- regenerate with a new seed
@@ -13,11 +14,11 @@ Controls:
   ESC        -- quit
 
 Post-effect tweaks (post-effect must be ON):
-  Z/X  -- scene blend ↓/↑     D/F  -- decay ↓/↑
-  Q/W  -- rotation ↓/↑        A/S  -- zoom ↓/↑
-  H/J  -- hue shift ↓/↑       C/V  -- chromatic aberration ↓/↑
-  B/N  -- saturation ↓/↑      K/L  -- smear ↓/↑
-  M    -- cycle smear pattern  G    -- cycle blend mode
+  Z/X  -- scene blend down/up   D/F  -- decay down/up
+  Q/W  -- rotation down/up      A/S  -- zoom down/up
+  H/J  -- hue shift down/up     C/V  -- chromatic aberration down/up
+  B/N  -- saturation down/up    K/L  -- smear down/up
+  M    -- cycle smear pattern   G    -- cycle blend mode
 """
 
 import colorsys
@@ -45,8 +46,15 @@ CIRCLE_HALF_W  = 0.0045
 SPOKE_HALF_W   = 0.0014
 LINE_HALF_W    = 0.0022
 
+# Turbine blade constants
+N_BLADES          = 64      # squares per circle
+BLADE_SIZE_FACTOR = 0.125   # blade side = radius * this
+BLADE_SPIN_SPEED  = 0.2     # radians / second
 
-# ── Feedback preset ─────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Feedback preset
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CircleParams(FeedbackParams):
@@ -63,7 +71,9 @@ class CircleParams(FeedbackParams):
     smear_strength   : float = 0.0
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _hsv(h: float, s: float, v: float, a: float = 1.0) -> np.ndarray:
     h = h % 1.0
@@ -98,8 +108,8 @@ def _width_dirs(tangents: np.ndarray) -> np.ndarray:
 
 
 def _ribbon_mesh(
-    pts:    np.ndarray,   # (N, 3)
-    colors: np.ndarray,   # (N, 4)
+    pts:    np.ndarray,
+    colors: np.ndarray,
     half_w: float,
     offset: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -138,13 +148,15 @@ def _ribbon_mesh(
     return verts, cols, idx
 
 
-# ── Geometry builders ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Geometry builders
+# ---------------------------------------------------------------------------
 
 def _circle_pts(cx: float, radius: float, n_seg: int, cy: float = 0.0) -> np.ndarray:
     """Closed circle in the YZ plane at x=cx, centred at (cx, cy, 0)."""
     theta = np.linspace(0.0, 2.0 * np.pi, n_seg + 1, dtype=np.float32)
     pts   = np.zeros((n_seg + 1, 3), dtype=np.float32)
-    pts[:, 0] = cx + cy  * 10
+    pts[:, 0] = cx + cy * 10
     pts[:, 1] = radius * np.cos(theta)
     pts[:, 2] = radius * np.sin(theta)
     return pts
@@ -167,25 +179,83 @@ def _ribbon_positions(pts: np.ndarray, half_w: float) -> np.ndarray:
     return verts
 
 
+def _blade_positions(cx: float, radius: float, spin_offset: float) -> np.ndarray:
+    """
+    Returns (N_BLADES * 4, 3) vertex positions for turbine-blade quads.
+
+    Each blade i:
+      - sits at angular position  theta_i = spin_offset + 2*pi*i/N_BLADES
+      - has blade-pitch angle     phi_i   = 2*pi*i/N_BLADES  (fans 0 to ~360 deg)
+
+    The pitch rotates the blade span axis from the X direction toward the
+    circle tangent direction, giving a turbine-blade appearance.
+
+    Vertex order per blade: [+pitch+radial, +pitch-radial, -pitch-radial, -pitch+radial]
+    Two triangles per blade: (0,1,2) and (0,2,3).
+    """
+    n  = N_BLADES
+    bi = np.arange(n, dtype=np.float32)
+
+    theta = spin_offset + 2.0 * np.pi * bi / n   # position around circle
+    phi   = 2.0 * np.pi * bi / n                  # blade pitch angle
+
+    hs = radius * BLADE_SIZE_FACTOR * 0.5          # half-side length
+
+    # Centre of each blade on the circumference  (n, 3)
+    P = np.zeros((n, 3), dtype=np.float32)
+    P[:, 0] = cx
+    P[:, 1] = radius * np.cos(theta)
+    P[:, 2] = radius * np.sin(theta)
+
+    # Radial unit vector (outward from circle centre)  (n, 3)
+    R = np.zeros((n, 3), dtype=np.float32)
+    R[:, 1] = np.cos(theta)
+    R[:, 2] = np.sin(theta)
+
+    # Tangent unit vector (CCW along circle in YZ plane)  (n, 3)
+    T = np.zeros((n, 3), dtype=np.float32)
+    T[:, 1] = -np.sin(theta)
+    T[:, 2] =  np.cos(theta)
+
+    # X-axis direction  (n, 3)
+    X_hat = np.zeros((n, 3), dtype=np.float32)
+    X_hat[:, 0] = 1.0
+
+    # Pitch direction: X rotated toward T by phi around R
+    c = np.cos(phi)[:, None]
+    s = np.sin(phi)[:, None]
+    pitch_dir = c * X_hat + s * T               # (n, 3)
+
+    # Four corners of each blade quad
+    c0 = P + hs * pitch_dir + hs * R
+    c1 = P + hs * pitch_dir - hs * R
+    c2 = P - hs * pitch_dir - hs * R
+    c3 = P - hs * pitch_dir + hs * R
+
+    corners = np.stack([c0, c1, c2, c3], axis=1)   # (n, 4, 3)
+    return corners.reshape(n * 4, 3).astype(np.float32)
+
+
 @dataclass
 class CircleAnimMeta:
-    cx:        float
-    radius:    float
-    phase:     float   # random phase offset (radians)
-    speed:     float   # angular speed (rad/s) — slow, lava-lamp
-    amplitude: float   # max displacement along X
-    n_verts:   int     # ribbon vertex count for this circle
+    cx:            float
+    radius:        float
+    phase:         float   # random phase offset (radians)
+    speed:         float   # angular speed (rad/s)
+    amplitude:     float   # max displacement along X
+    n_verts:       int     # ribbon vertex count for this circle
+    n_blade_verts: int     # = N_BLADES * 4
 
 
 @dataclass
 class TravAnimMeta:
-    x1:        float   # base x of endpoint 1
-    x2:        float   # base x of endpoint 2
-    y:         float   # shared Y (rv1 * cos(a1))
-    z:         float   # shared Z (rv1 * sin(a1))
+    x1:        float
+    x2:        float
+    y:         float
+    z:         float
     phase:     float
     speed:     float
-    amplitude: float   # max X shift
+    amplitude: float
 
 
 def build_geometry(
@@ -195,12 +265,14 @@ def build_geometry(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list, list]:
     """
     Returns (verts, colors, indices, circle_metas, trav_metas).
-    Both meta lists drive per-frame position rebuilds.
+
+    Vertex layout (must match _animated_positions exactly):
+      for each circle:  [circle ribbon verts]  [blade quad verts]
+      for each trav:    [line ribbon verts]
     """
     rng = np.random.default_rng(seed)
     pseed = int(seed) if seed is not None else 0
 
-    # Cool palette for circles/spokes; complementary warm palette for traverse lines.
     cool = generate_palette(ColorScheme.TRIADIC,       seed=pseed)
     warm = generate_palette(ColorScheme.COMPLEMENTARY, seed=pseed + 13)
     cool_hs = [colorsys.rgb_to_hsv(*rgb)[:2] for rgb in cool]
@@ -211,7 +283,7 @@ def build_geometry(
     all_idx:    list[np.ndarray] = []
     vert_offset = 0
 
-    def add(pts: np.ndarray, colors: np.ndarray, half_w: float) -> None:
+    def add_ribbon(pts: np.ndarray, colors: np.ndarray, half_w: float) -> None:
         nonlocal vert_offset
         if len(pts) < 2:
             return
@@ -221,35 +293,70 @@ def build_geometry(
         all_idx.append(ix)
         vert_offset += v.shape[0]
 
-    # ── Circles ──────────────────────────────────────────────────────────────
+    # Circles + turbine blades
     circle_metas: list[CircleAnimMeta] = []
 
     for ci in range(n_circles):
         cx     = float(rng.uniform(-bound * 0.88, bound * 0.88))
         radius = float(rng.uniform(0.04, bound * 0.88))
 
-        # Lava-lamp animation params — slow, each circle on its own clock
         phase     = float(rng.uniform(0.0, 2.0 * np.pi))
-        speed     = float(rng.uniform(0.08, 0.28))   # rad/s
+        speed     = float(rng.uniform(0.08, 0.28))
         amplitude = float(rng.uniform(0.04, 0.22))
 
-        pts = _circle_pts(cx, radius, N_SEG)  # cy=0 for initial build
-        t   = np.linspace(0.0, 1.0, len(pts), dtype=np.float32)
         bh, bs = cool_hs[ci % len(cool_hs)]
         bh = (bh + ci * 0.041) % 1.0
+
+        # Circle ribbon
+        pts = _circle_pts(cx, radius, N_SEG)
+        t   = np.linspace(0.0, 1.0, len(pts), dtype=np.float32)
         cols = np.stack([
             _hsv((bh + ti * 0.10) % 1.0, max(0.55, bs), 0.40 + 0.60 * ti)
             for ti in t
         ])
-        add(pts, cols, CIRCLE_HALF_W)
+        add_ribbon(pts, cols, CIRCLE_HALF_W)
+
+        # Turbine blade quads
+        blade_verts_init = _blade_positions(cx, radius, 0.0)
+
+        bi_arr  = np.arange(N_BLADES, dtype=np.float32)
+        phi_arr = 2.0 * np.pi * bi_arr / N_BLADES
+        # alpha slightly lower for edge-on blades (phi near 0 or pi)
+        face_alpha = (np.abs(np.sin(phi_arr)) * 0.35 + 0.65).astype(np.float32)
+
+        blade_colors = np.zeros((N_BLADES * 4, 4), dtype=np.float32)
+        for bi in range(N_BLADES):
+            blade_frac = bi / N_BLADES
+            col = _hsv(
+                (bh + blade_frac * 0.12) % 1.0,
+                min(1.0, bs + 0.15),
+                0.75 + 0.25 * blade_frac,
+                float(face_alpha[bi] * 0.1),
+            )
+            blade_colors[bi * 4 : bi * 4 + 4] = col
+
+        # Two triangles per blade: (0,1,2) and (0,2,3)
+        blade_idx = np.zeros(N_BLADES * 6, dtype=np.uint32)
+        for bi in range(N_BLADES):
+            base = vert_offset + bi * 4
+            o    = bi * 6
+            blade_idx[o]   = base;     blade_idx[o+1] = base + 1
+            blade_idx[o+2] = base + 2; blade_idx[o+3] = base
+            blade_idx[o+4] = base + 2; blade_idx[o+5] = base + 3
+
+        all_verts.append(blade_verts_init)
+        all_colors.append(blade_colors)
+        all_idx.append(blade_idx)
+        vert_offset += N_BLADES * 4
 
         circle_metas.append(CircleAnimMeta(
             cx=cx, radius=radius,
             phase=phase, speed=speed, amplitude=amplitude,
-            n_verts=(N_SEG + 1) * 2,  # ribbon doubles each source point
+            n_verts=(N_SEG + 1) * 2,
+            n_blade_verts=N_BLADES * 4,
         ))
 
-    # ── Traversal lines ──────────────────────────────────────────────────────
+    # Traversal lines
     trav_metas: list[TravAnimMeta] = []
 
     for li in range(N_TRAV_LINES):
@@ -276,7 +383,7 @@ def build_geometry(
             _hsv(lh, max(0.45, ls), 0.30 + 0.25 * lv),
             _hsv((lh + 0.09) % 1.0, max(0.45, ls), 0.90),
         ], dtype=np.float32)
-        add(pts, cols, LINE_HALF_W)
+        add_ribbon(pts, cols, LINE_HALF_W)
 
         trav_metas.append(TravAnimMeta(
             x1=x1, x2=x2, y=y, z=z,
@@ -292,7 +399,9 @@ def build_geometry(
     )
 
 
-# ── GUI ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
 
 class CircleAxisGUI(mglw.WindowConfig):
     title        = "Warp -- Circle Axis"
@@ -327,7 +436,7 @@ class CircleAxisGUI(mglw.WindowConfig):
         )
         self._post.setup(self.ctx, w, h)
 
-        print("[gui3] ready  —  R: regenerate  P: post-effect  O: orbit  ESC: quit")
+        print("[gui3] ready  --  R: regenerate  P: post-effect  O: orbit  ESC: quit")
 
     def _regen(self):
         if self._geo is None:
@@ -340,27 +449,41 @@ class CircleAxisGUI(mglw.WindowConfig):
         self._seed += 1
 
     def _animated_positions(self, t: float) -> np.ndarray:
-        """Rebuild all ribbon positions at time t."""
+        """
+        Rebuild all vertex positions at time t.
+
+        Order must exactly match build_geometry:
+          for each circle: [ribbon verts] [blade verts]
+          for each trav:   [ribbon verts]
+        """
         parts: list[np.ndarray] = []
+
         for m in self._circle_metas:
             cx  = m.cx + m.amplitude * np.sin(t * m.speed + m.phase) * 10
+
+            # Circle ribbon
             pts = _circle_pts(cx, m.radius, N_SEG)
             parts.append(_ribbon_positions(pts, CIRCLE_HALF_W))
+
+            # Turbine blades -- spin continuously
+            spin = t * BLADE_SPIN_SPEED
+            parts.append(_blade_positions(cx, m.radius, spin))
+
         for m in self._trav_metas:
             dx  = m.amplitude * np.sin(t * m.speed + m.phase) * 15
             p1  = np.array([m.x1 + dx, m.y, m.z], dtype=np.float32)
             p2  = np.array([m.x2 + dx, m.y, m.z], dtype=np.float32)
             pts = np.stack([p1, p2])
             parts.append(_ribbon_positions(pts, LINE_HALF_W))
+
         return np.vstack(parts).astype(np.float32)
 
-    # -- Per-frame ------------------------------------------------------------
+    # Per-frame
 
     def on_render(self, current_time: float, frame_time: float):
         self.camera.tick(frame_time)
         mvp = self.camera.mvp(self.window_size)
 
-        # Animate circle positions
         new_verts = self._animated_positions(current_time)
         self._geo.update(vertices=new_verts)
 
@@ -375,7 +498,7 @@ class CircleAxisGUI(mglw.WindowConfig):
             self.ctx.clear(0.04, 0.04, 0.06, 1.0)
             self._geo.draw(mvp)
 
-    # -- Input ----------------------------------------------------------------
+    # Input
 
     def on_mouse_press_event(self, x, y, button):
         if button == 1: self._drag = True
