@@ -5,51 +5,39 @@ Drawable base class and concrete drawables for points, lines, and shapes.
 Each Drawable owns its shader program and GPU buffers (VBO/VAO), but holds
 NO simulation data.
 
-Data flow — two paths:
-  write_warp(wp_array, ...)   GPU → GPU via CUDA-GL interop (preferred, zero CPU)
-  update(np_array, ...)       CPU → GPU fallback, or for static/one-shot uploads
+Data flow -- two paths:
+  write_warp(wp_array, ...)   GPU -> GPU via CUDA-GL interop (preferred, zero CPU)
+  update(np_array, ...)       CPU -> GPU fallback, or for static/one-shot uploads
 """
 
 from __future__ import annotations
-
 from abc import ABC, abstractmethod
-
 import numpy as np
 import moderngl
 import warp as wp
 
 
-# ---------------------------------------------------------------------------
-# Base
-# ---------------------------------------------------------------------------
-
 class Drawable(ABC):
-    """Abstract base: owns a shader program, VAO, and GPU buffers."""
-
     def __init__(self, ctx: moderngl.Context):
         self.ctx  = ctx
         self.prog: moderngl.Program     = None
         self.vao:  moderngl.VertexArray = None
 
     @abstractmethod
-    def setup(self, *args, **kwargs):
-        """Create shader, buffers, and VAO from initial numpy data."""
+    def setup(self, *args, **kwargs): ...
 
-    def update(self, *args, **kwargs):
-        """CPU → GPU: write numpy arrays into the GL buffers (fallback)."""
+    def update(self, *args, **kwargs): ...
 
     @abstractmethod
-    def draw(self, mvp: np.ndarray, **kwargs):
-        """Issue the draw call with the given MVP matrix."""
+    def draw(self, mvp: np.ndarray, **kwargs): ...
 
 
 def _register(gl_buffer: moderngl.Buffer) -> wp.RegisteredGLBuffer:
-    """Register an OpenGL buffer for CUDA-GL interop on the default CUDA device."""
     return wp.RegisteredGLBuffer(gl_buffer.glo, wp.get_preferred_device())
 
 
 # ---------------------------------------------------------------------------
-# Points  (flat round-disc point sprites — particle cloud)
+# Points
 # ---------------------------------------------------------------------------
 
 _POINTS_VERT = """
@@ -78,41 +66,27 @@ _POINTS_FRAG = """
 
 
 class PointsDrawable(Drawable):
-    """Renders a large set of small round point sprites."""
-
     def setup(self, positions: np.ndarray, colors: np.ndarray):
         self._n = len(positions)
-
-        self.prog = self.ctx.program(
-            vertex_shader=_POINTS_VERT,
-            fragment_shader=_POINTS_FRAG,
-        )
+        self.prog = self.ctx.program(vertex_shader=_POINTS_VERT, fragment_shader=_POINTS_FRAG)
         self._vbo_pos = self.ctx.buffer(positions.tobytes())
         self._vbo_col = self.ctx.buffer(colors.tobytes())
-        self.vao = self.ctx.vertex_array(
-            self.prog,
-            [
-                (self._vbo_pos, "3f", "in_position"),
-                (self._vbo_col, "4f", "in_color"),
-            ],
-        )
-
-        # Register GL buffers for CUDA-GL interop
+        self.vao = self.ctx.vertex_array(self.prog, [
+            (self._vbo_pos, "3f", "in_position"),
+            (self._vbo_col, "4f", "in_color"),
+        ])
         self._reg_pos = _register(self._vbo_pos)
         self._reg_col = _register(self._vbo_col)
 
     def write_warp(self, wp_pos: wp.array, wp_col: wp.array):
-        """GPU → GPU: copy Warp arrays directly into the OpenGL VBOs."""
         gl_pos = self._reg_pos.map(dtype=wp.vec3, shape=(self._n,))
         wp.copy(gl_pos, wp_pos)
         self._reg_pos.unmap()
-
         gl_col = self._reg_col.map(dtype=wp.vec4, shape=(self._n,))
         wp.copy(gl_col, wp_col)
         self._reg_col.unmap()
 
     def update(self, positions: np.ndarray, colors: np.ndarray):
-        """CPU → GPU fallback (e.g. after a randomize())."""
         self._vbo_pos.write(positions.tobytes())
         self._vbo_col.write(colors.tobytes())
 
@@ -122,7 +96,7 @@ class PointsDrawable(Drawable):
 
 
 # ---------------------------------------------------------------------------
-# Lines  (indexed line segments — wireframe)
+# Lines (static indexed)
 # ---------------------------------------------------------------------------
 
 _LINES_VERT = """
@@ -146,33 +120,19 @@ _LINES_FRAG = """
 
 
 class LinesDrawable(Drawable):
-    """
-    Renders indexed line segments (e.g. a wireframe cube).
-    Geometry is typically static so no interop path is provided.
-    """
-
     def setup(self, vertices: np.ndarray, colors: np.ndarray, indices: np.ndarray):
-        self.prog = self.ctx.program(
-            vertex_shader=_LINES_VERT,
-            fragment_shader=_LINES_FRAG,
-        )
+        self.prog = self.ctx.program(vertex_shader=_LINES_VERT, fragment_shader=_LINES_FRAG)
         self._vbo_pos = self.ctx.buffer(vertices.tobytes())
         self._vbo_col = self.ctx.buffer(colors.tobytes())
         self._ibo     = self.ctx.buffer(indices.tobytes())
-        self.vao = self.ctx.vertex_array(
-            self.prog,
-            [
-                (self._vbo_pos, "3f", "in_position"),
-                (self._vbo_col, "4f", "in_color"),
-            ],
-            self._ibo,
-        )
+        self.vao = self.ctx.vertex_array(self.prog, [
+            (self._vbo_pos, "3f", "in_position"),
+            (self._vbo_col, "4f", "in_color"),
+        ], self._ibo)
 
     def update(self, vertices: np.ndarray = None, colors: np.ndarray = None):
-        if vertices is not None:
-            self._vbo_pos.write(vertices.tobytes())
-        if colors is not None:
-            self._vbo_col.write(colors.tobytes())
+        if vertices is not None: self._vbo_pos.write(vertices.tobytes())
+        if colors  is not None: self._vbo_col.write(colors.tobytes())
 
     def draw(self, mvp: np.ndarray, **kwargs):
         self.prog["mvp"].write(mvp.tobytes())
@@ -180,10 +140,10 @@ class LinesDrawable(Drawable):
 
 
 # ---------------------------------------------------------------------------
-# Dynamic Lines  (flat non-indexed line segments — updated every frame)
+# Dynamic Lines & Triangles  (shared shaders, CUDA-GL interop)
 # ---------------------------------------------------------------------------
 
-_DYN_LINES_VERT = """
+_DYN_VERT = """
     #version 330
     uniform mat4 mvp;
     in vec3 in_position;
@@ -195,71 +155,89 @@ _DYN_LINES_VERT = """
     }
 """
 
-_DYN_LINES_FRAG = """
+_DYN_FRAG = """
     #version 330
     in vec4 v_color;
     out vec4 f_color;
     void main() { f_color = v_color; }
 """
 
+# Keep the old names as aliases so existing code keeps working
+_DYN_LINES_VERT = _DYN_VERT
+_DYN_LINES_FRAG = _DYN_FRAG
+
+
+def _make_dynamic_drawable(ctx, n_verts):
+    """Shared helper: allocate VBOs + interop registers for n_verts vertices."""
+    prog = ctx.program(vertex_shader=_DYN_VERT, fragment_shader=_DYN_FRAG)
+    vbo_pos = ctx.buffer(np.zeros((n_verts, 3), dtype=np.float32).tobytes())
+    vbo_col = ctx.buffer(np.zeros((n_verts, 4), dtype=np.float32).tobytes())
+    vao = ctx.vertex_array(prog, [
+        (vbo_pos, "3f", "in_position"),
+        (vbo_col, "4f", "in_color"),
+    ])
+    reg_pos = _register(vbo_pos)
+    reg_col = _register(vbo_col)
+    return prog, vbo_pos, vbo_col, vao, reg_pos, reg_col
+
 
 class DynamicLinesDrawable(Drawable):
-    """
-    Renders N_segments line segments from a flat VBO of N_segments*2 vertices.
-    No index buffer — consecutive vertex pairs form segments (GL_LINES).
-    Supports CUDA-GL interop via write_warp for zero-copy GPU updates each frame.
-    """
+    """N line segments, non-indexed. 2 verts per segment. CUDA-GL interop."""
 
     def setup(self, n_segments: int):
-        """Allocate empty buffers for n_segments line segments."""
         self._n_verts = n_segments * 2
-
-        self.prog = self.ctx.program(
-            vertex_shader=_DYN_LINES_VERT,
-            fragment_shader=_DYN_LINES_FRAG,
-        )
-        self._vbo_pos = self.ctx.buffer(
-            np.zeros((self._n_verts, 3), dtype=np.float32).tobytes()
-        )
-        self._vbo_col = self.ctx.buffer(
-            np.zeros((self._n_verts, 4), dtype=np.float32).tobytes()
-        )
-        self.vao = self.ctx.vertex_array(
-            self.prog,
-            [
-                (self._vbo_pos, "3f", "in_position"),
-                (self._vbo_col, "4f", "in_color"),
-            ],
-        )
-
-        # Register GL buffers for CUDA-GL interop
-        self._reg_pos = _register(self._vbo_pos)
-        self._reg_col = _register(self._vbo_col)
+        (self.prog, self._vbo_pos, self._vbo_col,
+         self.vao, self._reg_pos, self._reg_col) = _make_dynamic_drawable(self.ctx, self._n_verts)
 
     def write_warp(self, wp_pos: wp.array, wp_col: wp.array):
-        """GPU → GPU: copy Warp arrays directly into the OpenGL VBOs."""
         gl_pos = self._reg_pos.map(dtype=wp.vec3, shape=(self._n_verts,))
         wp.copy(gl_pos, wp_pos)
         self._reg_pos.unmap()
-
         gl_col = self._reg_col.map(dtype=wp.vec4, shape=(self._n_verts,))
         wp.copy(gl_col, wp_col)
         self._reg_col.unmap()
 
     def update(self, positions: np.ndarray = None, colors: np.ndarray = None):
-        """CPU → GPU fallback."""
-        if positions is not None:
-            self._vbo_pos.write(positions.tobytes())
-        if colors is not None:
-            self._vbo_col.write(colors.tobytes())
+        if positions is not None: self._vbo_pos.write(positions.tobytes())
+        if colors    is not None: self._vbo_col.write(colors.tobytes())
 
     def draw(self, mvp: np.ndarray, **kwargs):
         self.prog["mvp"].write(mvp.tobytes())
         self.vao.render(moderngl.LINES)
 
 
+class DynamicTrianglesDrawable(Drawable):
+    """N billboard quads stored as 6 non-indexed verts each. CUDA-GL interop.
+
+    Vertex layout per quad (base = i*6):
+        0 head_left   1 head_right   2 tail_right   <- triangle A
+        3 head_left   4 tail_right   5 tail_left    <- triangle B
+    """
+
+    def setup(self, n_quads: int):
+        self._n_verts = n_quads * 6
+        (self.prog, self._vbo_pos, self._vbo_col,
+         self.vao, self._reg_pos, self._reg_col) = _make_dynamic_drawable(self.ctx, self._n_verts)
+
+    def write_warp(self, wp_pos: wp.array, wp_col: wp.array):
+        gl_pos = self._reg_pos.map(dtype=wp.vec3, shape=(self._n_verts,))
+        wp.copy(gl_pos, wp_pos)
+        self._reg_pos.unmap()
+        gl_col = self._reg_col.map(dtype=wp.vec4, shape=(self._n_verts,))
+        wp.copy(gl_col, wp_col)
+        self._reg_col.unmap()
+
+    def update(self, positions: np.ndarray = None, colors: np.ndarray = None):
+        if positions is not None: self._vbo_pos.write(positions.tobytes())
+        if colors    is not None: self._vbo_col.write(colors.tobytes())
+
+    def draw(self, mvp: np.ndarray, **kwargs):
+        self.prog["mvp"].write(mvp.tobytes())
+        self.vao.render(moderngl.TRIANGLES)
+
+
 # ---------------------------------------------------------------------------
-# Shapes  (sphere-shaded point sprites — bouncing balls)
+# Shapes  (sphere-shaded point sprites -- bouncing balls)
 # ---------------------------------------------------------------------------
 
 _SHAPES_VERT = """
@@ -297,43 +275,27 @@ _SHAPES_FRAG = """
 
 
 class ShapeDrawable(Drawable):
-    """
-    Renders sphere-shaded point sprites (balls).
-    Colors are static; only positions change each frame.
-    """
+    """Sphere-shaded point sprites (balls). Colors static; positions dynamic."""
 
     def setup(self, positions: np.ndarray, colors: np.ndarray):
         self._n = len(positions)
-
-        self.prog = self.ctx.program(
-            vertex_shader=_SHAPES_VERT,
-            fragment_shader=_SHAPES_FRAG,
-        )
+        self.prog = self.ctx.program(vertex_shader=_SHAPES_VERT, fragment_shader=_SHAPES_FRAG)
         self._vbo_pos = self.ctx.buffer(positions.tobytes())
         self._vbo_col = self.ctx.buffer(colors.tobytes())
-        self.vao = self.ctx.vertex_array(
-            self.prog,
-            [
-                (self._vbo_pos, "3f", "in_position"),
-                (self._vbo_col, "4f", "in_color"),
-            ],
-        )
-
-        # Only positions change; register just that buffer
+        self.vao = self.ctx.vertex_array(self.prog, [
+            (self._vbo_pos, "3f", "in_position"),
+            (self._vbo_col, "4f", "in_color"),
+        ])
         self._reg_pos = _register(self._vbo_pos)
 
     def write_warp(self, wp_pos: wp.array):
-        """GPU → GPU: copy Warp positions directly into the OpenGL VBO."""
         gl_pos = self._reg_pos.map(dtype=wp.vec3, shape=(self._n,))
         wp.copy(gl_pos, wp_pos)
         self._reg_pos.unmap()
 
     def update(self, positions: np.ndarray = None, colors: np.ndarray = None):
-        """CPU → GPU fallback."""
-        if positions is not None:
-            self._vbo_pos.write(positions.tobytes())
-        if colors is not None:
-            self._vbo_col.write(colors.tobytes())
+        if positions is not None: self._vbo_pos.write(positions.tobytes())
+        if colors    is not None: self._vbo_col.write(colors.tobytes())
 
     def draw(self, mvp: np.ndarray, point_size: float = 80.0, **kwargs):
         self.prog["mvp"].write(mvp.tobytes())
@@ -342,38 +304,25 @@ class ShapeDrawable(Drawable):
 
 
 # ---------------------------------------------------------------------------
-# Ribbons  (filled triangle-mesh strips — same shader as Lines)
+# Ribbons  (static indexed triangle mesh)
 # ---------------------------------------------------------------------------
 
 class RibbonDrawable(Drawable):
-    """
-    Renders filled quad-strip ribbons as indexed triangles.
-    Same vertex shader as LinesDrawable; just uses TRIANGLES mode.
-    Geometry is static (CPU-built once); regenerate by calling setup() again.
-    """
+    """Static filled quad-strip ribbons as indexed triangles."""
 
     def setup(self, vertices: np.ndarray, colors: np.ndarray, indices: np.ndarray):
-        self.prog = self.ctx.program(
-            vertex_shader=_LINES_VERT,
-            fragment_shader=_LINES_FRAG,
-        )
+        self.prog = self.ctx.program(vertex_shader=_LINES_VERT, fragment_shader=_LINES_FRAG)
         self._vbo_pos = self.ctx.buffer(vertices.tobytes())
         self._vbo_col = self.ctx.buffer(colors.tobytes())
         self._ibo     = self.ctx.buffer(indices.tobytes())
-        self.vao = self.ctx.vertex_array(
-            self.prog,
-            [
-                (self._vbo_pos, "3f", "in_position"),
-                (self._vbo_col, "4f", "in_color"),
-            ],
-            self._ibo,
-        )
+        self.vao = self.ctx.vertex_array(self.prog, [
+            (self._vbo_pos, "3f", "in_position"),
+            (self._vbo_col, "4f", "in_color"),
+        ], self._ibo)
 
     def update(self, vertices: np.ndarray = None, colors: np.ndarray = None):
-        if vertices is not None:
-            self._vbo_pos.write(vertices.tobytes())
-        if colors is not None:
-            self._vbo_col.write(colors.tobytes())
+        if vertices is not None: self._vbo_pos.write(vertices.tobytes())
+        if colors   is not None: self._vbo_col.write(colors.tobytes())
 
     def draw(self, mvp: np.ndarray, **kwargs):
         self.prog["mvp"].write(mvp.tobytes())

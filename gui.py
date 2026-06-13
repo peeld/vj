@@ -46,10 +46,10 @@ import warp as wp
 
 from drawlib.data import BallData, PointCloudData
 from drawlib.operation import BallOperation, PointCloudOperation
-from drawlib.drawable import DynamicLinesDrawable, LinesDrawable, PointsDrawable, ShapeDrawable
+from drawlib.drawable import LinesDrawable, PointsDrawable, ShapeDrawable
 from drawlib.post_effect import FeedbackPostEffect
 from drawlib.warp_feedback import FeedbackParams
-from drawlib.nn_graph import NNGraph
+from elements.nn_graph import NNGraph
 from drawlib.helpers import build_wireframe
 from drawlib.camera import OrbitCamera
 

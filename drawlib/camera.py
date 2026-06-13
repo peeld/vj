@@ -47,7 +47,7 @@ class OrbitCamera:
     orbit_speed:
         Horizontal angular speed in rad/s.
     orbit_phi:
-        Vertical frequency multiplier (golden-ratio fraction by default → slow drift).
+        Vertical frequency multiplier (golden-ratio fraction by default -> slow drift).
     orbit_resume_delay:
         Seconds of idle time before auto-orbit reclaims the camera after user input.
     drag_sensitivity:
@@ -70,7 +70,7 @@ class OrbitCamera:
         orbit_a:            float = 1.5,
         orbit_b:            float = 0.6,
         orbit_speed:        float = 0.22,
-        orbit_phi:          float = (1 + 5 ** 0.5) / 2 * 0.5,  # ≈ 0.809
+        orbit_phi:          float = (1 + 5 ** 0.5) / 2 * 0.5,
         orbit_resume_delay: float = 2.0,
         drag_sensitivity:   float = 0.4,
         scroll_sensitivity: float = 0.2,
@@ -93,7 +93,7 @@ class OrbitCamera:
         self._orbit_speed       = orbit_speed
         self._orbit_phi         = orbit_phi
         self._orbit_resume_delay = orbit_resume_delay
-        self._user_idle         = 0.0   # countdown; orbit resumes when ≤ 0
+        self._user_idle         = 0.0
 
         # Input
         self._drag_sens   = drag_sensitivity
@@ -101,10 +101,10 @@ class OrbitCamera:
         self._dist_min    = dist_min
         self._dist_max    = dist_max
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def tick(self, dt: float) -> None:
-        """Advance auto-orbit by *dt* seconds (no-op when disabled or user is active)."""
+        """Advance auto-orbit by dt seconds (no-op when disabled or user is active)."""
         if not self.orbit_enabled:
             return
         if self._user_idle > 0.0:
@@ -138,14 +138,39 @@ class OrbitCamera:
             self._dist_max,
         ))
 
-    def mvp(self, window_size: tuple[int, int]) -> np.ndarray:
-        """Return the column-major MVP matrix for the current frame.
+    def position_and_axes(self) -> tuple:
+        """Return (eye, forward, right, up) as float32 unit vectors.
 
-        Parameters
-        ----------
-        window_size:
-            ``(width, height)`` in pixels; used to compute the aspect ratio.
+        eye     -- camera position in world space
+        forward -- unit vector pointing into the scene (eye toward origin)
+        right   -- unit vector to the camera's right
+        up      -- unit vector upward in camera space
         """
+        yaw   = np.radians(self.yaw)
+        pitch = np.radians(self.pitch)
+        d     = self.dist
+
+        eye = np.array([
+            d * np.cos(pitch) * np.sin(yaw),
+            d * np.sin(pitch),
+            d * np.cos(pitch) * np.cos(yaw),
+        ], dtype=np.float32)
+
+        fwd = -eye / (np.linalg.norm(eye) + 1e-9)
+
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        right = np.cross(fwd, world_up)
+        rn = np.linalg.norm(right)
+        if rn < 1e-6:
+            right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            right = (right / rn).astype(np.float32)
+
+        up = np.cross(right, fwd).astype(np.float32)
+        return eye, fwd, right, up
+
+    def mvp(self, window_size: tuple) -> np.ndarray:
+        """Return the column-major MVP matrix for the current frame."""
         yaw   = np.radians(self.yaw)
         pitch = np.radians(self.pitch)
         d     = self.dist
