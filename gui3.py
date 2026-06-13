@@ -268,7 +268,7 @@ def build_geometry(
     """
     Returns (verts, colors, indices, circle_metas, trav_metas).
 
-    Vertex layout (must match _animated_positions exactly):
+    Vertex layout (must match animated_positions exactly):
       for each circle:  [circle ribbon verts]  [blade quad verts]
       for each trav:    [line ribbon verts]
     """
@@ -402,6 +402,106 @@ def build_geometry(
 
 
 # ---------------------------------------------------------------------------
+# Drawing class
+# ---------------------------------------------------------------------------
+
+class CircleAxisDrawing:
+    """
+    Encapsulates all geometry, animation, and draw calls for the circle-axis scene.
+
+    Usage:
+        drawing = CircleAxisDrawing(ctx)
+        drawing.update_audio(metrics)          # call from audio callback
+        drawing.draw(mvp, current_time)        # call each frame
+        drawing.on_key(key, action, keys)      # returns True if key was consumed
+    """
+
+    def __init__(self, ctx: moderngl.Context):
+        self._ctx = ctx
+        self._seed = 0
+        self._geo: RibbonDrawable | None = None
+        self._circle_metas: list[CircleAnimMeta] = []
+        self._trav_metas:   list[TravAnimMeta]   = []
+        self._audio_data:   audio_metrics.AudioMetrics | None = None
+        self.regen()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update_audio(self, m: audio_metrics.AudioMetrics) -> None:
+        """Receive a fresh AudioMetrics value to drive animation parameters."""
+        self._audio_data = m
+
+    def regen(self) -> None:
+        """Rebuild geometry with the next seed."""
+        if self._geo is None:
+            self._geo = RibbonDrawable(self._ctx)
+        verts, colors, idx, circle_metas, trav_metas = build_geometry(seed=self._seed)
+        self._geo.setup(verts, colors, idx)
+        self._circle_metas = circle_metas
+        self._trav_metas   = trav_metas
+        print(f"[drawing] geometry generated  (seed={self._seed})")
+        self._seed += 1
+
+    def on_key(self, key, action, keys) -> bool:
+        """
+        Handle key events relevant to drawing.
+        Returns True if the key was consumed so the caller can skip further handling.
+        """
+        if action != keys.ACTION_PRESS:
+            return False
+        if key == keys.R:
+            self.regen()
+            return True
+        return False
+
+    def draw(self, mvp: np.ndarray, t: float) -> None:
+        """Update animated positions and issue the draw call."""
+        new_verts = self._animated_positions(t)
+        self._geo.update(vertices=new_verts)
+        self._geo.draw(mvp)
+
+    # ------------------------------------------------------------------
+    # Internal animation
+    # ------------------------------------------------------------------
+
+    def _animated_positions(self, t: float) -> np.ndarray:
+        """
+        Rebuild all vertex positions at time t.
+
+        Order must exactly match build_geometry:
+          for each circle: [ribbon verts] [blade verts]
+          for each trav:   [ribbon verts]
+        """
+        parts: list[np.ndarray] = []
+
+        for m in self._circle_metas:
+            aa = m.amplitude
+            if self._audio_data is not None:
+                aa = self._audio_data.energy * 0.4
+
+            cx = m.cx + aa * np.sin(aa * t * m.speed + m.phase)
+
+            # Circle ribbon
+            pts = _circle_pts(cx, m.radius, N_SEG)
+            parts.append(_ribbon_positions(pts, CIRCLE_HALF_W))
+
+            # Turbine blades — spin continuously
+            spin = t * BLADE_SPIN_SPEED
+            parts.append(_blade_positions(cx, m.radius, spin))
+
+        for m in self._trav_metas:
+            dx  = m.amplitude * np.sin(t * m.speed + m.phase) * 15
+            p1  = np.array([m.x1 + dx, m.y, m.z], dtype=np.float32)
+            p2  = np.array([m.x2 + dx, m.y, m.z], dtype=np.float32)
+            pts = np.stack([p1, p2])
+            parts.append(_ribbon_positions(pts, LINE_HALF_W))
+
+        return np.vstack(parts).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -417,18 +517,17 @@ class CircleAxisGUI(mglw.WindowConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self._seed = 0
-        self._geo: RibbonDrawable | None = None
-        self._circle_metas: list[CircleAnimMeta] = []
-        self._trav_metas:   list[TravAnimMeta]   = []
-        self._regen()
-
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
+        # Camera
         self.camera = OrbitCamera()
         self._drag  = False
 
+        # Drawing
+        self._drawing = CircleAxisDrawing(self.ctx)
+
+        # Post-effect
         self.post_effect_on = True
         w, h = self.window_size
         self._post = FeedbackPostEffect(
@@ -438,86 +537,45 @@ class CircleAxisGUI(mglw.WindowConfig):
         )
         self._post.setup(self.ctx, w, h)
 
-        self._audio_data = None
-        self._audio_metrics = audio_metrics.AudioAnalyzer(device="CABLE Output (VB-Audio Virtual Cable), Windows DirectSound", on_frame=self.on_frame)
-        self._audio_metrics.start()
+        # Audio — wires into drawing and post-effect via callback
+        self._audio = audio_metrics.AudioAnalyzer(
+            # device   = "CABLE Output (VB-Audio Virtual Cable), Windows DirectSound",
+            on_frame = self._on_audio_frame,
+        )
+        self._audio.start()
 
         print("[gui3] ready  --  R: regenerate  P: post-effect  O: orbit  ESC: quit")
 
-    def on_frame(self, m: audio_metrics.AudioMetrics):
-        # m.kick, m.bass, m.brightness, etc. — all 0.0–1.0
-        self._audio_data = m
+    # ------------------------------------------------------------------
+    # Audio callback — links audio → drawing + post-effect
+    # ------------------------------------------------------------------
+
+    def _on_audio_frame(self, m: audio_metrics.AudioMetrics) -> None:
+        self._drawing.update_audio(m)
         self._post.params.sat_boost = m.bass * 4
 
-    def _regen(self):
-        if self._geo is None:
-            self._geo = RibbonDrawable(self.ctx)
-        verts, colors, idx, circle_metas, trav_metas = build_geometry(seed=self._seed)
-        self._geo.setup(verts, colors, idx)
-        self._circle_metas = circle_metas
-        self._trav_metas   = trav_metas
-        print(f"[gui3] geometry generated  (seed={self._seed})")
-        self._seed += 1
-
-    def _animated_positions(self, t: float) -> np.ndarray:
-        """
-        Rebuild all vertex positions at time t.
-
-        Order must exactly match build_geometry:
-          for each circle: [ribbon verts] [blade verts]
-          for each trav:   [ribbon verts]
-        """
-        parts: list[np.ndarray] = []
-
-        for m in self._circle_metas:
-
-            aa = m.amplitude
-            
-            if self._audio_data:
-                aa = self._audio_data.energy * 0.4
- 
-            cx  = m.cx + aa * np.sin(aa * t * m.speed + m.phase) 
-
-            
-
-            # Circle ribbon
-            pts = _circle_pts(cx, m.radius, N_SEG)
-            parts.append(_ribbon_positions(pts, CIRCLE_HALF_W))
-
-            # Turbine blades -- spin continuously
-            spin = t * BLADE_SPIN_SPEED
-            parts.append(_blade_positions(cx, m.radius, spin))
-
-        for m in self._trav_metas:
-            dx  = m.amplitude * np.sin(t * m.speed + m.phase) * 15
-            p1  = np.array([m.x1 + dx, m.y, m.z], dtype=np.float32)
-            p2  = np.array([m.x2 + dx, m.y, m.z], dtype=np.float32)
-            pts = np.stack([p1, p2])
-            parts.append(_ribbon_positions(pts, LINE_HALF_W))
-
-        return np.vstack(parts).astype(np.float32)
-
+    # ------------------------------------------------------------------
     # Per-frame
+    # ------------------------------------------------------------------
 
     def on_render(self, current_time: float, frame_time: float):
         self.camera.tick(frame_time)
         mvp = self.camera.mvp(self.window_size)
 
-        new_verts = self._animated_positions(current_time)
-        self._geo.update(vertices=new_verts)
-
         if self.post_effect_on:
             self._post.bind_scene_fbo()
-            self._geo.draw(mvp)
+            self._drawing.draw(mvp, current_time)
             self._post.process(self._post.fbo, current_time, dt=0.0)
             self._post.blit_to_screen(self.ctx.screen)
         else:
             self.ctx.screen.use()
             self.ctx.enable(moderngl.DEPTH_TEST)
             self.ctx.clear(0.04, 0.04, 0.06, 1.0)
-            self._geo.draw(mvp)
+            self._drawing.draw(mvp, current_time)
 
+    # ------------------------------------------------------------------
     # Input
+    # ------------------------------------------------------------------
 
     def on_mouse_press_event(self, x, y, button):
         if button == 1: self._drag = True
@@ -536,10 +594,12 @@ class CircleAxisGUI(mglw.WindowConfig):
             return
         keys = self.wnd.keys
 
+        # Drawing class gets first pick (handles R)
+        if self._drawing.on_key(key, action, keys):
+            return
+
         if key == keys.ESCAPE:
             self.wnd.close()
-        elif key == keys.R:
-            self._regen()
         elif key == keys.P:
             self.post_effect_on = not self.post_effect_on
             print(f"[gui3] post-effect: {'ON' if self.post_effect_on else 'OFF'}")
