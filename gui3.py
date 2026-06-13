@@ -35,6 +35,8 @@ from drawlib.warp_feedback import FeedbackParams
 from drawlib.camera import OrbitCamera
 from color_harmony import ColorScheme, generate_palette
 
+import audio_metrics
+
 wp.init()
 
 BOUND          = 1.0
@@ -436,7 +438,16 @@ class CircleAxisGUI(mglw.WindowConfig):
         )
         self._post.setup(self.ctx, w, h)
 
+        self._audio_data = None
+        self._audio_metrics = audio_metrics.AudioAnalyzer(device="CABLE Output (VB-Audio Virtual Cable), Windows DirectSound", on_frame=self.on_frame)
+        self._audio_metrics.start()
+
         print("[gui3] ready  --  R: regenerate  P: post-effect  O: orbit  ESC: quit")
+
+    def on_frame(self, m: audio_metrics.AudioMetrics):
+        # m.kick, m.bass, m.brightness, etc. — all 0.0–1.0
+        self._audio_data = m
+        self._post.params.sat_boost = m.bass * 4
 
     def _regen(self):
         if self._geo is None:
@@ -459,7 +470,15 @@ class CircleAxisGUI(mglw.WindowConfig):
         parts: list[np.ndarray] = []
 
         for m in self._circle_metas:
-            cx  = m.cx + m.amplitude * np.sin(t * m.speed + m.phase) * 10
+
+            aa = m.amplitude
+            
+            if self._audio_data:
+                aa = self._audio_data.energy * 0.4
+ 
+            cx  = m.cx + aa * np.sin(aa * t * m.speed + m.phase) 
+
+            
 
             # Circle ribbon
             pts = _circle_pts(cx, m.radius, N_SEG)
