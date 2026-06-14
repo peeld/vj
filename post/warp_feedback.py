@@ -57,7 +57,7 @@ class FeedbackParams:
     rot_sensitivity: float = 0.015  # extra rotation per unit of mid (0-1)
 
     # Brightness decay — keeps energy from accumulating forever.
-    decay: float = 0.2              # multiply RGB by this each frame
+    decay: float = 0.97             # multiply RGB by this each frame (0.95–0.999)
 
     # Treble-driven radial ripple.
     ripple_strength: float = 16.0   # max displacement in pixels

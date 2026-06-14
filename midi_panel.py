@@ -1,37 +1,38 @@
 """
-midi_panel.py — MIDI assignment GUI
+midi_panel.py — MIDI assignment GUI (PropertyManager edition)
 
-PySide6 panel for assigning MIDI CC / note events to live parameters at runtime.
-Matches the dark style of param_dialog.py.
+PySide6 panel for assigning MIDI CC / note events to parameters managed by a
+PropertyManager.  MidiRouter handles hardware I/O only; all binding logic lives
+in PropertyManager.
 
-Usage (add to gui_merged.py __main__ block):
---------------------------------------------
-    from midi_input import get_router
-    from midi_panel import start_midi_panel
+Usage (gui_merged.py __main__ block)::
 
-    router = get_router()
+    from midi_input       import get_router
+    from midi_panel       import MidiPanel
+    from property_manager import build_default_manager
 
-    start_midi_panel(
-        router,
-        ("Post-FX", _params),
-        ("Scene",   _controls),
-        title="MIDI Assignments",
-    )
+    _router = get_router()
+    _pm     = build_default_manager(_params, _controls, None, None, None)
 
-    router.start()   # or pass a specific device name
+    midi = MidiPanel(_router, _pm, title="MIDI Assignments")
+    midi.show()
+
+    # When the GL window starts and elements exist, rebuild pm in-place:
+    #   build_default_manager(_params, _controls, nn, lasers, circles, pm=_pm)
 
 Flow
 ----
-1. Select device from dropdown → Connect
-2. Pick a parameter (Section / field) from the "Parameter" combo
+1. Select device → Connect
+2. Pick a parameter (grouped by section)
 3. Choose CC or Note
-4. For CC: set min / max values
-5. Click Learn → touch a knob or key → assignment is created
-6. Assignments appear in the list; click ✕ to remove
-7. Save / Load buttons persist mappings to midi_mappings.json beside the script
+   - CC + numeric → enter Min/Max; Learn → touch a knob
+   - CC + enum    → auto-detected; shows "Sweeps N choices: …"; Learn → touch a knob
+   - Note + bool  → toggle on note-on; Learn → press a key
+   - Note + enum  → pick a Value from the dropdown; Learn → press a key
+4. Assignments appear in the list; ✕ removes
+5. Save/Load persist the full PropertyManager JSON (presets + all mappings)
 """
 
-import dataclasses
 import json
 import threading
 from pathlib import Path
@@ -45,7 +46,8 @@ from PySide6.QtWidgets import (
     QButtonGroup, QRadioButton,
 )
 
-from midi_input import MidiRouter, get_router
+from midi_input       import MidiRouter, get_router
+from property_manager import PropertyManager, PropDef, MidiCCBinding, MidiNoteBinding
 
 
 # ── stylesheet (matches param_dialog.py) ──────────────────────────────────────
@@ -64,6 +66,7 @@ QLabel#act  { color: #ffb347; font-weight: bold; }
 QLabel#ok   { color: #7ec87e; }
 QLabel#err  { color: #e07070; }
 QLabel#info { color: #707078; font-style: italic; }
+QLabel#enum { color: #a070d0; font-style: italic; }
 
 QLineEdit {
     background-color: #111118;
@@ -166,9 +169,9 @@ def _sep() -> QFrame:
 
 
 def _hdr(text: str) -> QLabel:
-    l = QLabel(text)
-    l.setObjectName("hdr")
-    return l
+    lbl = QLabel(text)
+    lbl.setObjectName("hdr")
+    return lbl
 
 
 def _note_name(n: int) -> str:
@@ -176,45 +179,60 @@ def _note_name(n: int) -> str:
     return f"{names[n % 12]}{n // 12 - 1}"
 
 
+def _is_enum(prop: PropDef) -> bool:
+    return bool(prop.choices)
+
+
+def _restyle(widget: QWidget) -> None:
+    """Force Qt stylesheet re-polish (needed after objectName changes)."""
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
 # ── main panel ────────────────────────────────────────────────────────────────
 
 class MidiPanel(QWidget):
     """
-    Live MIDI assignment panel.
+    Live MIDI assignment panel backed by a PropertyManager.
 
-    targets : list of (section_label, obj, hints_dict)   # same as param_dialog
+    router — MidiRouter instance (hardware I/O only)
+    pm     — PropertyManager that owns all parameters and bindings
     """
 
     def __init__(
         self,
-        router  : MidiRouter,
-        targets : list[tuple[str, Any, dict]],
-        title   : str = "MIDI Assignments",
+        router   : MidiRouter,
+        pm       : PropertyManager,
+        title    : str = "MIDI Assignments",
         save_path: Path | None = None,
     ):
         super().__init__()
         self.router    = router
-        self.targets   = targets
+        self.pm        = pm
         self.save_path = save_path or Path("midi_mappings.json")
+
         self._learn_active = False
-        self._bridge   = _Bridge()
+        # Per-choice enum note learn state
+        self._note_enum_learn_target: str | None = None
+        self._note_enum_learn_btn:    QPushButton | None = None
+        self._bridge = _Bridge()
         self._bridge.midi_event.connect(self._on_midi_event)
 
         self.setWindowTitle(title)
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         self.setStyleSheet(_STYLESHEET)
-        self.setMinimumWidth(420)
-        self.resize(440, 700)
+        self.setMinimumWidth(440)
+        self.resize(460, 720)
 
         self._build_ui()
         self._refresh_devices()
 
-        # Poll timer — updates activity label and assignment list
+        # Poll timer — updates activity label
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._timer.start(80)
 
-        # Register raw listener to forward events to Qt thread
+        # Raw MIDI listener: forward events to Qt thread AND dispatch to PM
         self.router.add_listener(self._raw_listener)
 
     # ── teardown ───────────────────────────────────────────────────────────────
@@ -275,11 +293,10 @@ class MidiPanel(QWidget):
         param_row.addWidget(QLabel("Parameter:"))
         self._param_combo = QComboBox()
         self._param_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._populate_param_combo()
         param_row.addWidget(self._param_combo)
         root.addLayout(param_row)
 
-        # Type: CC / Note
+        # CC / Note radio buttons
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Type:"))
         self._type_group = QButtonGroup(self)
@@ -288,15 +305,16 @@ class MidiPanel(QWidget):
         self._rb_cc.setChecked(True)
         self._type_group.addButton(self._rb_cc,   0)
         self._type_group.addButton(self._rb_note, 1)
-        self._rb_cc.toggled.connect(self._on_type_changed)
+        self._rb_cc.toggled.connect(self._update_mode_ui)
         type_row.addWidget(self._rb_cc)
         type_row.addWidget(self._rb_note)
         type_row.addStretch()
         root.addLayout(type_row)
 
-        # CC range row (hidden for Note mode)
-        self._range_widget = QWidget()
-        rr = QHBoxLayout(self._range_widget)
+        # ── CC sub-widgets ────────────────────────────────────────────────────
+        # (a) Numeric: Min / Max fields
+        self._cc_range_widget = QWidget()
+        rr = QHBoxLayout(self._cc_range_widget)
         rr.setContentsMargins(0, 0, 0, 0)
         rr.addWidget(QLabel("Min:"))
         self._edit_min = QLineEdit("0.0")
@@ -307,21 +325,52 @@ class MidiPanel(QWidget):
         self._edit_max.setFixedWidth(70)
         rr.addWidget(self._edit_max)
         rr.addStretch()
-        root.addWidget(self._range_widget)
+        root.addWidget(self._cc_range_widget)
 
-        # Note on/off values row (hidden for CC mode)
-        self._note_val_widget = QWidget()
-        nvr = QHBoxLayout(self._note_val_widget)
-        nvr.setContentsMargins(0, 0, 0, 0)
-        self._lbl_note_hint = QLabel("Bool param → toggle  |  Float/int: set on/off value")
+        # (b) Enum: info label showing the sweep
+        self._cc_enum_widget = QWidget()
+        er = QHBoxLayout(self._cc_enum_widget)
+        er.setContentsMargins(0, 0, 0, 0)
+        self._lbl_cc_enum = QLabel("")
+        self._lbl_cc_enum.setObjectName("enum")
+        self._lbl_cc_enum.setWordWrap(True)
+        er.addWidget(self._lbl_cc_enum)
+        self._cc_enum_widget.setVisible(False)
+        root.addWidget(self._cc_enum_widget)
+
+        # ── Note sub-widgets ──────────────────────────────────────────────────
+        # (a) Bool / generic: hint label
+        self._note_bool_widget = QWidget()
+        nbr = QHBoxLayout(self._note_bool_widget)
+        nbr.setContentsMargins(0, 0, 0, 0)
+        self._lbl_note_hint = QLabel("Note-on toggles boolean.")
         self._lbl_note_hint.setObjectName("info")
         self._lbl_note_hint.setWordWrap(True)
-        nvr.addWidget(self._lbl_note_hint)
-        self._note_val_widget.setVisible(False)
-        root.addWidget(self._note_val_widget)
+        nbr.addWidget(self._lbl_note_hint)
+        self._note_bool_widget.setVisible(False)
+        root.addWidget(self._note_bool_widget)
 
-        # Learn button
-        learn_row = QHBoxLayout()
+        # (b) Enum: per-choice note assignment rows
+        self._note_enum_widget = QWidget()
+        ne_vbox = QVBoxLayout(self._note_enum_widget)
+        ne_vbox.setContentsMargins(0, 2, 0, 2)
+        ne_vbox.setSpacing(2)
+        lbl_ne_hdr = QLabel("Assign a note to each value:")
+        lbl_ne_hdr.setObjectName("info")
+        ne_vbox.addWidget(lbl_ne_hdr)
+        # Inner widget that _build_enum_note_rows() clears and rebuilds
+        self._note_enum_rows_widget = QWidget()
+        self._note_enum_rows_layout = QVBoxLayout(self._note_enum_rows_widget)
+        self._note_enum_rows_layout.setContentsMargins(4, 0, 0, 0)
+        self._note_enum_rows_layout.setSpacing(2)
+        ne_vbox.addWidget(self._note_enum_rows_widget)
+        self._note_enum_widget.setVisible(False)
+        root.addWidget(self._note_enum_widget)
+
+        # Learn button row (hidden in Note+Enum mode — per-row buttons take over)
+        self._learn_row_widget = QWidget()
+        learn_row = QHBoxLayout(self._learn_row_widget)
+        learn_row.setContentsMargins(0, 0, 0, 0)
         self._btn_learn = QPushButton("Learn")
         self._btn_learn.setObjectName("learn")
         self._btn_learn.setProperty("active", "false")
@@ -331,7 +380,7 @@ class MidiPanel(QWidget):
         self._lbl_learn.setObjectName("info")
         learn_row.addWidget(self._lbl_learn)
         learn_row.addStretch()
-        root.addLayout(learn_row)
+        root.addWidget(self._learn_row_widget)
 
         # ── Assignments list ──────────────────────────────────────────────────
         root.addSpacing(4)
@@ -361,6 +410,9 @@ class MidiPanel(QWidget):
         io_row.addStretch()
         root.addLayout(io_row)
 
+        # Initial UI state
+        self._populate_param_combo()
+        self._update_mode_ui()
         self._refresh_assignments()
 
     # ── device management ──────────────────────────────────────────────────────
@@ -384,51 +436,85 @@ class MidiPanel(QWidget):
         else:
             self._lbl_status.setObjectName("err")
             self._lbl_status.setText(f"✗ Failed to connect: {name}")
-        self._lbl_status.setStyleSheet("")  # force re-polish
-        self._lbl_status.style().unpolish(self._lbl_status)
-        self._lbl_status.style().polish(self._lbl_status)
+        _restyle(self._lbl_status)
 
     def _on_disconnect(self) -> None:
         self.router.stop()
         self._lbl_status.setObjectName("info")
         self._lbl_status.setText("Not connected")
-        self._lbl_status.style().unpolish(self._lbl_status)
-        self._lbl_status.style().polish(self._lbl_status)
+        _restyle(self._lbl_status)
 
     # ── param combo ───────────────────────────────────────────────────────────
 
     def _populate_param_combo(self) -> None:
-        self._param_items: list[tuple[str, Any, str, type]] = []  # (section, obj, field, ftype)
+        """Fill _param_combo from pm, grouped by section."""
+        self._param_keys: list[str] = []   # prop_key per combo index
         self._param_combo.clear()
 
-        for section, obj, _ in self.targets:
-            fields = list(self._iter_fields(obj))
-            for fname, ftype, _ in fields:
-                label = f"{section} / {fname}"
-                self._param_combo.addItem(label)
-                self._param_items.append((section, obj, fname, ftype))
+        for section in self.pm.sections():
+            for prop in self.pm.props_in(section):
+                self._param_combo.addItem(f"{section} / {prop.label or prop.name}")
+                self._param_keys.append(prop.key)
 
-        self._param_combo.currentIndexChanged.connect(self._on_param_changed)
-        self._on_param_changed(0)
+        self._param_combo.currentIndexChanged.connect(self._update_mode_ui)
+        self._update_mode_ui()
 
-    def _on_param_changed(self, idx: int) -> None:
-        if not self._param_items or idx < 0:
-            return
-        _, _, _, ftype = self._param_items[idx]
-        if ftype is bool:
-            self._edit_min.setText("0")
-            self._edit_max.setText("1")
-        elif ftype is int:
-            self._edit_min.setText("0")
-            self._edit_max.setText("127")
-        else:
-            self._edit_min.setText("0.0")
-            self._edit_max.setText("1.0")
+    def _current_prop(self) -> PropDef | None:
+        idx = self._param_combo.currentIndex()
+        if idx < 0 or idx >= len(self._param_keys):
+            return None
+        return self.pm._defs.get(self._param_keys[idx])
 
-    def _on_type_changed(self, checked: bool) -> None:
-        is_cc = self._rb_cc.isChecked()
-        self._range_widget.setVisible(is_cc)
-        self._note_val_widget.setVisible(not is_cc)
+    # ── mode-aware sub-widget visibility ──────────────────────────────────────
+
+    def _update_mode_ui(self) -> None:
+        """Show/hide the right sub-widgets for the current (type, prop kind)."""
+        # Cancel any in-progress enum row learn when the user switches param/type
+        self._cancel_enum_learn()
+
+        prop      = self._current_prop()
+        is_cc     = self._rb_cc.isChecked()
+        is_note   = not is_cc
+        is_enum   = _is_enum(prop) if prop else False
+        is_bool   = (prop and prop.type is bool and not is_enum)
+        note_enum = is_note and is_enum
+
+        # CC sub-widgets
+        self._cc_range_widget.setVisible(is_cc and not is_enum)
+        self._cc_enum_widget.setVisible(is_cc and is_enum)
+
+        # Note sub-widgets
+        self._note_bool_widget.setVisible(is_note and not is_enum)
+        self._note_enum_widget.setVisible(note_enum)
+
+        # Main Learn row — hidden for Note+Enum (per-row buttons take over)
+        self._learn_row_widget.setVisible(not note_enum)
+
+        if prop:
+            # Prefill range fields from prop bounds
+            if is_cc and not is_enum:
+                lo = prop.min_val if prop.min_val is not None else (0   if prop.type is int else 0.0)
+                hi = prop.max_val if prop.max_val is not None else (127 if prop.type is int else 1.0)
+                self._edit_min.setText(str(lo))
+                self._edit_max.setText(str(hi))
+
+            # Fill enum sweep label
+            if is_cc and is_enum:
+                choices_str = " | ".join(prop.choices)
+                self._lbl_cc_enum.setText(
+                    f"Sweeps {len(prop.choices)} values: {choices_str}"
+                )
+
+            # Fill note hint for non-enum
+            if is_note and not is_enum:
+                self._lbl_note_hint.setText(
+                    "Note-on toggles boolean." if is_bool
+                    else f"Note-on increments {prop.label or prop.name} by one step."
+                )
+
+            # Build per-choice note assignment rows
+            if note_enum:
+                self._build_enum_note_rows(prop)
 
     # ── MIDI learn ─────────────────────────────────────────────────────────────
 
@@ -440,77 +526,220 @@ class MidiPanel(QWidget):
 
     def _start_learn(self) -> None:
         self._learn_active = True
-        self._learn_event  = None
         self._btn_learn.setText("Listening…  (click to cancel)")
         self._btn_learn.setProperty("active", "true")
-        self._btn_learn.style().unpolish(self._btn_learn)
-        self._btn_learn.style().polish(self._btn_learn)
+        _restyle(self._btn_learn)
         self._lbl_learn.setText("Waiting for MIDI event…")
 
     def _cancel_learn(self) -> None:
         self._learn_active = False
-        self._learn_event  = None
         self._btn_learn.setText("Learn")
         self._btn_learn.setProperty("active", "false")
-        self._btn_learn.style().unpolish(self._btn_learn)
-        self._btn_learn.style().polish(self._btn_learn)
+        _restyle(self._btn_learn)
         self._lbl_learn.setText("Click Learn, then send a MIDI event.")
 
     def _commit_learn(self, evt: dict) -> None:
         """Called on the Qt thread when a MIDI event arrives during learn mode."""
-        idx = self._param_combo.currentIndex()
-        if idx < 0 or idx >= len(self._param_items):
+        prop = self._current_prop()
+        if prop is None:
             self._cancel_learn()
             return
 
-        section, obj, field, ftype = self._param_items[idx]
-        ev_type = evt["type"]
-        number  = evt["number"]
-        channel = evt.get("channel", 0)
+        ev_type  = evt["type"]
+        number   = evt["number"]
+        channel  = evt.get("channel", 0)
+        is_cc    = self._rb_cc.isChecked()
+        is_note  = not is_cc
+        is_enum  = _is_enum(prop)
 
-        is_cc_mode   = self._rb_cc.isChecked()
-        is_note_mode = self._rb_note.isChecked()
+        if ev_type == "cc" and is_cc:
+            if is_enum:
+                # Sweep all choices via CC
+                self.pm.bind_enum_to_cc(prop.key, number, channel)
+                choices_str = " | ".join(prop.choices)
+                self._lbl_learn.setText(
+                    f"✓ CC#{number} → {prop.key}  [enum: {choices_str}]"
+                )
+            else:
+                # Range CC
+                try:
+                    min_v = float(self._edit_min.text())
+                    max_v = float(self._edit_max.text())
+                except ValueError:
+                    min_v = prop.min_val or 0.0
+                    max_v = prop.max_val or 1.0
+                if prop.type is int:
+                    min_v, max_v = int(min_v), int(max_v)
+                self.pm.bind_midi_cc(MidiCCBinding(
+                    cc=number, prop_key=prop.key,
+                    min_val=min_v, max_val=max_v,
+                    channel=channel, mode="range",
+                ))
+                self._lbl_learn.setText(
+                    f"✓ CC#{number} → {prop.key}  [{min_v:.4g} – {max_v:.4g}]"
+                )
 
-        if ev_type == "cc" and is_cc_mode:
-            try:
-                min_v = float(self._edit_min.text())
-                max_v = float(self._edit_max.text())
-            except ValueError:
-                min_v, max_v = 0.0, 1.0
-            if ftype is int:
-                min_v, max_v = int(min_v), int(max_v)
-            self.router.map_cc(number, obj, field, min_val=min_v, max_val=max_v,
-                               channel=None, section=section)
-            self._lbl_learn.setText(f"✓ CC#{number} → {section}/{field}")
-
-        elif ev_type == "note" and is_note_mode:
-            self.router.map_note_to_param(number, obj, field,
-                                          channel=None, section=section)
-            self._lbl_learn.setText(f"✓ Note {_note_name(number)} → {section}/{field}")
+        elif ev_type == "note" and is_note and not is_enum:
+            # Toggle / increment (enum case handled by per-row Learn buttons)
+            self.pm.bind_midi_note(MidiNoteBinding(
+                note=number, prop_key=prop.key, channel=channel,
+            ))
+            self._lbl_learn.setText(
+                f"✓ Note {_note_name(number)}({number}) → {prop.key}  [toggle]"
+            )
 
         else:
-            # Wrong event type — keep listening
-            hint = "CC" if is_cc_mode else "Note"
-            self._lbl_learn.setText(f"Waiting for {hint} event…")
+            # Wrong event type (or Note+Enum — handled by per-row buttons)
+            want = "CC" if is_cc else "Note"
+            self._lbl_learn.setText(f"Waiting for {want} event…")
             return   # don't cancel learn
 
+        # Success
         self._learn_active = False
-        self._learn_event  = None
         self._btn_learn.setText("Learn")
         self._btn_learn.setProperty("active", "false")
-        self._btn_learn.style().unpolish(self._btn_learn)
-        self._btn_learn.style().polish(self._btn_learn)
+        _restyle(self._btn_learn)
         self._refresh_assignments()
 
-    # ── MIDI event from router thread (via Qt signal) ─────────────────────────
+    # ── Enum note: per-choice row table ───────────────────────────────────────
+
+    def _build_enum_note_rows(self, prop: PropDef | None = None) -> None:
+        """Clear and rebuild the per-choice note assignment rows."""
+        if prop is None:
+            prop = self._current_prop()
+        layout = self._note_enum_rows_layout
+
+        # Clear existing rows
+        while layout.count() > 0:
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if prop is None or not _is_enum(prop):
+            return
+
+        # Build lookup: target_value -> (note, channel)
+        assigned: dict[str, tuple[int, int]] = {}
+        for b in self.pm.midi_note_bindings():
+            if b.prop_key == prop.key and b.target_value is not None:
+                assigned[str(b.target_value)] = (b.note, b.channel)
+
+        for choice in prop.choices:
+            row_w  = QWidget()
+            row_hl = QHBoxLayout(row_w)
+            row_hl.setContentsMargins(0, 1, 0, 1)
+            row_hl.setSpacing(6)
+
+            lbl_choice = QLabel(choice)
+            lbl_choice.setFixedWidth(118)
+            lbl_choice.setObjectName("mono")
+            row_hl.addWidget(lbl_choice)
+
+            note_ch = assigned.get(choice)
+            note_str = f"{_note_name(note_ch[0])}({note_ch[0]})" if note_ch else "—"
+            lbl_note = QLabel(note_str)
+            lbl_note.setFixedWidth(68)
+            lbl_note.setObjectName("ok" if note_ch else "info")
+            row_hl.addWidget(lbl_note)
+
+            btn_learn = QPushButton("Learn")
+            btn_learn.setObjectName("learn")
+            btn_learn.setProperty("active", "false")
+            btn_learn.setFixedWidth(52)
+            # If this row is already the active listen target, show it
+            if self._note_enum_learn_target == choice:
+                btn_learn.setText("…")
+                btn_learn.setProperty("active", "true")
+                _restyle(btn_learn)
+                self._note_enum_learn_btn = btn_learn
+            btn_learn.clicked.connect(
+                self._make_enum_learn_handler(choice, btn_learn, prop)
+            )
+            row_hl.addWidget(btn_learn)
+
+            if note_ch:
+                btn_rm = QPushButton("✕")
+                btn_rm.setObjectName("remove")
+                btn_rm.setFixedWidth(22)
+                btn_rm.clicked.connect(
+                    self._make_enum_row_remove_handler(note_ch[0], note_ch[1], prop)
+                )
+                row_hl.addWidget(btn_rm)
+
+            row_hl.addStretch()
+            layout.addWidget(row_w)
+
+    def _make_enum_learn_handler(
+        self, choice: str, btn: QPushButton, prop: PropDef
+    ):
+        def _handler():
+            if self._note_enum_learn_target == choice:
+                self._cancel_enum_learn()
+            else:
+                self._cancel_enum_learn()
+                self._note_enum_learn_target = choice
+                self._note_enum_learn_btn    = btn
+                btn.setText("…")
+                btn.setProperty("active", "true")
+                _restyle(btn)
+        return _handler
+
+    def _make_enum_row_remove_handler(self, note: int, channel: int, prop: PropDef):
+        def _handler():
+            self.pm.remove_midi_note(note, channel)
+            self._build_enum_note_rows(prop)
+            self._refresh_assignments()
+        return _handler
+
+    def _cancel_enum_learn(self) -> None:
+        """Reset per-row learn state without committing."""
+        self._note_enum_learn_target = None
+        if self._note_enum_learn_btn is not None:
+            self._note_enum_learn_btn.setText("Learn")
+            self._note_enum_learn_btn.setProperty("active", "false")
+            _restyle(self._note_enum_learn_btn)
+            self._note_enum_learn_btn = None
+
+    def _commit_enum_learn(self, evt: dict) -> None:
+        """Called on Qt thread when a MIDI event arrives during per-row learn."""
+        if evt["type"] != "note" or evt.get("value", 0) == 0:
+            return  # ignore CC and note-off
+
+        prop   = self._current_prop()
+        choice = self._note_enum_learn_target
+        if prop is None or choice is None:
+            self._cancel_enum_learn()
+            return
+
+        note    = evt["number"]
+        channel = evt.get("channel", 0)
+        self.pm.bind_midi_note(MidiNoteBinding(
+            note=note, prop_key=prop.key,
+            channel=channel, target_value=choice,
+        ))
+
+        self._cancel_enum_learn()
+        self._build_enum_note_rows(prop)
+        self._refresh_assignments()
+
+    # ── MIDI event routing ────────────────────────────────────────────────────
 
     def _raw_listener(self, evt: dict) -> None:
-        """Called from MIDI thread — only emit the signal, never touch widgets."""
+        """Called from MIDI thread -- emit signal (Qt-safe) and dispatch to PM."""
+        try:
+            if evt["type"] == "cc":
+                self.pm.apply_midi_cc(evt.get("channel", 0), evt["number"], evt["value"])
+            elif evt["type"] == "note":
+                self.pm.apply_midi_note(evt.get("channel", 0), evt["number"], evt.get("value", 0))
+        except Exception:
+            pass
         self._bridge.midi_event.emit(evt)
 
     def _on_midi_event(self, evt: dict) -> None:
-        """Qt thread handler for incoming MIDI events."""
-        if self._learn_active:
+        """Qt thread handler -- routes to the active learn path."""
+        if self._note_enum_learn_target is not None:
+            self._commit_enum_learn(evt)
+        elif self._learn_active:
             self._commit_learn(evt)
 
     # ── poll timer ─────────────────────────────────────────────────────────────
@@ -526,37 +755,48 @@ class MidiPanel(QWidget):
                 self._lbl_activity.setText(f"CC#{n}  ch={ch}  val={v}")
             elif t == "note":
                 self._lbl_activity.setText(
-                    f"{'Note On' if v > 0 else 'Note Off'}  {_note_name(n)}({n})  ch={ch}  vel={v}"
+                    f"{'Note On' if v > 0 else 'Note Off'}  "
+                    f"{_note_name(n)}({n})  ch={ch}  vel={v}"
                 )
 
     # ── assignment list ────────────────────────────────────────────────────────
 
     def _refresh_assignments(self) -> None:
-        # Clear existing rows (except the stretch at the end)
+        # Keep the enum note rows in sync whenever assignments change
+        prop = self._current_prop()
+        if prop and _is_enum(prop) and not self._rb_cc.isChecked():
+            self._build_enum_note_rows(prop)
+
+        # Clear existing rows (except the terminal stretch)
         while self._assign_layout.count() > 1:
             item = self._assign_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        rows: list[tuple[str, dict, str, int]] = []  # (kind, data, display, idx)
+        rows = []
 
-        for i, d in enumerate(self.router.get_cc_mappings()):
-            label = (f"CC#{d['cc_num']}  →  {d['section']} / {d['field']}"
-                     f"   [{d['min_val']:.4g} – {d['max_val']:.4g}]")
-            rows.append(("cc", d, label, i))
-
-        for i, d in enumerate(self.router.get_note_param_mappings()):
-            note_str = _note_name(d["note"])
-            if d.get("toggle"):
-                label = f"Note {note_str}({d['note']})  →  {d['section']} / {d['field']}  [toggle]"
+        for b in self.pm.midi_cc_bindings():
+            p = self.pm._defs.get(b.prop_key)
+            if p and _is_enum(p):
+                choices_str = " | ".join(p.choices)
+                label = f"CC#{b.cc}  ->  {b.prop_key}  [enum: {choices_str}]"
             else:
-                label = (f"Note {note_str}({d['note']})  →  {d['section']} / {d['field']}"
-                         f"   on={d['on_value']} off={d['off_value']}")
-            rows.append(("note_param", d, label, i))
+                lo = b.min_val if b.min_val is not None else "?"
+                hi = b.max_val if b.max_val is not None else "?"
+                label = (f"CC#{b.cc}  ->  {b.prop_key}  [{lo:.4g} - {hi:.4g}]"
+                         if isinstance(lo, float)
+                         else f"CC#{b.cc}  ->  {b.prop_key}  [{lo} - {hi}]")
+            rows.append(("cc", label, b.cc, b.channel))
 
-        for i, d in enumerate(self.router.get_note_mappings()):
-            label = f"Note {_note_name(d['note'])}({d['note']})  →  {d['section']} / {d['field']}  [callback]"
-            rows.append(("note_cb", d, label, i))
+        for b in self.pm.midi_note_bindings():
+            if b.prop_key is None:
+                continue
+            note_str = f"{_note_name(b.note)}({b.note})"
+            if b.target_value is not None:
+                label = f"Note {note_str}  ->  {b.prop_key} = '{b.target_value}'"
+            else:
+                label = f"Note {note_str}  ->  {b.prop_key}  [toggle]"
+            rows.append(("note", label, b.note, b.channel))
 
         if not rows:
             lbl = QLabel("No assignments yet.")
@@ -564,7 +804,7 @@ class MidiPanel(QWidget):
             self._assign_layout.insertWidget(0, lbl)
             return
 
-        for pos, (kind, d, label, idx) in enumerate(rows):
+        for pos, (kind, label, num, ch) in enumerate(rows):
             row_w  = QWidget()
             row_hl = QHBoxLayout(row_w)
             row_hl.setContentsMargins(0, 1, 0, 1)
@@ -575,26 +815,20 @@ class MidiPanel(QWidget):
             lbl.setWordWrap(False)
             row_hl.addWidget(lbl, stretch=1)
 
-            if kind != "note_cb":   # callbacks registered in code: read-only
-                btn_rm = QPushButton("✕")
-                btn_rm.setObjectName("remove")
-                btn_rm.setToolTip("Remove assignment")
-                # Capture loop vars
-                btn_rm.clicked.connect(
-                    self._make_remove_handler(kind, idx)
-                )
-                row_hl.addWidget(btn_rm)
+            btn_rm = QPushButton("x")
+            btn_rm.setObjectName("remove")
+            btn_rm.setToolTip("Remove assignment")
+            btn_rm.clicked.connect(self._make_remove_handler(kind, num, ch))
+            row_hl.addWidget(btn_rm)
 
             self._assign_layout.insertWidget(pos, row_w)
 
-    def _make_remove_handler(self, kind: str, idx: int):
+    def _make_remove_handler(self, kind: str, num: int, channel: int):
         def _handler():
             if kind == "cc":
-                self.router.unmap_cc_by_index(idx)
-            elif kind == "note_param":
-                self.router.unmap_note_param_by_index(idx)
-            elif kind == "note_cb":
-                self.router.unmap_note_by_index(idx)
+                self.pm.remove_midi_cc(num, channel)
+            else:
+                self.pm.remove_midi_note(num, channel)
             self._refresh_assignments()
         return _handler
 
@@ -605,8 +839,9 @@ class MidiPanel(QWidget):
             self, "Save MIDI Mappings", str(self.save_path), "JSON (*.json)"
         )
         if path:
-            self.router.save_mappings(path)
+            self.pm.save_json(path)
             self.save_path = Path(path)
+            self._lbl_learn.setText(f"Saved: {Path(path).name}")
 
     def _on_load(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -614,89 +849,11 @@ class MidiPanel(QWidget):
         )
         if not path:
             return
-
         try:
-            data = json.loads(Path(path).read_text())
+            self.pm.load_json(path)
+            self.save_path = Path(path)
+            self._lbl_learn.setText(f"Loaded: {Path(path).name}")
+            self._refresh_assignments()
         except Exception as exc:
+            self._lbl_learn.setText(f"Load error: {exc}")
             print(f"[midi_panel] load error: {exc}")
-            return
-
-        # Build a (section, field) → obj lookup from our targets
-        lookup: dict[tuple[str, str], Any] = {}
-        for section, obj, _ in self.targets:
-            for fname, _, _ in self._iter_fields(obj):
-                lookup[(section, fname)] = obj
-
-        def resolve(section: str, field: str) -> Any | None:
-            return lookup.get((section, field))
-
-        n_cc   = self.router.load_cc_mappings(data.get("cc", []),   resolve)
-        n_np   = self.router.load_note_param_mappings(
-                     data.get("note_param", []), resolve)
-        print(f"[midi_panel] loaded {n_cc} CC + {n_np} note-param mappings from {path}")
-        self._refresh_assignments()
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _iter_fields(obj: Any):
-        if dataclasses.is_dataclass(obj):
-            for f in dataclasses.fields(obj):
-                val = getattr(obj, f.name)
-                t   = f.type if isinstance(f.type, type) else type(val)
-                yield f.name, t, val
-        else:
-            for name, ann in getattr(obj, "__annotations__", {}).items():
-                if not name.startswith("_"):
-                    val = getattr(obj, name, None)
-                    t   = ann if isinstance(ann, type) else type(val)
-                    yield name, t, val
-
-
-# ── public entry point ────────────────────────────────────────────────────────
-
-def start_midi_panel(
-    router    : MidiRouter | None = None,
-    *targets,
-    title     : str = "MIDI Assignments",
-    save_path : str | Path | None = None,
-) -> threading.Thread:
-    """
-    Launch a MidiPanel in a background daemon thread.
-
-    router   — MidiRouter instance; defaults to get_router() singleton
-    targets  — same format as start_param_dialog:
-                   ("Section", obj)
-                   ("Section", obj, hints_dict)
-    title    — window title
-    save_path— default path for save/load dialogs
-
-    Returns the daemon thread (usually not needed).
-    """
-    if router is None:
-        router = get_router()
-
-    pairs: list[tuple[str, Any, dict]] = []
-    for t in targets:
-        if isinstance(t, tuple):
-            if len(t) >= 3 and isinstance(t[0], str):
-                pairs.append((t[0], t[1], t[2]))
-            elif len(t) == 2 and isinstance(t[0], str):
-                pairs.append((t[0], t[1], {}))
-            else:
-                pairs.append((type(t[0]).__name__, t[0], {}))
-        else:
-            pairs.append((type(t).__name__, t, {}))
-
-    sp = Path(save_path) if save_path else None
-
-    def _run() -> None:
-        app  = QApplication.instance() or QApplication([])
-        panel = MidiPanel(router, pairs, title=title, save_path=sp)
-        panel.show()
-        app.exec()
-
-    t = threading.Thread(target=_run, daemon=True, name="midi-panel")
-    t.start()
-    return t
-

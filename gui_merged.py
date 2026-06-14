@@ -35,8 +35,13 @@ import moderngl
 import moderngl_window as mglw
 import warp as wp
 
+
+from param_dialog import start_param_dialog, apply_fullscreen_to_monitor
+
+_pending_monitor: int | None = None
+
 from post import (
-    FeedbackPostEffect, PassThroughEffect, GlitchEffect,
+    FeedbackPostEffect, PassThroughEffect, GlitchEffect, BokehEffect,
     FeedbackParams, BLEND_MODES, SMEAR_PATTERNS, PRESETS,
 )
 from drawlib.camera import OrbitCamera
@@ -46,7 +51,18 @@ from elements.nn_graph import NNGraph
 from elements.circleaxis import CircleAxisDrawing
 from elements.laser_ribbons import LaserRibbons
 
-import audio_metrics
+from audio_panel      import AudioPanel
+from property_manager import PropertyManager, build_default_manager
+
+# Late-bound audio callbacks registered by MergedGUI after it constructs its
+# scene elements.  AudioPanel calls each entry from the audio thread so that
+# the panel is the single audio stream owner.
+_circles_audio_fns: list = []
+
+# Module-level PM (params + controls only; element props added in MergedGUI.__init__)
+# Shared with the Qt panels so MidiPanel can show all scene/feedback params
+# before the GL window starts.
+_pm: PropertyManager | None = None
 
 wp.init()
 DEVICE = "cuda" if wp.get_cuda_device_count() > 0 else "cpu"
@@ -70,6 +86,9 @@ _params = FeedbackParams(
 )
 
 
+_EFFECT_NAMES = ["feedback", "pass_through", "glitch", "bokeh"]
+
+
 @dataclass
 class SceneControls:
     show_cloud    : bool  = True
@@ -77,8 +96,9 @@ class SceneControls:
     show_circles  : bool  = True
     show_lasers   : bool  = True
     scene_alpha   : float = 0.18
-    blend_mode    : str   = "lerp"
+    blend_mode    : str   = "screen"   # screen keeps trail persistence = decay only
     smear_pattern : str   = "outward"
+    active_effect : str   = "feedback"
 
 
 _controls = SceneControls()
@@ -131,6 +151,7 @@ class MergedGUI(mglw.WindowConfig):
             ),
             PassThroughEffect(),
             GlitchEffect(),
+            BokehEffect(),
         ]
         self._effect_idx = 0
 
@@ -138,26 +159,33 @@ class MergedGUI(mglw.WindowConfig):
             eff.setup(self.ctx, w, h)
 
         # -- Audio ------------------------------------------------------------
-        self._audio = audio_metrics.AudioAnalyzer(
-           # device   = "CABLE Output (VB-Audio Virtual Cable), Windows DirectSound",
-            on_frame = self._on_audio_frame,
+        # AudioPanel (Qt thread) owns the audio stream; register this scene's
+        # callback so the panel drives circles alongside PM bindings.
+        _circles_audio_fns.append(self._circles.update_audio)
+
+        # -- Property manager -------------------------------------------------
+        # Extend the shared module-level PM with element-specific properties now
+        # that the GL elements exist.  If _pm was already created by the Qt thread
+        # (see __main__), properties that were registered earlier are skipped
+        # (idempotent); only element sections are added here.
+        global _pm
+        self.pm = build_default_manager(
+            _params, _controls,
+            self.nn_graph, self._lasers, self._circles,
+            pm=_pm,
         )
-        self._audio.start()
+        _pm = self.pm   # keep module ref in sync
 
         effect_names = "  |  ".join(e.name for e in self._effects)
         print(f"[merged] effects: {effect_names}")
         print("[merged] 1=cloud  2=nn  3=circles  4=lasers  R=regen  P=post  O=orbit  Tab=effect  ESC=quit")
+        print("[merged] pm.describe() to list all properties  |  pm.save_preset('name') to snapshot")
 
     # -- Convenience ----------------------------------------------------------
 
     @property
     def _active_effect(self):
         return self._effects[self._effect_idx]
-
-    # -- Audio ----------------------------------------------------------------
-
-    def _on_audio_frame(self, m: audio_metrics.AudioMetrics) -> None:
-        self._circles.update_audio(m)
 
     # -- Regenerate -----------------------------------------------------------
 
@@ -171,6 +199,12 @@ class MergedGUI(mglw.WindowConfig):
     # -- Per-frame ------------------------------------------------------------
 
     def on_render(self, current_time: float, frame_time: float):
+
+        global _pending_monitor
+        if _pending_monitor is not None:
+            apply_fullscreen_to_monitor(self.wnd, _pending_monitor)
+            _pending_monitor = None
+
         self.time += frame_time
 
         if _controls.show_cloud:
@@ -179,6 +213,17 @@ class MergedGUI(mglw.WindowConfig):
         if _controls.show_nn:
             self.nn_graph.step(self.time)
             self.nn_graph.upload()
+
+        # Sync active_effect selection from param_dialog -> _effect_idx.
+        desired = _controls.active_effect
+        effect_names = [e.name for e in self._effects]
+        if desired in effect_names:
+            new_idx = effect_names.index(desired)
+            if new_idx != self._effect_idx:
+                self._effect_idx = new_idx
+                print(f"[merged] effect -> {self._active_effect.name}")
+        else:
+            _controls.active_effect = self._active_effect.name
 
         # Sync param_dialog controls -> active feedback effect each frame.
         eff = self._active_effect
@@ -240,51 +285,66 @@ class MergedGUI(mglw.WindowConfig):
             return
         keys = self.wnd.keys
 
-        # -- Scene toggles (always active) ------------------------------------
-        if key == keys.NUMBER_1:
-            _controls.show_cloud = not _controls.show_cloud
-            print(f"[merged] cloud/ball: {'ON' if _controls.show_cloud else 'OFF'}")
-        elif key == keys.NUMBER_2:
-            _controls.show_nn = not _controls.show_nn
-            print(f"[merged] nn-graph: {'ON' if _controls.show_nn else 'OFF'}")
-        elif key == keys.NUMBER_3:
-            _controls.show_circles = not _controls.show_circles
-            print(f"[merged] circles: {'ON' if _controls.show_circles else 'OFF'}")
-        elif key == keys.NUMBER_4:
-            _controls.show_lasers = not _controls.show_lasers
-            print(f"[merged] lasers: {'ON' if _controls.show_lasers else 'OFF'}")
-        elif key == keys.R:
+        # -- App-level actions (not delegated to PropertyManager) -------------
+        if key == keys.R:
             self._regen_all()
-        elif key == keys.ESCAPE:
+            return
+        if key == keys.ESCAPE:
             self.wnd.close()
-
-        # -- Post pipeline toggle ---------------------------------------------
-        elif key == keys.P:
+            return
+        if key == keys.P:
             self.post_effect_on = not self.post_effect_on
             print(f"[merged] post pipeline: {'ON' if self.post_effect_on else 'OFF'}")
-
-        # -- Camera -----------------------------------------------------------
-        elif key == keys.O:
+            return
+        if key == keys.O:
             self.camera.orbit_enabled = not self.camera.orbit_enabled
-            if self.camera.orbit_enabled:
-                self.camera._user_idle = 0.0
-                print("[merged] orbit: ON")
-            else:
-                print("[merged] orbit: OFF")
+            self.camera._user_idle = 0.0 if self.camera.orbit_enabled else self.camera._user_idle
+            print(f"[merged] orbit: {'ON' if self.camera.orbit_enabled else 'OFF'}")
+            return
 
-        # -- Effect switcher (Tab) and per-effect keys ------------------------
-        elif self.post_effect_on:
-            if key == keys.TAB:
-                self._effect_idx = (self._effect_idx + 1) % len(self._effects)
-                print(f"[merged] effect -> {self._active_effect.name}")
-            else:
-                # Forward to active effect; sync any changes back to _controls
-                eff = self._active_effect
+        # -- T key: cycle named preset ----------------------------------------
+        if key == keys.T and self.post_effect_on:
+            eff = self._active_effect
+            if isinstance(eff, FeedbackPostEffect):
                 eff.on_key(key, action, keys)
-                if isinstance(eff, FeedbackPostEffect):
-                    _controls.scene_alpha   = eff.scene_alpha
-                    _controls.blend_mode    = BLEND_MODES[eff._blend_mode_idx]
-                    _controls.smear_pattern = eff._smear_pattern_name
+                # Sync preset changes back to _params (already in-place) and _controls
+                _controls.scene_alpha   = eff.scene_alpha
+                _controls.blend_mode    = BLEND_MODES[eff._blend_mode_idx]
+                _controls.smear_pattern = eff._smear_pattern_name
+            return
+
+        # -- All other keys: delegate to PropertyManager ----------------------
+        # Map moderngl key constants to the string names registered in the PM.
+        _KEY_MAP = {
+            keys.NUMBER_1: "NUMBER_1", keys.NUMBER_2: "NUMBER_2",
+            keys.NUMBER_3: "NUMBER_3", keys.NUMBER_4: "NUMBER_4",
+            keys.TAB: "TAB",
+            keys.Z: "Z", keys.X: "X",
+            keys.D: "D", keys.F: "F",
+            keys.Q: "Q", keys.W: "W",
+            keys.A: "A", keys.S: "S",
+            keys.H: "H", keys.J: "J",
+            keys.C: "C", keys.V: "V",
+            keys.B: "B", keys.N: "N",
+            keys.K: "K", keys.L: "L",
+            keys.I: "I", keys.U: "U",
+            keys.G: "G", keys.M: "M",
+        }
+        key_name = _KEY_MAP.get(key)
+        if key_name and self.pm.apply_key_action(key_name):
+            # Sync any scene_alpha / blend_mode / smear_pattern changes to the
+            # active FeedbackPostEffect so the GPU effect picks them up.
+            eff = self._active_effect
+            if isinstance(eff, FeedbackPostEffect):
+                eff.scene_alpha = _controls.scene_alpha
+                if _controls.blend_mode in BLEND_MODES:
+                    eff._blend_mode_idx = BLEND_MODES.index(_controls.blend_mode)
+                if _controls.smear_pattern != eff._smear_pattern_name:
+                    eff._smear_pattern_name = _controls.smear_pattern
+                    eff._smear_pattern_idx  = SMEAR_PATTERNS.index(_controls.smear_pattern)
+                    if eff._loop is not None:
+                        eff._loop.set_smear_pattern(_controls.smear_pattern)
+            return
 
     def on_resize(self, width: int, height: int):
         for eff in self._effects:
@@ -292,13 +352,58 @@ class MergedGUI(mglw.WindowConfig):
 
 
 if __name__ == "__main__":
-    from param_dialog import start_param_dialog
-    start_param_dialog(
-        ("Post-FX", _params),
-        ("Scene",   _controls, {
-            "blend_mode":    ("combo", BLEND_MODES),
-            "smear_pattern": ("combo", SMEAR_PATTERNS),
-        }),
-        title="MergedGUI Params",
-    )
+    import threading
+    from PySide6.QtWidgets import QApplication
+    from param_dialog import ParamDialog
+    from midi_input   import get_router
+    from midi_panel   import MidiPanel
+    from audio_panel  import AudioPanel
+
+    _router = get_router()
+
+    # Build base PM now (feedback + scene props only; elements added in GL __init__)
+    _pm = build_default_manager(_params, _controls, None, None, None)
+
+    def _run_qt() -> None:
+        """Single Qt thread — one QApplication, both panels."""
+        app = QApplication.instance() or QApplication([])
+
+        dlg = ParamDialog(
+            [
+                ("Post-FX", _params, {}),
+                ("Scene",   _controls, {
+                    "blend_mode":    ("combo", BLEND_MODES),
+                    "smear_pattern": ("combo", SMEAR_PATTERNS),
+                    "active_effect": ("combo", _EFFECT_NAMES),
+                }),
+            ],
+            title="MergedGUI Params",
+            on_monitor_change=lambda idx: globals().__setitem__('_pending_monitor', idx),
+        )
+        dlg.show()
+
+        # MidiPanel now uses PropertyManager directly.
+        # _pm initially has feedback + scene; element sections (nn_graph, lasers,
+        # circles) are added to the same object when MergedGUI.__init__ runs.
+        midi = MidiPanel(_router, _pm, title="MIDI Assignments")
+        midi.show()
+
+        # AudioPanel owns the single audio stream; _circles_audio_fns is
+        # populated by MergedGUI.__init__ so circles receive audio even though
+        # the GL window starts after this Qt thread.
+        audio = AudioPanel(
+            pm             = _pm,
+            title          = "Audio Input",
+            extra_on_frame = lambda m: [fn(m) for fn in _circles_audio_fns],
+        )
+        audio.show()
+
+        app.exec()
+
+    threading.Thread(target=_run_qt, daemon=True, name="qt-ui").start()
+
     mglw.run_window_config(MergedGUI)
+
+    # After the GL window closes, the PropertyManager is accessible as:
+    #   gui_instance.pm
+    # Use pm.save_json("session.json") to persist presets and mappings.

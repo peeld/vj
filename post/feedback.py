@@ -56,20 +56,44 @@ _BLEND_OVERLAY    = 6
 
 @wp.func
 def _blend_channel(c: float, s: float, alpha: float, mode: int) -> float:
+    """
+    Blend the current scene pixel (s) into the accumulated feedback buffer (c).
+
+    c   = feedback buffer value, already warped+decayed by _feedback_kernel
+    s   = current scene pixel value  [0, 1]
+    alpha = scene_alpha  — controls how strongly the scene injects
+
+    IMPORTANT: most modes do NOT attenuate c, because decay in _feedback_kernel
+    already controls trail persistence.  Only 'lerp' (crossfade) intentionally
+    reduces c, which is useful when you want the scene to dominate quickly.
+
+    Effective persistence reference (decay=0.993):
+      screen / additive / lighten / dodge : ~100-frame half-life (decay only)
+      lerp (alpha=0.18)                   : ~3-frame half-life (decay * 0.82)
+    """
     sa = s * alpha
     if mode == _BLEND_ADDITIVE:
+        # Scene adds on top of feedback — can't exceed 1.0.
         return wp.clamp(c + sa, 0.0, 1.0)
     elif mode == _BLEND_SCREEN:
+        # Screen: bright accumulation without blowout; c unchanged when s=0.
         return 1.0 - (1.0 - c) * (1.0 - sa)
     elif mode == _BLEND_LIGHTEN:
+        # Take whichever is brighter; never dims the feedback.
         return wp.max(c, sa)
     elif mode == _BLEND_DODGE:
+        # Color dodge: scene brightens feedback proportionally.
         return wp.clamp(c / (1.0 - sa + 1e-4), 0.0, 1.0)
     elif mode == _BLEND_DIFFERENCE:
+        # Interference fringes — great with fast hue_shift.
         return wp.abs(c - sa)
     elif mode == _BLEND_OVERLAY:
+        # Overlay: amplifies contrast in both feedback and scene.
         return wp.where(c < 0.5, 2.0 * c * sa, 1.0 - 2.0 * (1.0 - c) * (1.0 - sa))
-    else:  # lerp
+    else:
+        # lerp / crossfade: deliberately blends toward the scene each frame.
+        # Use sparingly — compounds with decay to shorten trails significantly.
+        # Prefer screen or additive for long-trail accumulation.
         return c * (1.0 - alpha) + sa
 
 
@@ -136,6 +160,7 @@ class EffectPreset:
 
 PRESETS: list[EffectPreset] = [
     # gentle — slow atmospheric drift; the MergedGUI default feel.
+    # Uses screen blend so decay alone controls trail persistence (~100-frame half-life).
     EffectPreset(
         name="gentle",
         params=FeedbackParams(
@@ -145,7 +170,7 @@ PRESETS: list[EffectPreset] = [
             hue_shift=0.005, chroma_offset=0.005,
             sat_boost=1.12, smear_strength=0.0, fisheye_strength=0.0,
         ),
-        scene_alpha=0.18, smear_pattern="outward", blend_mode="lerp",
+        scene_alpha=0.18, smear_pattern="outward", blend_mode="screen",
     ),
     # tunnel — zoom-in vortex with corkscrew smear and barrel lens.
     EffectPreset(
@@ -193,7 +218,7 @@ PRESETS: list[EffectPreset] = [
             hue_shift=0.015, chroma_offset=0.005,
             sat_boost=1.6, smear_strength=0.010, fisheye_strength=0.0,
         ),
-        scene_alpha=0.15, smear_pattern="swirl", blend_mode="difference",
+        scene_alpha=0.12, smear_pattern="swirl", blend_mode="screen",
     ),
     # aurora — horizontal cross-flow streaks, screen blend, slow colour drift.
     EffectPreset(
@@ -238,7 +263,7 @@ class FeedbackPostEffect(PostEffect):
         params:        FeedbackParams | None = None,
         scene_alpha:   float                 = 0.13,
         smear_pattern: str                   = "swirl",
-        blend_mode:    str                   = "lerp",
+        blend_mode:    str                   = "screen",
         preset_idx:    int | None            = None,
     ):
         self.params      = params or FeedbackParams()

@@ -147,24 +147,30 @@ def _ribbon_positions(pts: np.ndarray, half_w: float) -> np.ndarray:
     return verts
 
 
-def _blade_positions(cx: float, radius: float, spin_offset: float) -> np.ndarray:
+def _blade_positions(
+    cx: float,
+    radius: float,
+    spin_offset: float,
+    n_blades: int = N_BLADES,
+    blade_size_factor: float = BLADE_SIZE_FACTOR,
+) -> np.ndarray:
     """
-    Returns (N_BLADES * 4, 3) vertex positions for turbine-blade quads.
+    Returns (n_blades * 4, 3) vertex positions for turbine-blade quads.
 
     Each blade i:
-      - sits at angular position  theta_i = spin_offset + 2*pi*i/N_BLADES
-      - has blade-pitch angle     phi_i   = 2*pi*i/N_BLADES  (fans 0 to ~360 deg)
+      - sits at angular position  theta_i = spin_offset + 2*pi*i/n_blades
+      - has blade-pitch angle     phi_i   = 2*pi*i/n_blades  (fans 0 to ~360 deg)
 
     Vertex order per blade: [+pitch+radial, +pitch-radial, -pitch-radial, -pitch+radial]
     Two triangles per blade: (0,1,2) and (0,2,3).
     """
-    n  = N_BLADES
+    n  = n_blades
     bi = np.arange(n, dtype=np.float32)
 
     theta = spin_offset + 2.0 * np.pi * bi / n
     phi   = 2.0 * np.pi * bi / n
 
-    hs = radius * BLADE_SIZE_FACTOR * 0.5
+    hs = radius * blade_size_factor * 0.5
 
     P = np.zeros((n, 3), dtype=np.float32)
     P[:, 0] = cx
@@ -226,9 +232,12 @@ class TravAnimMeta:
 # ---------------------------------------------------------------------------
 
 def build_geometry(
-    n_circles: int = N_CIRCLES,
-    bound:     float = BOUND,
-    seed:      int | None = None,
+    n_circles        : int        = N_CIRCLES,
+    n_trav_lines     : int        = N_TRAV_LINES,
+    n_blades         : int        = N_BLADES,
+    blade_size_factor: float      = BLADE_SIZE_FACTOR,
+    bound            : float      = BOUND,
+    seed             : int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list, list]:
     """
     Returns (verts, colors, indices, circle_metas, trav_metas).
@@ -281,15 +290,17 @@ def build_geometry(
         ])
         add_ribbon(pts, cols, CIRCLE_HALF_W)
 
-        blade_verts_init = _blade_positions(cx, radius, 0.0)
+        blade_verts_init = _blade_positions(cx, radius, 0.0,
+                                              n_blades=n_blades,
+                                              blade_size_factor=blade_size_factor)
 
-        bi_arr  = np.arange(N_BLADES, dtype=np.float32)
-        phi_arr = 2.0 * np.pi * bi_arr / N_BLADES
+        bi_arr  = np.arange(n_blades, dtype=np.float32)
+        phi_arr = 2.0 * np.pi * bi_arr / n_blades
         face_alpha = (np.abs(np.sin(phi_arr)) * 0.35 + 0.65).astype(np.float32)
 
-        blade_colors = np.zeros((N_BLADES * 4, 4), dtype=np.float32)
-        for bi in range(N_BLADES):
-            blade_frac = bi / N_BLADES
+        blade_colors = np.zeros((n_blades * 4, 4), dtype=np.float32)
+        for bi in range(n_blades):
+            blade_frac = bi / n_blades
             col = _hsv(
                 (bh + blade_frac * 0.12) % 1.0,
                 min(1.0, bs + 0.15),
@@ -298,8 +309,8 @@ def build_geometry(
             )
             blade_colors[bi * 4 : bi * 4 + 4] = col
 
-        blade_idx = np.zeros(N_BLADES * 6, dtype=np.uint32)
-        for bi in range(N_BLADES):
+        blade_idx = np.zeros(n_blades * 6, dtype=np.uint32)
+        for bi in range(n_blades):
             base = vert_offset + bi * 4
             o    = bi * 6
             blade_idx[o]   = base;     blade_idx[o+1] = base + 1
@@ -309,18 +320,18 @@ def build_geometry(
         all_verts.append(blade_verts_init)
         all_colors.append(blade_colors)
         all_idx.append(blade_idx)
-        vert_offset += N_BLADES * 4
+        vert_offset += n_blades * 4
 
         circle_metas.append(CircleAnimMeta(
             cx=cx, radius=radius,
             phase=phase, speed=speed, amplitude=amplitude,
             n_verts=(N_SEG + 1) * 2,
-            n_blade_verts=N_BLADES * 4,
+            n_blade_verts=n_blades * 4,
         ))
 
     trav_metas: list[TravAnimMeta] = []
 
-    for li in range(N_TRAV_LINES):
+    for li in range(n_trav_lines):
         lh, ls = warm_hs[li % len(warm_hs)]
         lh = (lh + li * 0.057) % 1.0
 
@@ -339,7 +350,7 @@ def build_geometry(
         p2  = np.array([x2, y, z], dtype=np.float32)
         pts = np.stack([p1, p2])
 
-        lv = float(li / N_TRAV_LINES)
+        lv = float(li / max(1, n_trav_lines))
         cols = np.array([
             _hsv(lh, max(0.45, ls), 0.30 + 0.25 * lv),
             _hsv((lh + 0.09) % 1.0, max(0.45, ls), 0.90),
@@ -382,6 +393,16 @@ class CircleAxisDrawing:
         self._circle_metas: list[CircleAnimMeta] = []
         self._trav_metas:   list[TravAnimMeta]   = []
         self._audio_data:   audio_metrics.AudioMetrics | None = None
+
+        # Tuneable instance attributes (PropertyManager binds to these;
+        # n_circles / n_trav_lines / n_blades / blade_size_factor take effect
+        # on the next regen(); blade_spin_speed is applied every frame).
+        self.n_circles        = N_CIRCLES
+        self.n_trav_lines     = N_TRAV_LINES
+        self.n_blades         = N_BLADES
+        self.blade_size_factor = BLADE_SIZE_FACTOR
+        self.blade_spin_speed  = BLADE_SPIN_SPEED
+
         self.regen()
 
     # ------------------------------------------------------------------
@@ -393,14 +414,22 @@ class CircleAxisDrawing:
         self._audio_data = m
 
     def regen(self) -> None:
-        """Rebuild geometry with the next seed."""
+        """Rebuild geometry with the next seed, using current instance settings."""
         if self._geo is None:
             self._geo = RibbonDrawable(self._ctx)
-        verts, colors, idx, circle_metas, trav_metas = build_geometry(seed=self._seed)
+        verts, colors, idx, circle_metas, trav_metas = build_geometry(
+            n_circles   = self.n_circles,
+            n_trav_lines= self.n_trav_lines,
+            n_blades    = self.n_blades,
+            blade_size_factor = self.blade_size_factor,
+            seed        = self._seed,
+        )
         self._geo.setup(verts, colors, idx)
         self._circle_metas = circle_metas
         self._trav_metas   = trav_metas
-        print(f"[circleaxis] geometry generated  (seed={self._seed})")
+        print(f"[circleaxis] geometry generated  (seed={self._seed}  "
+              f"circles={self.n_circles}  trav={self.n_trav_lines}  "
+              f"blades={self.n_blades})")
         self._seed += 1
 
     def on_key(self, key, action, keys) -> bool:
@@ -445,8 +474,11 @@ class CircleAxisDrawing:
             pts = _circle_pts(cx, m.radius, N_SEG)
             parts.append(_ribbon_positions(pts, CIRCLE_HALF_W))
 
-            spin = t * BLADE_SPIN_SPEED
-            parts.append(_blade_positions(cx, m.radius, spin))
+            n_blades_this = m.n_blade_verts // 4
+            spin = t * self.blade_spin_speed
+            parts.append(_blade_positions(cx, m.radius, spin,
+                                          n_blades=n_blades_this,
+                                          blade_size_factor=self.blade_size_factor))
 
         for m in self._trav_metas:
             dx  = m.amplitude * np.sin(t * m.speed + m.phase) * 15

@@ -203,9 +203,9 @@ class NNGraph:
         amplitude: float = 0.08,
         fade_dist: float = 0.5,
     ):
-        self._device    = device
-        self._amplitude = amplitude
-        self._fade_dist = fade_dist
+        self._device   = device
+        self.amplitude = amplitude   # PropertyManager binds to this
+        self.fade_dist = fade_dist   # PropertyManager binds to this
 
         # Warp arrays
         self._wp_pos      = wp.zeros(N,        dtype=wp.vec3)
@@ -235,7 +235,7 @@ class NNGraph:
     def step(self, time: float) -> None:
         """Run the full Warp kernel pipeline for one frame."""
         wp.launch(_animate_points, dim=N,
-                  inputs=[self._wp_pos, self._wp_base_pos, time, self._amplitude],
+                  inputs=[self._wp_pos, self._wp_base_pos, time, self.amplitude],
                   device=self._device)
         wp.launch(_find_knn5, dim=N,
                   inputs=[self._wp_pos, self._wp_nn_idx, self._wp_nn_dist, N],
@@ -243,7 +243,7 @@ class NNGraph:
         wp.launch(_build_edges, dim=N,
                   inputs=[self._wp_pos, self._wp_col,
                           self._wp_nn_idx, self._wp_nn_dist,
-                          self._wp_edge_pos, self._wp_edge_col, self._fade_dist],
+                          self._wp_edge_pos, self._wp_edge_col, self.fade_dist],
                   device=self._device)
 
     def upload(self) -> None:

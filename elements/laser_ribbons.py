@@ -178,6 +178,15 @@ class LaserRibbons:
         self._ctx = ctx
         self._rng = np.random.default_rng()
 
+        # Tuneable instance attributes (PropertyManager binds to these;
+        # they shadow the module-level constants and can be changed at runtime)
+        self.ribbon_speed   = RIBBON_SPEED
+        self.ribbon_length  = RIBBON_LENGTH
+        self.half_width     = HALF_WIDTH
+        self.spawn_interval = SPAWN_INTERVAL
+        self.spawn_spread   = SPAWN_SPREAD
+        self.max_dist       = MAX_DIST
+
         # CPU shadow arrays (source of truth for spawning)
         n = MAX_RIBBONS
         self._np_pos   = np.zeros((n, 3), dtype=np.float32)
@@ -236,8 +245,8 @@ class LaserRibbons:
         self._next_slot = (self._next_slot + 1) % MAX_RIBBONS
 
         # Random lateral jitter so ribbons fan out slightly
-        jr = self._rng.uniform(-SPAWN_SPREAD, SPAWN_SPREAD)
-        ju = self._rng.uniform(-SPAWN_SPREAD, SPAWN_SPREAD)
+        jr = self._rng.uniform(-self.spawn_spread, self.spawn_spread)
+        ju = self._rng.uniform(-self.spawn_spread, self.spawn_spread)
 
         spawn_pos = (cam_eye
                      - cam_forward * BEHIND_OFFSET
@@ -245,7 +254,7 @@ class LaserRibbons:
                      + cam_up      * ju)
 
         # Velocity: strictly in the forward direction frozen at birth
-        spawn_vel = cam_forward * RIBBON_SPEED
+        spawn_vel = cam_forward * self.ribbon_speed
 
         color_idx = int(self._rng.integers(0, len(_PALETTE)))
 
@@ -274,10 +283,10 @@ class LaserRibbons:
             float(cam_eye[0]), float(cam_eye[1]), float(cam_eye[2])
         )
 
-        # Spawn (may fire multiple times if dt > SPAWN_INTERVAL)
+        # Spawn (may fire multiple times if dt > spawn_interval)
         self._spawn_timer += dt
-        while self._spawn_timer >= SPAWN_INTERVAL:
-            self._spawn_timer -= SPAWN_INTERVAL
+        while self._spawn_timer >= self.spawn_interval:
+            self._spawn_timer -= self.spawn_interval
             self._spawn(cam_eye, cam_forward, cam_right, cam_up)
 
         # Advance all live ribbons on GPU
@@ -286,7 +295,7 @@ class LaserRibbons:
             dim=MAX_RIBBONS,
             inputs=[
                 self._wp_pos, self._wp_vel, self._wp_dist, self._wp_alive,
-                float(dt), float(MAX_DIST),
+                float(dt), float(self.max_dist),
             ],
         )
 
@@ -296,7 +305,7 @@ class LaserRibbons:
             dim=MAX_RIBBONS,
             inputs=[
                 self._wp_pos, self._wp_vel, self._wp_col, self._wp_alive,
-                float(RIBBON_LENGTH), float(HALF_WIDTH),
+                float(self.ribbon_length), float(self.half_width),
                 self._cam_eye,
                 self._wp_tris_pos, self._wp_tris_col,
             ],

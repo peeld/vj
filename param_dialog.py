@@ -29,14 +29,15 @@ Each positional arg can be:
 
 import threading
 import dataclasses
-from typing import Any
+from typing import Any, Callable
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QFormLayout, QLineEdit,
     QLabel, QScrollArea, QVBoxLayout, QFrame,
-    QCheckBox, QComboBox,
+    QCheckBox, QComboBox, QPushButton,
 )
 from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QGuiApplication
 
 
 POLL_MS = 100
@@ -140,14 +141,27 @@ class ParamDialog(QWidget):
                   "combo", [choices]  →  QComboBox
                   (auto) bool field   →  QCheckBox
                   anything else       →  QLineEdit
+
+    on_monitor_change : optional callback(monitor_index: int) called when the
+                        user selects a monitor in the Display section.  When
+                        provided, a "Display" section is appended with a combo
+                        box listing all attached screens and a "Go Fullscreen"
+                        button.
     """
 
-    def __init__(self, targets: list[tuple[str, Any, dict]], title: str = "Parameters"):
+    def __init__(
+        self,
+        targets: list[tuple[str, Any, dict]],
+        title: str = "Parameters",
+        on_monitor_change: Callable[[int], None] | None = None,
+    ):
         super().__init__()
         self.setWindowTitle(title)
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         self.setStyleSheet(_STYLESHEET)
         self.setMinimumWidth(380)
+
+        self._on_monitor_change = on_monitor_change
 
         # { id(obj): { field_name: (widget, ftype, hint) } }
         self._rows: dict[int, dict[str, tuple[Any, type, Any]]] = {}
@@ -200,11 +214,65 @@ class ParamDialog(QWidget):
                 form.addRow(lbl, widget)
                 self._rows[obj_id][fname] = (widget, ftype, hint)
 
+        if self._on_monitor_change is not None:
+            self._build_monitor_section(form)
+
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
         n_rows = sum(len(r) for r in self._rows.values())
-        self.resize(400, min(80 + 26 * n_rows, 720))
+        extra = 60 if self._on_monitor_change is not None else 0
+        self.resize(400, min(80 + 26 * n_rows + extra, 720))
+
+    # ── monitor section ───────────────────────────────────────────────────────
+
+    def _build_monitor_section(self, form: QFormLayout) -> None:
+        """Append a 'Display' section with a monitor picker and fullscreen button."""
+        hdr = QLabel("Display")
+        hdr.setObjectName("section_header")
+        form.addRow(hdr)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #2e2e38;")
+        form.addRow(sep)
+
+        self._monitor_combo = QComboBox()
+        for label in self._get_monitor_labels():
+            self._monitor_combo.addItem(label)
+        form.addRow(QLabel("Monitor"), self._monitor_combo)
+
+        btn = QPushButton("Go Fullscreen")
+        btn.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1e2a40; color: #5eaeff;"
+            "  border: 1px solid #38383f; border-radius: 3px; padding: 4px 10px;"
+            "}"
+            "QPushButton:hover { background-color: #243050; }"
+            "QPushButton:pressed { background-color: #2a4070; }"
+        )
+        btn.clicked.connect(self._emit_monitor_change)
+        form.addRow("", btn)
+
+    @staticmethod
+    def _get_monitor_labels() -> list[str]:
+        app = QGuiApplication.instance()
+        screens = app.screens() if app else []
+        labels = []
+        for i, s in enumerate(screens):
+            geo = s.geometry()
+            tag = " [primary]" if s == app.primaryScreen() else ""
+            labels.append(
+                f"Monitor {i}: {s.name()} "
+                f"({geo.width()}×{geo.height()} @ {geo.x()},{geo.y()}){tag}"
+            )
+        if not labels:
+            labels = ["Monitor 0 (unknown)"]
+        return labels
+
+    def _emit_monitor_change(self) -> None:
+        if self._on_monitor_change is not None:
+            self._on_monitor_change(self._monitor_combo.currentIndex())
 
     # ── widget factory ────────────────────────────────────────────────────────
 
@@ -319,6 +387,7 @@ def start_param_dialog(
     title: str = "Parameters",
     x: int | None = None,
     y: int | None = None,
+    on_monitor_change: Callable[[int], None] | None = None,
 ) -> threading.Thread:
     """
     Launch a ParamDialog in a background daemon thread and return the thread.
@@ -330,6 +399,14 @@ def start_param_dialog(
                                         "field": "check"
                                         "field": ("combo", ["a", "b", ...])
         obj                         — class name as label, no hints
+
+    Keyword args:
+        on_monitor_change : callable(monitor_index: int) | None
+            When provided, a "Display" section is appended with a monitor
+            combo box and a "Go Fullscreen" button.  Clicking the button
+            invokes the callback with the selected monitor index (0-based).
+            Use ``apply_fullscreen_to_monitor(self.wnd, index)`` in the
+            callback or render loop to apply the switch via GLFW.
     """
     pairs: list[tuple[str, Any, dict]] = []
     for t in targets:
@@ -345,7 +422,7 @@ def start_param_dialog(
 
     def _run() -> None:
         app = QApplication.instance() or QApplication([])
-        dlg = ParamDialog(pairs, title=title)
+        dlg = ParamDialog(pairs, title=title, on_monitor_change=on_monitor_change)
         if x is not None and y is not None:
             dlg.move(x, y)
         dlg.show()
@@ -354,3 +431,81 @@ def start_param_dialog(
     t = threading.Thread(target=_run, daemon=True, name="param-dialog")
     t.start()
     return t
+
+
+def apply_fullscreen_to_monitor(mglw_wnd, monitor_index: int) -> None:
+    """
+    Switch an mglw window to fullscreen on the given monitor.
+
+    Must be called from the main/render thread.  Typical usage::
+
+        _pending_monitor: int | None = None
+
+        def render(self, time, frametime):
+            global _pending_monitor
+            if _pending_monitor is not None:
+                apply_fullscreen_to_monitor(self.wnd, _pending_monitor)
+                _pending_monitor = None
+            ...
+
+        start_param_dialog(
+            ...,
+            on_monitor_change=lambda idx: globals().__setitem__('_pending_monitor', idx),
+        )
+
+    Supports the pyglet, glfw, and pygame2 mglw backends.
+
+    Args:
+        mglw_wnd      : the ``self.wnd`` WindowConfig attribute
+        monitor_index : 0-based index into the list of attached monitors
+                        (0 = primary / first monitor)
+    """
+    backend = getattr(mglw_wnd, "name", "")
+
+    # ── pyglet ────────────────────────────────────────────────────────────────
+    if backend == "pyglet":
+        try:
+            # Use the display attached to the existing window — works across
+            # all pyglet versions without importing pyglet.canvas / pyglet.display.
+            screens = mglw_wnd._window.display.get_screens()
+            if not screens:
+                print("[param_dialog] apply_fullscreen_to_monitor: no pyglet screens found")
+                return
+            monitor_index = max(0, min(monitor_index, len(screens) - 1))
+            mglw_wnd._window.set_fullscreen(True, screen=screens[monitor_index])
+        except Exception as exc:
+            print(f"[param_dialog] apply_fullscreen_to_monitor (pyglet) failed: {exc}")
+        return
+
+    # ── glfw ──────────────────────────────────────────────────────────────────
+    if backend == "glfw":
+        try:
+            import glfw
+            monitors = glfw.get_monitors()
+            if not monitors:
+                print("[param_dialog] apply_fullscreen_to_monitor: no GLFW monitors found")
+                return
+            monitor_index = max(0, min(monitor_index, len(monitors) - 1))
+            monitor = monitors[monitor_index]
+            mode = glfw.get_video_mode(monitor)
+            glfw.set_window_monitor(
+                mglw_wnd._window, monitor,
+                0, 0, mode.size.width, mode.size.height, mode.refresh_rate,
+            )
+        except Exception as exc:
+            print(f"[param_dialog] apply_fullscreen_to_monitor (glfw) failed: {exc}")
+        return
+
+    # ── pygame2 / SDL2 ────────────────────────────────────────────────────────
+    if backend == "pygame2":
+        try:
+            import pygame._sdl2.video as sdl2
+            # SDL2 display index maps to monitor; recreate window on the target display
+            sdl_win = mglw_wnd._sdl_window
+            sdl_win.position = sdl2.WINDOWPOS_CENTERED_DISPLAY(monitor_index)
+            sdl_win.set_fullscreen(True)
+        except Exception as exc:
+            print(f"[param_dialog] apply_fullscreen_to_monitor (pygame2) failed: {exc}")
+        return
+
+    print(f"[param_dialog] apply_fullscreen_to_monitor: unsupported backend '{backend}'")
