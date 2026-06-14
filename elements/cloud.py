@@ -56,8 +56,17 @@ class CloudElement:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def step(self, time: float, frame_time: float) -> None:
-        """Run physics kernels and upload results to GL buffers."""
+    def step(self, time: float, frame_time: float, enabled: bool = True) -> None:
+        """Run physics kernels and upload results to GL buffers.
+
+        When *enabled* is True, dead particles are probabilistically spawned in.
+        When False, live particles are probabilistically killed off.
+        """
+        if enabled:
+            self.cloud_op.spawn_particles()
+        else:
+            self.cloud_op.kill_particles()
+
         self.ball_op.step(frame_time)
         self.cloud_op.step(time, frame_time, self.ball_data)
         self.cloud_draw.write_warp(self.cloud_data.wp_pos, self.cloud_data.wp_col)

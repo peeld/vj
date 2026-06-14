@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QLabel, QScrollArea, QVBoxLayout, QFrame,
     QCheckBox, QComboBox, QPushButton,
 )
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QSettings
 from PySide6.QtGui import QGuiApplication
 
 
@@ -240,6 +240,9 @@ class ParamDialog(QWidget):
         self._monitor_combo = QComboBox()
         for label in self._get_monitor_labels():
             self._monitor_combo.addItem(label)
+        saved_idx = int(QSettings("WarpApp", "WarpApp").value("display/monitor_index", 0))
+        if 0 <= saved_idx < self._monitor_combo.count():
+            self._monitor_combo.setCurrentIndex(saved_idx)
         form.addRow(QLabel("Monitor"), self._monitor_combo)
 
         btn = QPushButton("Go Fullscreen")
@@ -272,7 +275,9 @@ class ParamDialog(QWidget):
 
     def _emit_monitor_change(self) -> None:
         if self._on_monitor_change is not None:
-            self._on_monitor_change(self._monitor_combo.currentIndex())
+            idx = self._monitor_combo.currentIndex()
+            QSettings("WarpApp", "WarpApp").setValue("display/monitor_index", idx)
+            self._on_monitor_change(idx)
 
     # ── widget factory ────────────────────────────────────────────────────────
 
@@ -426,6 +431,11 @@ def start_param_dialog(
         if x is not None and y is not None:
             dlg.move(x, y)
         dlg.show()
+        # Auto-apply saved fullscreen monitor on startup
+        if on_monitor_change is not None:
+            qs = QSettings("WarpApp", "WarpApp")
+            if qs.contains("display/monitor_index"):
+                QTimer.singleShot(0, dlg._emit_monitor_change)
         app.exec()
 
     t = threading.Thread(target=_run, daemon=True, name="param-dialog")

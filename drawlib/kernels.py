@@ -35,7 +35,7 @@ def color_by_interaction(
                 c[0] * (1.0 - t) + bc[0] * t,
                 c[1] * (1.0 - t) + bc[1] * t,
                 c[2] * (1.0 - t) + bc[2] * t,
-                0.3,
+                0.4,
             )
 
     colors[i] = c
@@ -122,6 +122,76 @@ def respawn_escaped(
         positions[i]  = wp.vec3(nx, ny, nz)
         velocities[i] = wp.vec3(0.0, 0.0, 0.0)
         colors[i]     = wp.vec4(0.5, 0.5, 0.5, 0.1)
+
+
+@wp.kernel
+def spawn_batch(
+    positions:  wp.array(dtype=wp.vec3),
+    velocities: wp.array(dtype=wp.vec3),
+    colors:     wp.array(dtype=wp.vec4),
+    alive:      wp.array(dtype=wp.int32),
+    half:       float,
+    prob:       float,
+    seed:       int,
+):
+    """Probabilistically activate dead particles: assign random position + colour."""
+    i = wp.tid()
+    if alive[i] == 1:
+        return
+    r = wp.rand_init(seed, i)
+    if wp.randf(r) >= prob:
+        return
+
+    alive[i] = 1
+
+    r0 = wp.rand_init(seed + 1, i * 3 + 0)
+    r1 = wp.rand_init(seed + 1, i * 3 + 1)
+    r2 = wp.rand_init(seed + 1, i * 3 + 2)
+    rc = wp.rand_init(seed + 2, i)
+
+    px = (wp.randf(r0) * 2.0 - 1.0) * half
+    py = (wp.randf(r1) * 2.0 - 1.0) * half
+    pz = (wp.randf(r2) * 2.0 - 1.0) * half
+    positions[i]  = wp.vec3(px, py, pz)
+    velocities[i] = wp.vec3(0.0, 0.0, 0.0)
+
+    # Sinusoidal hue -> RGB (full saturation / brightness rainbow)
+    hue = wp.randf(rc) * 6.28318
+    cr  = 0.5 + 0.5 * wp.sin(hue)
+    cg  = 0.5 + 0.5 * wp.sin(hue + 2.094)
+    cb  = 0.5 + 0.5 * wp.sin(hue + 4.189)
+    colors[i] = wp.vec4(cr, cg, cb, 0.0)
+
+
+@wp.kernel
+def kill_batch(
+    colors: wp.array(dtype=wp.vec4),
+    alive:  wp.array(dtype=wp.int32),
+    prob:   float,
+    seed:   int,
+):
+    """Probabilistically deactivate live particles: zero their alpha."""
+    i = wp.tid()
+    if alive[i] == 0:
+        return
+    r = wp.rand_init(seed, i)
+    if wp.randf(r) >= prob:
+        return
+    alive[i] = 0
+    c = colors[i]
+    colors[i] = wp.vec4(c[0], c[1], c[2], 0.0)
+
+
+@wp.kernel
+def apply_alive_mask(
+    colors: wp.array(dtype=wp.vec4),
+    alive:  wp.array(dtype=wp.int32),
+):
+    """Force dead particles to alpha=0 (final pass after colour kernels)."""
+    i = wp.tid()
+    if alive[i] == 0:
+        c = colors[i]
+        colors[i] = wp.vec4(c[0], c[1], c[2], 0.0)
 
 
 @wp.kernel

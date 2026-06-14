@@ -324,6 +324,14 @@ class RibbonDrawable(Drawable):
         if vertices is not None: self._vbo_pos.write(vertices.tobytes())
         if colors   is not None: self._vbo_col.write(colors.tobytes())
 
+    def release(self):
+        """Release all GPU resources held by this drawable."""
+        for attr in ("vao", "_ibo", "_vbo_col", "_vbo_pos", "prog"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                obj.release()
+                setattr(self, attr, None)
+
     def draw(self, mvp: np.ndarray, **kwargs):
         self.prog["mvp"].write(mvp.tobytes())
         self.vao.render(moderngl.TRIANGLES)

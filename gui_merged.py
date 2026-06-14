@@ -47,11 +47,10 @@ from post import (
 from drawlib.camera import OrbitCamera
 
 from elements.cloud import CloudElement
-from elements.nn_graph import NNGraph
 from elements.circleaxis import CircleAxisDrawing
 from elements.laser_ribbons import LaserRibbons
+from elements.nn_graph import NNGraph
 
-from audio_panel      import AudioPanel
 from property_manager import PropertyManager, build_default_manager
 
 # Late-bound audio callbacks registered by MergedGUI after it constructs its
@@ -119,10 +118,10 @@ class MergedGUI(mglw.WindowConfig):
         super().__init__(**kwargs)
 
         # -- Scene elements ---------------------------------------------------
-        self._cloud   = CloudElement(self.ctx)
-        self.nn_graph = NNGraph(self.ctx, device=DEVICE)
-        self._circles = CircleAxisDrawing(self.ctx)
-        self._lasers  = LaserRibbons(self.ctx)
+        self._cloud     = CloudElement(self.ctx)
+        self.nn_graph   = NNGraph(self.ctx, device=DEVICE)
+        self._circles   = CircleAxisDrawing(self.ctx)
+        self._lasers    = LaserRibbons(self.ctx)
 
         # -- GL state ---------------------------------------------------------
         self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
@@ -178,7 +177,7 @@ class MergedGUI(mglw.WindowConfig):
 
         effect_names = "  |  ".join(e.name for e in self._effects)
         print(f"[merged] effects: {effect_names}")
-        print("[merged] 1=cloud  2=nn  3=circles  4=lasers  R=regen  P=post  O=orbit  Tab=effect  ESC=quit")
+        print("[merged] 1=cloud  2=nn  3=circles  4=lasers  5=nn  R=regen  P=post  O=orbit  Tab=effect  ESC=quit")
         print("[merged] pm.describe() to list all properties  |  pm.save_preset('name') to snapshot")
 
     # -- Convenience ----------------------------------------------------------
@@ -194,6 +193,7 @@ class MergedGUI(mglw.WindowConfig):
         self._cloud.randomize()
         nn_seed = random.randint(0, 2**31 - 1)
         self.nn_graph.randomize(nn_seed)
+        self._nn.randomize(nn_seed)
         print(f"[merged] regenerated  (nn_seed={nn_seed})")
 
     # -- Per-frame ------------------------------------------------------------
@@ -207,8 +207,7 @@ class MergedGUI(mglw.WindowConfig):
 
         self.time += frame_time
 
-        if _controls.show_cloud:
-            self._cloud.step(self.time, frame_time)
+        self._cloud.step(self.time, frame_time, _controls.show_cloud)
 
         if _controls.show_nn:
             self.nn_graph.step(self.time)
@@ -241,9 +240,9 @@ class MergedGUI(mglw.WindowConfig):
         self.camera.tick(frame_time)
         mvp = self.camera.mvp(self.window_size)
 
-        if _controls.show_lasers:
-            cam_eye, cam_fwd, cam_right, cam_up = self.camera.position_and_axes()
-            self._lasers.step(frame_time, cam_eye, cam_fwd, cam_right, cam_up)
+        cam_eye, cam_fwd, cam_right, cam_up = self.camera.position_and_axes()
+        self._lasers.step(frame_time, cam_eye, cam_fwd, cam_right, cam_up, _controls.show_lasers)
+        self._circles.step(frame_time, current_time, _controls.show_circles)
 
         if self.post_effect_on:
             eff.bind_scene_fbo()
@@ -257,14 +256,11 @@ class MergedGUI(mglw.WindowConfig):
             self._draw_scene(mvp, current_time)
 
     def _draw_scene(self, mvp, t: float) -> None:
-        if _controls.show_cloud:
-            self._cloud.draw(mvp)
+        self._cloud.draw(mvp)
         if _controls.show_nn:
             self.nn_graph.draw(mvp)
-        if _controls.show_circles:
-            self._circles.draw(mvp, t)
-        if _controls.show_lasers:
-            self._lasers.draw(mvp)
+        self._circles.draw(mvp, t)
+        self._lasers.draw(mvp)
 
     # -- Input ----------------------------------------------------------------
 
@@ -302,7 +298,6 @@ class MergedGUI(mglw.WindowConfig):
             print(f"[merged] orbit: {'ON' if self.camera.orbit_enabled else 'OFF'}")
             return
 
-        # -- T key: cycle named preset ----------------------------------------
         if key == keys.T and self.post_effect_on:
             eff = self._active_effect
             if isinstance(eff, FeedbackPostEffect):

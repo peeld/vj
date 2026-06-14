@@ -255,8 +255,8 @@ def _feedback_kernel(
     # ── Screen-space smear ────────────────────────────────────────────────
     if smear_strength > 0.0:
         sv = sample_smear_field(smear_field, nx + 0.5, ny + 0.5, smear_gw, smear_gh)
-        nx = nx + sv[0] * smear_strength
-        ny = ny + sv[1] * smear_strength
+        nx = nx + sv[0] * smear_strength * smear_strength
+        ny = ny + sv[1] * smear_strength * smear_strength
 
     # ── Chromatic aberration: sample R further from centre, B closer ──────
     cdx = (cx3 / (dist + 1e-6)) * chroma_offset

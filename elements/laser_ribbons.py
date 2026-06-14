@@ -275,6 +275,7 @@ class LaserRibbons:
         cam_forward: np.ndarray,
         cam_right:   np.ndarray,
         cam_up:      np.ndarray,
+        enabled:     bool,
     ) -> None:
         """Spawn, advance, and build triangle geometry for this frame."""
 
@@ -284,10 +285,13 @@ class LaserRibbons:
         )
 
         # Spawn (may fire multiple times if dt > spawn_interval)
-        self._spawn_timer += dt
-        while self._spawn_timer >= self.spawn_interval:
-            self._spawn_timer -= self.spawn_interval
-            self._spawn(cam_eye, cam_forward, cam_right, cam_up)
+        if enabled:
+            self._spawn_timer += dt
+            while self._spawn_timer >= self.spawn_interval:
+                self._spawn_timer -= self.spawn_interval
+                self._spawn(cam_eye, cam_forward, cam_right, cam_up)
+        else:
+            self._spawn_timer = self.spawn_interval
 
         # Advance all live ribbons on GPU
         wp.launch(

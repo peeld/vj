@@ -898,7 +898,6 @@ def build_default_manager(
                   description="Blade side length as a fraction of circle radius"),
           circles, "blade_size_factor")
 
-    # ── Register default keyboard mappings (idempotent) ───────────────────────
     _register_default_key_bindings(pm)
 
     return pm

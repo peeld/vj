@@ -34,12 +34,14 @@ class PointCloudData:
             (self.num_points, 3)
         ).astype(np.float32)
 
-        # grey = np.full((self.num_points, 4), [0.5, 0.5, 0.5, 1.0], dtype=np.float32)
-        black = np.full((self.num_points, 4), [0.05, 0.05, 0.05, 0.01], dtype=np.float32)
+        # All particles start dead (alpha=0, invisible)
+        black = np.zeros((self.num_points, 4), dtype=np.float32)
+        alive = np.zeros(self.num_points, dtype=np.int32)
 
-        self.wp_pos = wp.array(pos, dtype=wp.vec3)
-        self.wp_vel = wp.array(vel, dtype=wp.vec3)
-        self.wp_col = wp.array(black, dtype=wp.vec4)
+        self.wp_pos   = wp.array(pos,   dtype=wp.vec3)
+        self.wp_vel   = wp.array(vel,   dtype=wp.vec3)
+        self.wp_col   = wp.array(black, dtype=wp.vec4)
+        self.wp_alive = wp.array(alive, dtype=wp.int32)
 
     def randomize(self):
         """Reset points to a fresh random distribution inside the cube."""

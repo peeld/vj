@@ -38,7 +38,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore    import QTimer, Qt, Signal, QObject
+from PySide6.QtCore    import QTimer, Qt, Signal, QObject, QSettings
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QLineEdit,
@@ -226,6 +226,7 @@ class MidiPanel(QWidget):
 
         self._build_ui()
         self._refresh_devices()
+        self._restore_settings()
 
         # Poll timer — updates activity label
         self._timer = QTimer(self)
@@ -339,11 +340,27 @@ class MidiPanel(QWidget):
         root.addWidget(self._cc_enum_widget)
 
         # ── Note sub-widgets ──────────────────────────────────────────────────
-        # (a) Bool / generic: hint label
+        # (a) Bool / generic: Toggle vs Press mode + hint label
         self._note_bool_widget = QWidget()
-        nbr = QHBoxLayout(self._note_bool_widget)
+        nbr = QVBoxLayout(self._note_bool_widget)
         nbr.setContentsMargins(0, 0, 0, 0)
-        self._lbl_note_hint = QLabel("Note-on toggles boolean.")
+        nbr.setSpacing(3)
+
+        note_mode_row = QHBoxLayout()
+        note_mode_row.addWidget(QLabel("Mode:"))
+        self._note_mode_group = QButtonGroup(self)
+        self._rb_toggle = QRadioButton("Toggle")
+        self._rb_press  = QRadioButton("Press")
+        self._rb_toggle.setChecked(True)
+        self._note_mode_group.addButton(self._rb_toggle, 0)
+        self._note_mode_group.addButton(self._rb_press,  1)
+        self._rb_toggle.toggled.connect(self._update_note_hint)
+        note_mode_row.addWidget(self._rb_toggle)
+        note_mode_row.addWidget(self._rb_press)
+        note_mode_row.addStretch()
+        nbr.addLayout(note_mode_row)
+
+        self._lbl_note_hint = QLabel("Note-on toggles value.")
         self._lbl_note_hint.setObjectName("info")
         self._lbl_note_hint.setWordWrap(True)
         nbr.addWidget(self._lbl_note_hint)
@@ -425,6 +442,28 @@ class MidiPanel(QWidget):
         else:
             self._dev_combo.addItem("(no devices found)")
 
+    def _restore_settings(self) -> None:
+        qs = QSettings("WarpApp", "WarpApp")
+
+        # Restore saved MIDI preset
+        preset = qs.value("midi/preset_path", "")
+        if preset and Path(preset).exists():
+            try:
+                self.pm.load_json(preset)
+                self.save_path = Path(preset)
+                self._refresh_assignments()
+                self._lbl_status.setText(f"Auto-loaded: {Path(preset).name}")
+            except Exception as exc:
+                print(f"[midi_panel] auto-load error: {exc}")
+
+        # Restore saved MIDI device and auto-connect
+        device = qs.value("midi/device", "")
+        if device:
+            idx = self._dev_combo.findText(device)
+            if idx >= 0:
+                self._dev_combo.setCurrentIndex(idx)
+                self._on_connect()
+
     def _on_connect(self) -> None:
         name = self._dev_combo.currentText()
         if name.startswith("("):
@@ -433,6 +472,7 @@ class MidiPanel(QWidget):
         if ok:
             self._lbl_status.setObjectName("ok")
             self._lbl_status.setText(f"● Connected: {name}")
+            QSettings("WarpApp", "WarpApp").setValue("midi/device", name)
         else:
             self._lbl_status.setObjectName("err")
             self._lbl_status.setText(f"✗ Failed to connect: {name}")
@@ -507,14 +547,30 @@ class MidiPanel(QWidget):
 
             # Fill note hint for non-enum
             if is_note and not is_enum:
-                self._lbl_note_hint.setText(
-                    "Note-on toggles boolean." if is_bool
-                    else f"Note-on increments {prop.label or prop.name} by one step."
-                )
+                self._update_note_hint()
 
             # Build per-choice note assignment rows
             if note_enum:
                 self._build_enum_note_rows(prop)
+
+    # ── Note mode hint ─────────────────────────────────────────────────────────
+
+    def _update_note_hint(self) -> None:
+        """Refresh the note hint label based on current prop and Toggle/Press mode."""
+        prop    = self._current_prop()
+        is_bool = prop and prop.type is bool and not _is_enum(prop)
+        press   = self._rb_press.isChecked()
+        if press:
+            if is_bool:
+                hint = "Key held → True  |  Key released → False"
+            else:
+                hint = "Key held → on-value  |  Key released → off-value (0)"
+        else:
+            if is_bool:
+                hint = "Note-on toggles boolean."
+            else:
+                hint = f"Note-on increments {prop.label or prop.name} by one step." if prop else "Note-on toggles value."
+        self._lbl_note_hint.setText(hint)
 
     # ── MIDI learn ─────────────────────────────────────────────────────────────
 
@@ -580,12 +636,13 @@ class MidiPanel(QWidget):
                 )
 
         elif ev_type == "note" and is_note and not is_enum:
-            # Toggle / increment (enum case handled by per-row Learn buttons)
+            # Toggle / Press (enum case handled by per-row Learn buttons)
+            note_mode = "press" if self._rb_press.isChecked() else "toggle"
             self.pm.bind_midi_note(MidiNoteBinding(
-                note=number, prop_key=prop.key, channel=channel,
+                note=number, prop_key=prop.key, channel=channel, mode=note_mode,
             ))
             self._lbl_learn.setText(
-                f"✓ Note {_note_name(number)}({number}) → {prop.key}  [toggle]"
+                f"✓ Note {_note_name(number)}({number}) → {prop.key}  [{note_mode}]"
             )
 
         else:
@@ -795,7 +852,8 @@ class MidiPanel(QWidget):
             if b.target_value is not None:
                 label = f"Note {note_str}  ->  {b.prop_key} = '{b.target_value}'"
             else:
-                label = f"Note {note_str}  ->  {b.prop_key}  [toggle]"
+                mode_tag = getattr(b, "mode", "toggle")
+                label = f"Note {note_str}  ->  {b.prop_key}  [{mode_tag}]"
             rows.append(("note", label, b.note, b.channel))
 
         if not rows:
@@ -841,6 +899,7 @@ class MidiPanel(QWidget):
         if path:
             self.pm.save_json(path)
             self.save_path = Path(path)
+            QSettings("WarpApp", "WarpApp").setValue("midi/preset_path", path)
             self._lbl_learn.setText(f"Saved: {Path(path).name}")
 
     def _on_load(self) -> None:
@@ -852,6 +911,7 @@ class MidiPanel(QWidget):
         try:
             self.pm.load_json(path)
             self.save_path = Path(path)
+            QSettings("WarpApp", "WarpApp").setValue("midi/preset_path", path)
             self._lbl_learn.setText(f"Loaded: {Path(path).name}")
             self._refresh_assignments()
         except Exception as exc:

@@ -436,6 +436,8 @@ class DNAHelixGUI(mglw.WindowConfig):
     def _regen(self, phase=None):
         global _PHASE_OFFSET
         _PHASE_OFFSET = self._phase if phase is None else phase
+        if self._geo is not None:
+            self._geo.release()
         self._geo = RibbonDrawable(self.ctx)
         self._geo.setup(*build_geometry(seed=self._seed))
         print(f"[gui4] geometry generated  (seed={self._seed}, phase={_PHASE_OFFSET:.2f})")
@@ -448,7 +450,9 @@ class DNAHelixGUI(mglw.WindowConfig):
         global _PHASE_OFFSET
         _PHASE_OFFSET = self._phase
 
-        # Rebuild geometry with new phase (cheap enough for the geometry count)
+        # Rebuild geometry with new phase; release the previous frame's buffers
+        if self._geo is not None:
+            self._geo.release()
         self._geo = RibbonDrawable(self.ctx)
         self._geo.setup(*build_geometry(seed=self._seed))
 
@@ -502,6 +506,18 @@ class DNAHelixGUI(mglw.WindowConfig):
                 print("[gui4] orbit: OFF")
         elif self.post_effect_on:
             self._post.on_key(key, action, keys)
+
+    def on_close(self):
+        print("[gui4] closing — releasing GPU resources")
+        if self._geo is not None:
+            self._geo.release()
+            self._geo = None
+        # Release post-effect GL objects (FBO, textures, quad VAO/prog)
+        for attr in ("_fbo", "_display_tex", "_quad_vao", "_quad_prog"):
+            obj = getattr(self._post, attr, None)
+            if obj is not None:
+                obj.release()
+                setattr(self._post, attr, None)
 
     def on_resize(self, width: int, height: int):
         self._post.resize(width, height)

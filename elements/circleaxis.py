@@ -34,6 +34,16 @@ N_BLADES          = 64      # squares per circle
 BLADE_SIZE_FACTOR = 0.125   # blade side = radius * this
 BLADE_SPIN_SPEED  = 0.2     # radians / second
 
+# Emitted circle constants
+MAX_EMIT_CIRCLES = 24       # pool size
+EMIT_LIFETIME    = 3.5      # seconds before an emitted circle is gone
+EMIT_FADE_IN     = 0.25     # seconds to fade in
+EMIT_FADE_OUT    = 1.8      # seconds to dissolve out
+EMIT_INTERVAL    = 0.30     # seconds between spawns when active
+EMIT_RADIUS_MIN  = 0.04
+EMIT_RADIUS_MAX  = 0.75
+EMIT_HALF_W      = 0.006    # ribbon half-width for emitted circles
+
 
 # ---------------------------------------------------------------------------
 # Colour helpers
@@ -227,6 +237,14 @@ class TravAnimMeta:
     amplitude: float
 
 
+@dataclass
+class EmitCircle:
+    cx:     float
+    radius: float
+    birth:  float   # absolute time of spawn
+    hue:    float   # HSV hue for colour
+
+
 # ---------------------------------------------------------------------------
 # Geometry builder (public)
 # ---------------------------------------------------------------------------
@@ -403,6 +421,14 @@ class CircleAxisDrawing:
         self.blade_size_factor = BLADE_SIZE_FACTOR
         self.blade_spin_speed  = BLADE_SPIN_SPEED
 
+        # Emitted circle pool
+        self._rng          = np.random.default_rng()
+        self._emit_pool:   list[EmitCircle | None] = [None] * MAX_EMIT_CIRCLES
+        self._spawn_timer  = 0.0
+        self._emit_geo     = RibbonDrawable(ctx)
+        self._emit_geo_ready = False
+        self._init_emit_geo()
+
         self.regen()
 
     # ------------------------------------------------------------------
@@ -444,11 +470,137 @@ class CircleAxisDrawing:
             return True
         return False
 
+    def step(self, dt: float, t: float, enabled: bool) -> None:
+        """Advance emitted circle pool: age out dead circles, spawn new ones when active."""
+        # Age out expired circles
+        for i, ec in enumerate(self._emit_pool):
+            if ec is not None and (t - ec.birth) >= EMIT_LIFETIME:
+                self._emit_pool[i] = None
+
+        # Spawn new circles when active
+        if enabled:
+            self._spawn_timer += dt
+            while self._spawn_timer >= EMIT_INTERVAL:
+                self._spawn_timer -= EMIT_INTERVAL
+                self._spawn_emit(t)
+        else:
+            self._spawn_timer = 0.0
+
     def draw(self, mvp: np.ndarray, t: float) -> None:
         """Update animated positions and issue the draw call."""
+        # Base geometry is kept alive for animation state but not drawn;
+        # only emitted circles render so the element is empty when inactive.
         new_verts = self._animated_positions(t)
         self._geo.update(vertices=new_verts)
-        self._geo.draw(mvp)
+
+        # Draw emitted circles (always, so they dissolve even after deactivation)
+        self._update_emit_geo(t)
+        self._ctx.blend_func = moderngl.ONE, moderngl.ONE
+        self._emit_geo.draw(mvp)
+        self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+
+    # ------------------------------------------------------------------
+    # Emitted circle helpers
+    # ------------------------------------------------------------------
+
+    def _init_emit_geo(self) -> None:
+        """Pre-allocate fixed-size GPU buffers for the emitted circle pool."""
+        verts_per_circle = (N_SEG + 1) * 2
+        idx_per_circle   = N_SEG * 6
+
+        n_verts = MAX_EMIT_CIRCLES * verts_per_circle
+        n_idx   = MAX_EMIT_CIRCLES * idx_per_circle
+
+        verts  = np.zeros((n_verts, 3), dtype=np.float32)
+        colors = np.zeros((n_verts, 4), dtype=np.float32)
+
+        # Build indices once — they never change, only positions/colors update
+        all_idx = np.zeros(n_idx, dtype=np.uint32)
+        seg_i = np.arange(N_SEG, dtype=np.uint32)
+        for slot in range(MAX_EMIT_CIRCLES):
+            v_base = slot * verts_per_circle
+            i_base = slot * idx_per_circle
+            v0 = v_base + 2 * seg_i
+            v1 = v_base + 2 * seg_i + 1
+            v2 = v_base + 2 * seg_i + 2
+            v3 = v_base + 2 * seg_i + 3
+            slot_idx = np.empty(idx_per_circle, dtype=np.uint32)
+            slot_idx[0::6] = v0;  slot_idx[1::6] = v1;  slot_idx[2::6] = v3
+            slot_idx[3::6] = v0;  slot_idx[4::6] = v3;  slot_idx[5::6] = v2
+            all_idx[i_base:i_base + idx_per_circle] = slot_idx
+
+        self._emit_geo.setup(verts, colors, all_idx)
+        self._emit_geo_ready = True
+
+    def _spawn_emit(self, t: float) -> None:
+        """Place a new emitted circle into a free pool slot (or oldest)."""
+        # Find a free slot
+        slot = next((i for i, ec in enumerate(self._emit_pool) if ec is None), None)
+        if slot is None:
+            # Evict the oldest
+            oldest_age = -1.0
+            slot = 0
+            for i, ec in enumerate(self._emit_pool):
+                if ec is not None:
+                    age = t - ec.birth
+                    if age > oldest_age:
+                        oldest_age = age
+                        slot = i
+
+        cx     = float(self._rng.uniform(-BOUND * 0.85, BOUND * 0.85))
+        radius = float(self._rng.uniform(EMIT_RADIUS_MIN, EMIT_RADIUS_MAX))
+        hue    = float(self._rng.uniform(0.0, 1.0))
+        self._emit_pool[slot] = EmitCircle(cx=cx, radius=radius, birth=t, hue=hue)
+
+    @staticmethod
+    def _emit_alpha(age: float) -> float:
+        """Envelope: fade in → hold → dissolve."""
+        if age >= EMIT_LIFETIME:
+            return 0.0
+        if age < EMIT_FADE_IN:
+            return age / EMIT_FADE_IN
+        if age > EMIT_LIFETIME - EMIT_FADE_OUT:
+            return (EMIT_LIFETIME - age) / EMIT_FADE_OUT
+        return 1.0
+
+    def _update_emit_geo(self, t: float) -> None:
+        """Rebuild positions + colors for the emitted circle pool and upload."""
+        if not self._emit_geo_ready:
+            return
+
+        verts_per_circle = (N_SEG + 1) * 2
+        n_verts = MAX_EMIT_CIRCLES * verts_per_circle
+
+        all_pos = np.zeros((n_verts, 3), dtype=np.float32)
+        all_col = np.zeros((n_verts, 4), dtype=np.float32)
+
+        FAR = np.array([1e6, 1e6, 1e6], dtype=np.float32)
+
+        for slot, ec in enumerate(self._emit_pool):
+            v_base = slot * verts_per_circle
+            v_end  = v_base + verts_per_circle
+
+            if ec is None:
+                all_pos[v_base:v_end] = FAR
+                continue
+
+            age   = t - ec.birth
+            alpha = self._emit_alpha(age)
+
+            pts  = _circle_pts(ec.cx, ec.radius, N_SEG)
+            vpos = _ribbon_positions(pts, EMIT_HALF_W)
+            all_pos[v_base:v_end] = vpos
+
+            # Colour: hue shifts gently with age, bright saturated
+            hue_shift = (ec.hue + age * 0.04) % 1.0
+            t_arr     = np.linspace(0.0, 1.0, verts_per_circle, dtype=np.float32)
+            cols      = np.stack([
+                _hsv((hue_shift + ti * 0.08) % 1.0, 0.80, 0.90 + 0.10 * ti, alpha)
+                for ti in t_arr
+            ])
+            all_col[v_base:v_end] = cols
+
+        self._emit_geo.update(vertices=all_pos, colors=all_col)
 
     # ------------------------------------------------------------------
     # Internal animation

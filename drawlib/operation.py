@@ -7,7 +7,10 @@ BallOperation       — steps bouncing-ball physics.
 import warp as wp
 
 from drawlib.data import BallData, PointCloudData
-from drawlib.kernels import bounce_balls, color_by_interaction, influence_points, respawn_escaped, step_points
+from drawlib.kernels import (
+    apply_alive_mask, bounce_balls, color_by_interaction,
+    influence_points, kill_batch, respawn_escaped, spawn_batch, step_points,
+)
 
 
 class PointCloudOperation:
@@ -15,6 +18,9 @@ class PointCloudOperation:
     INFLUENCE_STRENGTH = 6.0    # velocity impulse scale
     DAMPING            = 0.99   # per-frame velocity multiplier
     VEL_THRESH         = 0.005  # below this speed a point is considered stopped
+
+    SPAWN_PROB = 0.05   # probability per dead particle per frame to activate
+    KILL_PROB  = 0.008  # probability per live particle per frame to deactivate
 
     def __init__(self, data: PointCloudData):
         self.data   = data
@@ -77,12 +83,43 @@ class PointCloudOperation:
             ],
         )
 
+    def spawn_particles(self) -> None:
+        """Probabilistically activate dead particles with random positions/colours."""
+        wp.launch(
+            spawn_batch,
+            dim=self.data.num_points,
+            inputs=[
+                self.data.wp_pos, self.data.wp_vel, self.data.wp_col,
+                self.data.wp_alive,
+                self.data.cube_half,
+                self.SPAWN_PROB,
+                self._frame,
+            ],
+        )
+
+    def kill_particles(self) -> None:
+        """Probabilistically deactivate live particles."""
+        wp.launch(
+            kill_batch,
+            dim=self.data.num_points,
+            inputs=[
+                self.data.wp_col, self.data.wp_alive,
+                self.KILL_PROB,
+                self._frame,
+            ],
+        )
+
     def step(self, time: float, dt: float, ball_data: BallData):
-        """Full frame: influence -> integrate -> respawn -> color by interaction."""
+        """Full frame: influence -> integrate -> respawn -> color by interaction -> mask dead."""
         self.apply_ball_influence(ball_data, dt)
         self.step_positions(dt)
         self.respawn_escaped()
         self.apply_interaction_colors(ball_data)
+        wp.launch(
+            apply_alive_mask,
+            dim=self.data.num_points,
+            inputs=[self.data.wp_col, self.data.wp_alive],
+        )
         self._frame += 1
         wp.synchronize()
 
