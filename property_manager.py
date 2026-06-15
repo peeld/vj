@@ -9,9 +9,9 @@ Every adjustable parameter across all scene modules is declared here with:
 The manager additionally owns:
   • Preset snapshots  — save / load / list  (JSON-persisted)
   • Keyboard mappings — key name → increment / decrement / toggle / cycle action
-  • MIDI mappings     — CC number → scaled property write
-                        note number → toggle / callback
-  • Audio mappings    — AudioMetrics attribute → scaled property write
+
+Signal routing (audio, MIDI, envelopes, LFOs, events) is handled by
+LinkManager (link_manager.py), which calls pm.set() from the GL thread.
 
 Typical usage (in gui_merged.py)
 ---------------------------------
@@ -29,15 +29,15 @@ Typical usage (in gui_merged.py)
     # preset round-trip
     pm.save_preset("my_look")
     pm.load_preset("my_look")
-    pm.save_json("presets.json")      # persists all presets + mappings
+    pm.save_json("presets.json")      # persists presets + key bindings
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,65 +128,6 @@ class KeyBinding:
     amount    : float | None = None   # override step if provided
 
 
-@dataclass
-class MidiCCBinding:
-    """Maps a MIDI CC number (0–127) to a property.
-
-    mode
-    ----
-    "range"  (default for numeric props)
-        CC 0–127 is linearly scaled to [min_val, max_val] and written to the
-        property.  min_val / max_val must be provided.
-
-    "enum"   (default when prop has choices)
-        The 0–127 range is divided into len(choices) equal segments; the CC
-        value selects the corresponding choice.  min_val / max_val are ignored.
-        Setting mode="enum" explicitly forces this behaviour even if min/max
-        are supplied.
-    """
-    cc        : int
-    prop_key  : str
-    min_val   : float | None = None
-    max_val   : float | None = None
-    channel   : int  = 0       # 0 = any channel
-    mode      : str  = "auto"  # "auto" | "range" | "enum"
-
-
-@dataclass
-class MidiNoteBinding:
-    """Maps a MIDI note to a property action or an arbitrary callback.
-
-    Actions (checked in order):
-      • callback      — called with velocity; takes priority over everything else
-      • target_value  — on note-on (velocity > 0) sets the property to this
-                        exact value; perfect for assigning one note per enum choice
-      • prop_key only — on note-on toggles a bool property (original behaviour)
-
-    release_value
-        If set, written to the property on note-off (velocity == 0).
-        Use this for momentary / "hold" behaviour on enum properties:
-        e.g. hold note → "additive", release → "lerp".
-        When target_value == release_value (or release_value is None) the
-        note-off is a no-op, which is the correct behaviour when the note
-        itself maps to the default value (e.g. "lerp").
-    """
-    note          : int
-    prop_key      : str | None = None
-    callback      : Callable[[int], None] | None = None
-    channel       : int = 0
-    target_value  : Any = None   # if set, writes this value instead of toggling
-    release_value : Any = None   # if set, writes this value on note-off
-
-
-@dataclass
-class AudioBinding:
-    """Maps an AudioMetrics attribute to a property (linear range scaling)."""
-    metric_attr : str          # e.g. "energy", "bass", "mid", "treble"
-    prop_key    : str
-    min_val     : float
-    max_val     : float
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  PropertyManager
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,6 +142,9 @@ class PropertyManager:
 
     If no binding is supplied the value is stored internally and callers are
     responsible for reading it via pm.get() when they need it.
+
+    Signal routing (audio, MIDI, envelopes, LFOs) is handled by LinkManager,
+    which writes values here via pm.set() from the GL thread.
     """
 
     def __init__(self) -> None:
@@ -214,10 +158,7 @@ class PropertyManager:
         self._values: dict[str, Any] = {}
 
         # mappings
-        self._key_bindings  : dict[str, KeyBinding]      = {}   # key_name -> binding
-        self._midi_cc       : dict[tuple[int,int], MidiCCBinding]   = {}  # (ch, cc)
-        self._midi_note     : dict[tuple[int,int], MidiNoteBinding] = {}  # (ch, note)
-        self._audio_bindings: list[AudioBinding] = []
+        self._key_bindings: dict[str, KeyBinding] = {}   # key_name -> binding
 
         # presets:  name -> {prop_key -> value}
         self._presets: dict[str, dict[str, Any]] = {}
@@ -296,8 +237,15 @@ class PropertyManager:
     def all_props(self) -> list[PropDef]:
         return list(self._defs.values())
 
-    def describe(self) -> None:
-        """Print a human-readable summary of all registered properties."""
+    def describe(self, lm=None) -> None:
+        """Print a human-readable summary of all registered properties.
+
+        If *lm* (a LinkManager) is provided, sinks with an active SignalLink
+        are annotated with [linked].
+        """
+        linked_keys: set[str] = set()
+        if lm is not None:
+            linked_keys = {sl.sink_key for sl in lm._signal_links if sl.enabled}
         for section in self.sections():
             print(f"\n[{section}]")
             for d in self.props_in(section):
@@ -307,7 +255,8 @@ class PropertyManager:
                     rng = f"  [{d.min_val} … {d.max_val}]"
                 if d.choices:
                     rng = f"  {d.choices}"
-                print(f"  {d.name:<24} = {live!r:<12}  (default={d.default!r}){rng}")
+                driven = "  [linked]" if d.key in linked_keys else ""
+                print(f"  {d.name:<24} = {live!r:<12}  (default={d.default!r}){rng}{driven}")
 
     # ── Snapshot of current values ────────────────────────────────────────────
 
@@ -385,213 +334,6 @@ class PropertyManager:
     def key_bindings(self) -> list[KeyBinding]:
         return list(self._key_bindings.values())
 
-    # ── MIDI mappings ─────────────────────────────────────────────────────────
-
-    def bind_midi_cc(self, binding: MidiCCBinding) -> None:
-        """Register a MIDI CC → property binding."""
-        self._midi_cc[(binding.channel, binding.cc)] = binding
-
-    def bind_midi_note(self, binding: MidiNoteBinding) -> None:
-        """Register a MIDI note → toggle / callback binding."""
-        self._midi_note[(binding.channel, binding.note)] = binding
-
-    def apply_midi_cc(self, channel: int, cc: int, value: int) -> bool:
-        """Apply a CC event (value 0–127).  Returns True if consumed.
-
-        For numeric properties:
-            CC linearly maps to [min_val, max_val].
-
-        For enum/str properties (or when mode="enum"):
-            CC range is divided into len(choices) equal buckets; the bucket
-            index selects the corresponding choice.
-            e.g. with 7 choices and CC=64 → bucket 3 → choices[3]
-        """
-        b = self._midi_cc.get((channel, cc)) or self._midi_cc.get((0, cc))
-        if b is None:
-            return False
-
-        prop = self._defs.get(b.prop_key)
-        if prop is None:
-            return False
-
-        # Determine effective mode
-        mode = b.mode
-        if mode == "auto":
-            mode = "enum" if (prop.choices is not None and len(prop.choices) > 0) else "range"
-
-        if mode == "enum":
-            choices = prop.choices
-            if not choices:
-                return False
-            # Divide 0–127 into len(choices) equal slots; clamp last bucket edge
-            idx = min(int(value / 128.0 * len(choices)), len(choices) - 1)
-            self.set(b.prop_key, choices[idx])
-            print(f"[pm] CC{cc}={value} → {b.prop_key} = {choices[idx]!r}  "
-                  f"(slot {idx}/{len(choices)})")
-        else:
-            if b.min_val is None or b.max_val is None:
-                raise ValueError(
-                    f"MidiCCBinding for '{b.prop_key}' in 'range' mode requires "
-                    f"min_val and max_val."
-                )
-            t      = value / 127.0
-            scaled = b.min_val + t * (b.max_val - b.min_val)
-            self.set(b.prop_key, scaled)
-            print(f"[pm] CC{cc}={value} → {b.prop_key} = {scaled:.4g}")
-
-        return True
-
-    def apply_midi_note(self, channel: int, note: int, velocity: int) -> bool:
-        """Apply a note-on/off event.  Returns True if consumed.
-
-        Resolution order:
-          1. callback(velocity)              — always fires if set
-          2. target_value write on note-on   — sets exact value (enum or any type)
-          3. bool toggle on note-on          — original behaviour
-        """
-        b = self._midi_note.get((channel, note)) or self._midi_note.get((0, note))
-        if b is None:
-            return False
-
-        if b.callback is not None:
-            b.callback(velocity)
-        elif b.prop_key is not None:
-            if velocity > 0:
-                if b.target_value is not None:
-                    self.set(b.prop_key, b.target_value)
-                    print(f"[pm] note {note} → {b.prop_key} = {b.target_value!r}")
-                else:
-                    cur = self.get(b.prop_key)
-                    self.set(b.prop_key, not cur)
-                    print(f"[pm] note {note} → {b.prop_key} toggled → {self.get(b.prop_key)!r}")
-            else:
-                # note-off: revert to release_value if one is set
-                if b.release_value is not None:
-                    self.set(b.prop_key, b.release_value)
-                    print(f"[pm] note {note} released → {b.prop_key} = {b.release_value!r}")
-        return True
-
-    def bind_enum_to_cc(self, prop_key: str, cc: int, channel: int = 0) -> None:
-        """Convenience: bind a CC knob/slider to sweep through an enum property.
-
-        Sweeping CC 0 → 127 steps through choices[0] → choices[-1].
-        The property must have a choices list.
-
-        Example::
-            pm.bind_enum_to_cc("scene.blend_mode", cc=14)
-        """
-        prop = self._defs.get(prop_key)
-        if prop is None:
-            raise KeyError(f"Unknown property: '{prop_key}'")
-        if not prop.choices:
-            raise ValueError(f"Property '{prop_key}' has no choices — cannot bind as enum.")
-        self.bind_midi_cc(MidiCCBinding(
-            cc=cc, prop_key=prop_key,
-            channel=channel, mode="enum",
-        ))
-        print(f"[pm] CC{cc} → {prop_key} (enum: {prop.choices})")
-
-    def bind_enum_to_notes(
-        self,
-        prop_key      : str,
-        start_note    : int,
-        channel       : int = 0,
-        release_value : Any = None,
-    ) -> dict[str, int]:
-        """Convenience: assign one MIDI note per enum choice.
-
-        Notes are assigned consecutively starting from start_note:
-            start_note + 0  → choices[0]
-            start_note + 1  → choices[1]
-            …
-
-        Returns a dict mapping choice_value → note for reference.
-
-        release_value
-            Value written to the property on note-off (key release).
-            Enables momentary / "hold" behaviour: hold note → choice,
-            release → release_value.  When a note's own target_value
-            equals release_value the note-off is a no-op (correct for
-            the note that maps to the default/rest value itself).
-
-            For blend_mode the default rest mode is "lerp", so pass
-            release_value="lerp" to get hold-to-activate behaviour on
-            all other blend modes while leaving the "lerp" note as a
-            plain latch (press sets lerp, release does nothing).
-
-        Example::
-            mapping = pm.bind_enum_to_notes(
-                "scene.blend_mode", start_note=36, release_value="lerp"
-            )
-            # note 36 → "lerp" (latch), 37 → "additive" (hold), …
-        """
-        prop = self._defs.get(prop_key)
-        if prop is None:
-            raise KeyError(f"Unknown property: '{prop_key}'")
-        if not prop.choices:
-            raise ValueError(f"Property '{prop_key}' has no choices.")
-
-        mapping: dict[str, int] = {}
-        for i, choice in enumerate(prop.choices):
-            note = start_note + i
-            # A note whose target equals the release_value acts as a plain
-            # latch (release_value=None means note-off is a no-op for it).
-            rv = None if (release_value is None or choice == release_value) \
-                 else release_value
-            self.bind_midi_note(MidiNoteBinding(
-                note=note,
-                prop_key=prop_key,
-                channel=channel,
-                target_value=choice,
-                release_value=rv,
-            ))
-            mapping[choice] = note
-
-        lines = "  ".join(f"{n}={c!r}" for c, n in mapping.items())
-        print(f"[pm] notes → {prop_key}:  {lines}")
-        return mapping
-
-    def remove_midi_cc(self, cc: int, channel: int = 0) -> bool:
-        """Remove a CC binding.  Returns True if it existed."""
-        key = (channel, cc)
-        if key in self._midi_cc:
-            del self._midi_cc[key]
-            return True
-        return False
-
-    def remove_midi_note(self, note: int, channel: int = 0) -> bool:
-        """Remove a note binding.  Returns True if it existed."""
-        key = (channel, note)
-        if key in self._midi_note:
-            del self._midi_note[key]
-            return True
-        return False
-
-    def midi_cc_bindings(self) -> list[MidiCCBinding]:
-        return list(self._midi_cc.values())
-
-    def midi_note_bindings(self) -> list[MidiNoteBinding]:
-        return list(self._midi_note.values())
-
-    # ── Audio mappings ────────────────────────────────────────────────────────
-
-    def bind_audio(self, binding: AudioBinding) -> None:
-        """Register an AudioMetrics attribute → property mapping."""
-        self._audio_bindings.append(binding)
-
-    def apply_audio(self, metrics: Any) -> None:
-        """Apply all audio bindings given a live AudioMetrics object."""
-        for b in self._audio_bindings:
-            raw = getattr(metrics, b.metric_attr, None)
-            if raw is None:
-                continue
-            t      = max(0.0, min(1.0, float(raw)))
-            scaled = b.min_val + t * (b.max_val - b.min_val)
-            self.set(b.prop_key, scaled)
-
-    def audio_bindings(self) -> list[AudioBinding]:
-        return list(self._audio_bindings)
-
     # ── Serialisation ─────────────────────────────────────────────────────────
 
     def _presets_to_dict(self) -> dict:
@@ -608,54 +350,19 @@ class PropertyManager:
             for b in self._key_bindings.values()
         ]
 
-    def _midi_cc_to_list(self) -> list:
-        return [
-            {
-                "cc"      : b.cc,
-                "prop_key": b.prop_key,
-                "min_val" : b.min_val,
-                "max_val" : b.max_val,
-                "channel" : b.channel,
-                "mode"    : b.mode,
-            }
-            for b in self._midi_cc.values()
-        ]
-
-    def _midi_note_to_list(self) -> list:
-        return [
-            {
-                "note"        : b.note,
-                "prop_key"    : b.prop_key,
-                "channel"     : b.channel,
-                "target_value": b.target_value,
-            }
-            for b in self._midi_note.values()
-            if b.prop_key is not None  # skip runtime-only callbacks
-        ]
-
-    def _audio_to_list(self) -> list:
-        return [
-            {
-                "metric_attr": b.metric_attr,
-                "prop_key"   : b.prop_key,
-                "min_val"    : b.min_val,
-                "max_val"    : b.max_val,
-            }
-            for b in self._audio_bindings
-        ]
-
     def to_dict(self) -> dict:
-        """Serialise presets and mappings to a plain dict (JSON-safe)."""
+        """Serialise presets and key bindings to a plain dict (JSON-safe)."""
         return {
             "presets"      : self._presets_to_dict(),
             "key_bindings" : self._key_bindings_to_list(),
-            "midi_cc"      : self._midi_cc_to_list(),
-            "midi_notes"   : self._midi_note_to_list(),
-            "audio"        : self._audio_to_list(),
         }
 
     def from_dict(self, data: dict) -> None:
-        """Restore presets and serialisable mappings from a dict."""
+        """Restore presets and key bindings from a dict.
+
+        Unknown keys (e.g. legacy midi_cc / midi_notes / audio from old JSON
+        files) are silently ignored.
+        """
         for name, snap in data.get("presets", {}).items():
             self._presets[name] = snap
 
@@ -665,32 +372,6 @@ class PropertyManager:
                 prop_key=kb["prop_key"],
                 action  =kb["action"],
                 amount  =kb.get("amount"),
-            ))
-
-        for cb in data.get("midi_cc", []):
-            self.bind_midi_cc(MidiCCBinding(
-                cc      =cb["cc"],
-                prop_key=cb["prop_key"],
-                min_val =cb.get("min_val"),
-                max_val =cb.get("max_val"),
-                channel =cb.get("channel", 0),
-                mode    =cb.get("mode", "auto"),
-            ))
-
-        for nb in data.get("midi_notes", []):
-            self.bind_midi_note(MidiNoteBinding(
-                note        =nb["note"],
-                prop_key    =nb.get("prop_key"),
-                channel     =nb.get("channel", 0),
-                target_value=nb.get("target_value"),
-            ))
-
-        for ab in data.get("audio", []):
-            self.bind_audio(AudioBinding(
-                metric_attr=ab["metric_attr"],
-                prop_key   =ab["prop_key"],
-                min_val    =ab["min_val"],
-                max_val    =ab["max_val"],
             ))
 
     def save_json(self, path: str | Path) -> None:

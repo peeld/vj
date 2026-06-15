@@ -52,6 +52,7 @@ from elements.laser_ribbons import LaserRibbons
 from elements.nn_graph import NNGraph
 
 from property_manager import PropertyManager, build_default_manager
+from link_manager import LinkManager
 
 # Late-bound audio callbacks registered by MergedGUI after it constructs its
 # scene elements.  AudioPanel calls each entry from the audio thread so that
@@ -62,6 +63,18 @@ _circles_audio_fns: list = []
 # Shared with the Qt panels so MidiPanel can show all scene/feedback params
 # before the GL window starts.
 _pm: PropertyManager | None = None
+
+# Module-level LinkManager — owns the SourceRegistry written by audio/MIDI threads
+# and read by the GL thread each frame.
+_lm = LinkManager()
+
+# Key names tracked for hold-state sources (key.<name>_hold)
+_ALL_KEY_NAMES = (
+    "NUMBER_1", "NUMBER_2", "NUMBER_3", "NUMBER_4",
+    "TAB",
+    "Z", "X", "D", "F", "Q", "W", "A", "S",
+    "H", "J", "C", "V", "B", "N", "K", "L", "I", "U", "G", "M",
+)
 
 wp.init()
 DEVICE = "cuda" if wp.get_cuda_device_count() > 0 else "cpu"
@@ -157,6 +170,11 @@ class MergedGUI(mglw.WindowConfig):
         for eff in self._effects:
             eff.setup(self.ctx, w, h)
 
+        # -- Link manager -----------------------------------------------------
+        self.lm = _lm
+        self._held_keys: set[str] = set()
+        self.lm.event_bus.subscribe("regen", lambda _: self._regen_all())
+
         # -- Audio ------------------------------------------------------------
         # AudioPanel (Qt thread) owns the audio stream; register this scene's
         # callback so the panel drives circles alongside PM bindings.
@@ -206,6 +224,25 @@ class MergedGUI(mglw.WindowConfig):
             _pending_monitor = None
 
         self.time += frame_time
+
+        # ── Source registry: clock + keyboard hold ────────────────────────────
+        reg = self.lm.source_registry
+        reg.update("clock.t", self.time)
+        for _kn in _ALL_KEY_NAMES:
+            reg.update(f"key.{_kn}_hold", 1.0 if _kn in self._held_keys else 0.0)
+
+        # ── Tick envelopes + LFOs → source registry ──────────────────────────
+        self.lm.tick_envelopes(frame_time)
+        self.lm.tick_lfos(frame_time)
+
+        # ── Threshold detectors → EventBus ────────────────────────────────────
+        self.lm.tick_thresholds()
+
+        # ── Drain EventBus → envelope triggers + EventLinks ───────────────────
+        self.lm.evaluate_events(self.pm)
+
+        # ── Evaluate all signal links → write to PM ───────────────────────────
+        self.lm.evaluate_links(self.pm, frame_time)
 
         self._cloud.step(self.time, frame_time, _controls.show_cloud)
 
@@ -281,9 +318,34 @@ class MergedGUI(mglw.WindowConfig):
         self.camera.on_scroll(y_offset)
 
     def on_key_event(self, key, action, modifiers):
-        if action != self.wnd.keys.ACTION_PRESS:
-            return
         keys = self.wnd.keys
+
+        # -- Keyboard hold-state tracking (press AND release) -----------------
+        _KEY_MAP = {
+            keys.NUMBER_1: "NUMBER_1", keys.NUMBER_2: "NUMBER_2",
+            keys.NUMBER_3: "NUMBER_3", keys.NUMBER_4: "NUMBER_4",
+            keys.TAB: "TAB",
+            keys.Z: "Z", keys.X: "X",
+            keys.D: "D", keys.F: "F",
+            keys.Q: "Q", keys.W: "W",
+            keys.A: "A", keys.S: "S",
+            keys.H: "H", keys.J: "J",
+            keys.C: "C", keys.V: "V",
+            keys.B: "B", keys.N: "N",
+            keys.K: "K", keys.L: "L",
+            keys.I: "I", keys.U: "U",
+            keys.G: "G", keys.M: "M",
+        }
+        key_name = _KEY_MAP.get(key)
+        if key_name is not None:
+            if action == keys.ACTION_PRESS:
+                self._held_keys.add(key_name)
+                self.lm.event_bus.fire(f"key.{key_name}.press")
+            elif action == keys.ACTION_RELEASE:
+                self._held_keys.discard(key_name)
+
+        if action != keys.ACTION_PRESS:
+            return
 
         # -- App-level actions (not delegated to PropertyManager) -------------
         if key == keys.R:
@@ -313,23 +375,6 @@ class MergedGUI(mglw.WindowConfig):
             return
 
         # -- All other keys: delegate to PropertyManager ----------------------
-        # Map moderngl key constants to the string names registered in the PM.
-        _KEY_MAP = {
-            keys.NUMBER_1: "NUMBER_1", keys.NUMBER_2: "NUMBER_2",
-            keys.NUMBER_3: "NUMBER_3", keys.NUMBER_4: "NUMBER_4",
-            keys.TAB: "TAB",
-            keys.Z: "Z", keys.X: "X",
-            keys.D: "D", keys.F: "F",
-            keys.Q: "Q", keys.W: "W",
-            keys.A: "A", keys.S: "S",
-            keys.H: "H", keys.J: "J",
-            keys.C: "C", keys.V: "V",
-            keys.B: "B", keys.N: "N",
-            keys.K: "K", keys.L: "L",
-            keys.I: "I", keys.U: "U",
-            keys.G: "G", keys.M: "M",
-        }
-        key_name = _KEY_MAP.get(key)
         if key_name and self.pm.apply_key_action(key_name):
             # Sync any scene_alpha / blend_mode / smear_pattern changes to the
             # active FeedbackPostEffect so the GPU effect picks them up.
@@ -408,7 +453,9 @@ if __name__ == "__main__":
         # MidiPanel now uses PropertyManager directly.
         # _pm initially has feedback + scene; element sections (nn_graph, lasers,
         # circles) are added to the same object when MergedGUI.__init__ runs.
-        midi = MidiPanel(_router, _pm, title="MIDI Assignments")
+        midi = MidiPanel(_router, title="MIDI Input",
+                         source_registry=_lm.source_registry,
+                         event_bus=_lm.event_bus)
         _restore_geometry(midi, saved, "MidiPanel")
         midi.show()
 
@@ -416,9 +463,9 @@ if __name__ == "__main__":
         # populated by MergedGUI.__init__ so circles receive audio even though
         # the GL window starts after this Qt thread.
         audio = AudioPanel(
-            pm             = _pm,
-            title          = "Audio Input",
-            extra_on_frame = lambda m: [fn(m) for fn in _circles_audio_fns],
+            title           = "Audio Input",
+            extra_on_frame  = lambda m: [fn(m) for fn in _circles_audio_fns],
+            source_registry = _lm.source_registry,
         )
         _restore_geometry(audio, saved, "AudioPanel")
         audio.show()
@@ -428,7 +475,16 @@ if __name__ == "__main__":
         _restore_geometry(colors, saved, "ColorPanel")
         colors.show()
 
-        _qt_windows = {"ParamDialog": dlg, "MidiPanel": midi, "AudioPanel": audio, "ColorPanel": colors}
+        from link_panel import LinkManagerPanel
+        links = LinkManagerPanel(_lm, _pm, title="Link Manager")
+        _restore_geometry(links, saved, "LinkManagerPanel")
+        links.show()
+
+        _qt_windows = {
+            "ParamDialog": dlg, "MidiPanel": midi,
+            "AudioPanel": audio, "ColorPanel": colors,
+            "LinkManagerPanel": links,
+        }
         app.aboutToQuit.connect(lambda: _save_positions(_qt_windows))
 
         app.exec()
