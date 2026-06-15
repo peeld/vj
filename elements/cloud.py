@@ -64,10 +64,10 @@ class CloudElement:
         """
         if enabled:
             self.cloud_op.spawn_particles()
+            self.ball_op.step(frame_time)
         else:
             self.cloud_op.kill_particles()
 
-        self.ball_op.step(frame_time)
         self.cloud_op.step(time, frame_time, self.ball_data)
         self.cloud_draw.write_warp(self.cloud_data.wp_pos, self.cloud_data.wp_col)
         self.ball_draw.write_warp(self.ball_data.wp_pos)

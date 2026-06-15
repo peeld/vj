@@ -121,7 +121,7 @@ def respawn_escaped(
         nz = (wp.randf(r2) * 2.0 - 1.0) * half
         positions[i]  = wp.vec3(nx, ny, nz)
         velocities[i] = wp.vec3(0.0, 0.0, 0.0)
-        colors[i]     = wp.vec4(0.5, 0.5, 0.5, 0.1)
+        colors[i]     = wp.vec4(0.5, 0.5, 0.5, 0.0)
 
 
 @wp.kernel

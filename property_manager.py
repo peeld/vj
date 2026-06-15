@@ -161,12 +161,21 @@ class MidiNoteBinding:
       • target_value  — on note-on (velocity > 0) sets the property to this
                         exact value; perfect for assigning one note per enum choice
       • prop_key only — on note-on toggles a bool property (original behaviour)
+
+    release_value
+        If set, written to the property on note-off (velocity == 0).
+        Use this for momentary / "hold" behaviour on enum properties:
+        e.g. hold note → "additive", release → "lerp".
+        When target_value == release_value (or release_value is None) the
+        note-off is a no-op, which is the correct behaviour when the note
+        itself maps to the default value (e.g. "lerp").
     """
-    note         : int
-    prop_key     : str | None = None
-    callback     : Callable[[int], None] | None = None
-    channel      : int = 0
-    target_value : Any = None   # if set, writes this value instead of toggling
+    note          : int
+    prop_key      : str | None = None
+    callback      : Callable[[int], None] | None = None
+    channel       : int = 0
+    target_value  : Any = None   # if set, writes this value instead of toggling
+    release_value : Any = None   # if set, writes this value on note-off
 
 
 @dataclass
@@ -455,6 +464,11 @@ class PropertyManager:
                     cur = self.get(b.prop_key)
                     self.set(b.prop_key, not cur)
                     print(f"[pm] note {note} → {b.prop_key} toggled → {self.get(b.prop_key)!r}")
+            else:
+                # note-off: revert to release_value if one is set
+                if b.release_value is not None:
+                    self.set(b.prop_key, b.release_value)
+                    print(f"[pm] note {note} released → {b.prop_key} = {b.release_value!r}")
         return True
 
     def bind_enum_to_cc(self, prop_key: str, cc: int, channel: int = 0) -> None:
@@ -479,9 +493,10 @@ class PropertyManager:
 
     def bind_enum_to_notes(
         self,
-        prop_key  : str,
-        start_note: int,
-        channel   : int = 0,
+        prop_key      : str,
+        start_note    : int,
+        channel       : int = 0,
+        release_value : Any = None,
     ) -> dict[str, int]:
         """Convenience: assign one MIDI note per enum choice.
 
@@ -492,9 +507,23 @@ class PropertyManager:
 
         Returns a dict mapping choice_value → note for reference.
 
+        release_value
+            Value written to the property on note-off (key release).
+            Enables momentary / "hold" behaviour: hold note → choice,
+            release → release_value.  When a note's own target_value
+            equals release_value the note-off is a no-op (correct for
+            the note that maps to the default/rest value itself).
+
+            For blend_mode the default rest mode is "lerp", so pass
+            release_value="lerp" to get hold-to-activate behaviour on
+            all other blend modes while leaving the "lerp" note as a
+            plain latch (press sets lerp, release does nothing).
+
         Example::
-            mapping = pm.bind_enum_to_notes("scene.blend_mode", start_note=36)
-            # note 36 → "lerp", 37 → "additive", 38 → "screen", …
+            mapping = pm.bind_enum_to_notes(
+                "scene.blend_mode", start_note=36, release_value="lerp"
+            )
+            # note 36 → "lerp" (latch), 37 → "additive" (hold), …
         """
         prop = self._defs.get(prop_key)
         if prop is None:
@@ -505,11 +534,16 @@ class PropertyManager:
         mapping: dict[str, int] = {}
         for i, choice in enumerate(prop.choices):
             note = start_note + i
+            # A note whose target equals the release_value acts as a plain
+            # latch (release_value=None means note-off is a no-op for it).
+            rv = None if (release_value is None or choice == release_value) \
+                 else release_value
             self.bind_midi_note(MidiNoteBinding(
                 note=note,
                 prop_key=prop_key,
                 channel=channel,
                 target_value=choice,
+                release_value=rv,
             ))
             mapping[choice] = note
 
@@ -786,17 +820,17 @@ def build_default_manager(
       controls, "show_cloud")
 
     R(PropDef(f"{_S}.show_nn",       _S, "show_nn",       "NN Graph",
-              bool, True,    widget_hint="check",
+              bool, False,    widget_hint="check",
               description="Toggle nearest-neighbour graph element"),
       controls, "show_nn")
 
     R(PropDef(f"{_S}.show_circles",  _S, "show_circles",  "Circle Axis",
-              bool, True,    widget_hint="check",
+              bool, False,    widget_hint="check",
               description="Toggle circle-axis ribbons element"),
       controls, "show_circles")
 
     R(PropDef(f"{_S}.show_lasers",   _S, "show_lasers",   "Laser Ribbons",
-              bool, True,    widget_hint="check",
+              bool, False,    widget_hint="check",
               description="Toggle laser ribbon element"),
       controls, "show_lasers")
 
@@ -806,7 +840,7 @@ def build_default_manager(
       controls, "scene_alpha")
 
     R(PropDef(f"{_S}.blend_mode",    _S, "blend_mode",    "Blend Mode",
-              str, "screen",  choices=BLEND_MODES, widget_hint="combo",
+              str, "lerp",  choices=BLEND_MODES, widget_hint="combo",
               description="Compositing operator for scene→feedback injection"),
       controls, "blend_mode")
 

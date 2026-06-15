@@ -60,6 +60,7 @@ _POINTS_FRAG = """
     void main() {
         vec2 c = gl_PointCoord * 2.0 - 1.0;
         if (dot(c, c) > 1.0) discard;
+        if (v_color[3] < 0.01) discard;
         f_color = v_color;
     }
 """

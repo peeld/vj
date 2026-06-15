@@ -33,14 +33,11 @@ Flow
 5. Save/Load persist the full PropertyManager JSON (presets + all mappings)
 """
 
-import json
-import threading
 from pathlib import Path
-from typing import Any
 
 from PySide6.QtCore    import QTimer, Qt, Signal, QObject, QSettings
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QLineEdit,
     QScrollArea, QFrame, QSizePolicy, QFileDialog,
     QButtonGroup, QRadioButton,
@@ -524,7 +521,7 @@ class MidiPanel(QWidget):
         self._cc_enum_widget.setVisible(is_cc and is_enum)
 
         # Note sub-widgets
-        self._note_bool_widget.setVisible(is_note and not is_enum)
+        self._note_bool_widget.setVisible(is_note)
         self._note_enum_widget.setVisible(note_enum)
 
         # Main Learn row — hidden for Note+Enum (per-row buttons take over)
@@ -635,7 +632,7 @@ class MidiPanel(QWidget):
                     f"✓ CC#{number} → {prop.key}  [{min_v:.4g} – {max_v:.4g}]"
                 )
 
-        elif ev_type == "note" and is_note and not is_enum:
+        elif ev_type == "note" and is_note:
             # Toggle / Press (enum case handled by per-row Learn buttons)
             note_mode = "press" if self._rb_press.isChecked() else "toggle"
             self.pm.bind_midi_note(MidiNoteBinding(

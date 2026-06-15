@@ -54,7 +54,7 @@ class PointCloudData:
             -self.INITIAL_SPEED, self.INITIAL_SPEED,
             (self.num_points, 3)
         ).astype(np.float32)
-        grey = np.full((self.num_points, 4), [0.5, 0.5, 0.5, 0.2], dtype=np.float32)
+        grey = np.full((self.num_points, 4), [0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self.wp_pos = wp.array(pos, dtype=wp.vec3)
         self.wp_vel = wp.array(vel, dtype=wp.vec3)
         self.wp_col = wp.array(grey, dtype=wp.vec4)

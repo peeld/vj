@@ -209,9 +209,14 @@ class MergedGUI(mglw.WindowConfig):
 
         self._cloud.step(self.time, frame_time, _controls.show_cloud)
 
-        if _controls.show_nn:
-            self.nn_graph.step(self.time)
-            self.nn_graph.upload()
+        if _controls.show_nn and not self.nn_graph.is_active():
+            self.nn_graph.activate()
+
+        if not _controls.show_nn and self.nn_graph.is_active():
+            self.nn_graph.deactivate()
+
+        self.nn_graph.step(self.time)
+        self.nn_graph.upload()
 
         # Sync active_effect selection from param_dialog -> _effect_idx.
         desired = _controls.active_effect
@@ -253,12 +258,11 @@ class MergedGUI(mglw.WindowConfig):
             self.ctx.screen.use()
             self.ctx.enable(moderngl.DEPTH_TEST)
             self.ctx.clear(0.04, 0.04, 0.06, 1.0)
-            self._draw_scene(mvp, current_time)
+            self._draw_scene(mvp)
 
     def _draw_scene(self, mvp, t: float) -> None:
         self._cloud.draw(mvp)
-        if _controls.show_nn:
-            self.nn_graph.draw(mvp)
+        self.nn_graph.draw(mvp)
         self._circles.draw(mvp, t)
         self._lasers.draw(mvp)
 
@@ -359,9 +363,32 @@ if __name__ == "__main__":
     # Build base PM now (feedback + scene props only; elements added in GL __init__)
     _pm = build_default_manager(_params, _controls, None, None, None)
 
+    import json, pathlib
+    _POS_FILE = pathlib.Path(__file__).with_name("window_positions.json")
+
+    def _load_positions() -> dict:
+        try:
+            return json.loads(_POS_FILE.read_text())
+        except Exception:
+            return {}
+
+    def _save_positions(widgets: dict) -> None:
+        data = {}
+        for name, w in widgets.items():
+            g = w.geometry()
+            data[name] = {"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height()}
+        _POS_FILE.write_text(json.dumps(data, indent=2))
+
+    def _restore_geometry(widget, saved: dict, key: str) -> None:
+        if key in saved:
+            g = saved[key]
+            widget.setGeometry(g["x"], g["y"], g["w"], g["h"])
+
     def _run_qt() -> None:
         """Single Qt thread — one QApplication, both panels."""
         app = QApplication.instance() or QApplication([])
+
+        saved = _load_positions()
 
         dlg = ParamDialog(
             [
@@ -375,12 +402,14 @@ if __name__ == "__main__":
             title="MergedGUI Params",
             on_monitor_change=lambda idx: globals().__setitem__('_pending_monitor', idx),
         )
+        _restore_geometry(dlg, saved, "ParamDialog")
         dlg.show()
 
         # MidiPanel now uses PropertyManager directly.
         # _pm initially has feedback + scene; element sections (nn_graph, lasers,
         # circles) are added to the same object when MergedGUI.__init__ runs.
         midi = MidiPanel(_router, _pm, title="MIDI Assignments")
+        _restore_geometry(midi, saved, "MidiPanel")
         midi.show()
 
         # AudioPanel owns the single audio stream; _circles_audio_fns is
@@ -391,7 +420,11 @@ if __name__ == "__main__":
             title          = "Audio Input",
             extra_on_frame = lambda m: [fn(m) for fn in _circles_audio_fns],
         )
+        _restore_geometry(audio, saved, "AudioPanel")
         audio.show()
+
+        _qt_windows = {"ParamDialog": dlg, "MidiPanel": midi, "AudioPanel": audio}
+        app.aboutToQuit.connect(lambda: _save_positions(_qt_windows))
 
         app.exec()
 
