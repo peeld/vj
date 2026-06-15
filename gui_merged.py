@@ -3,29 +3,16 @@ gui_merged.py - MergedGUI
 Combines the cloud/ball/NN-graph scene (gui.py) with the circle-axis scene
 (gui3.py) into a single window with per-element visibility toggles.
 
-Element toggles:
-  1  -- cloud data + ball data
-  2  -- NN graph
-  3  -- circle axis
-  4  -- laser ribbons
-
-Other controls:
+App-level controls (not user-configurable):
   R          -- regenerate all elements
   P          -- toggle post pipeline on / off (raw scene render)
   O          -- toggle orbit camera on / off
-  Tab        -- cycle effect type  (feedback -> pass_through -> ...)
+  T          -- cycle feedback preset (when feedback effect active)
   Mouse drag -- orbit camera
   Scroll     -- zoom
   ESC        -- quit
 
-Post-effect tweaks (effect must be ON, feedback effect active):
-  T    -- cycle preset  (gentle -> tunnel -> slow_burn -> deep_sea -> acid -> aurora)
-  Z/X  -- scene blend down/up     D/F  -- decay down/up
-  Q/W  -- rotation down/up        A/S  -- zoom down/up
-  H/J  -- hue shift down/up       C/V  -- chromatic aberration down/up
-  B/N  -- saturation down/up      K/L  -- smear strength down/up
-  I/U  -- fisheye down/up         M    -- cycle smear pattern
-  G    -- cycle blend mode
+All other key mappings are configured via the Link Manager panel (EventLinks).
 """
 
 import random
@@ -374,21 +361,6 @@ class MergedGUI(mglw.WindowConfig):
                 _controls.smear_pattern = eff._smear_pattern_name
             return
 
-        # -- All other keys: delegate to PropertyManager ----------------------
-        if key_name and self.pm.apply_key_action(key_name):
-            # Sync any scene_alpha / blend_mode / smear_pattern changes to the
-            # active FeedbackPostEffect so the GPU effect picks them up.
-            eff = self._active_effect
-            if isinstance(eff, FeedbackPostEffect):
-                eff.scene_alpha = _controls.scene_alpha
-                if _controls.blend_mode in BLEND_MODES:
-                    eff._blend_mode_idx = BLEND_MODES.index(_controls.blend_mode)
-                if _controls.smear_pattern != eff._smear_pattern_name:
-                    eff._smear_pattern_name = _controls.smear_pattern
-                    eff._smear_pattern_idx  = SMEAR_PATTERNS.index(_controls.smear_pattern)
-                    if eff._loop is not None:
-                        eff._loop.set_smear_pattern(_controls.smear_pattern)
-            return
 
     def on_resize(self, width: int, height: int):
         for eff in self._effects:

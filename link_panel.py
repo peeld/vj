@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QCheckBox, QHeaderView,
     QTabWidget, QFrame, QDoubleSpinBox,
-    QCompleter, QAbstractItemView, QDialog, QDialogButtonBox,
+    QCompleter, QAbstractItemView, QDialog, QDialogButtonBox, QInputDialog,
 )
 
 from link_manager import (
@@ -205,8 +205,14 @@ def _expr_completions(lm: LinkManager) -> list[str]:
     return keys + math
 
 
-def _action_completions(pm: "PropertyManager") -> list[str]:
+def _action_completions(lm: LinkManager, pm: "PropertyManager") -> list[str]:
     actions: list[str] = ["regen", "preset('')"]
+    preset_names = lm.list_link_presets()
+    if preset_names:
+        for name in preset_names:
+            actions.append(f"link_preset('{name}')")
+    else:
+        actions.append("link_preset('')")
     for prop in pm.all_props():
         k = prop.key
         if prop.type is bool:
@@ -216,6 +222,11 @@ def _action_completions(pm: "PropertyManager") -> list[str]:
             actions.append(f"cycle_back({k})")
         actions.append(f"set({k}, )")
     return actions
+
+
+def _trigger_action_completions(lm: LinkManager) -> list[str]:
+    names = lm.list_link_presets()
+    return [f"link_preset('{n}')" for n in names] if names else ["link_preset('')"]
 
 
 def _make_completer(words: list[str], parent=None) -> QCompleter:
@@ -355,7 +366,8 @@ class SignalLinkDialog(_BaseDialog):
 
 class EventLinkDialog(_BaseDialog):
     def __init__(self, lm: LinkManager, pm: "PropertyManager",
-                 link: EventLink | None = None, parent=None):
+                 link: EventLink | None = None, parent=None,
+                 action_completions: list[str] | None = None):
         super().__init__("Event Link" if link is None else "Edit Event Link", parent)
 
         self._event = QLineEdit()
@@ -369,7 +381,8 @@ class EventLinkDialog(_BaseDialog):
         self._action.setPlaceholderText("toggle(scene.show_cloud)")
         if link:
             self._action.setText(link.action)
-        self._action.setCompleter(_make_completer(_action_completions(pm), self))
+        actions = action_completions if action_completions is not None else _action_completions(lm, pm)
+        self._action.setCompleter(_make_completer(actions, self))
         self._row("Action:", self._action)
 
         self._condition = QLineEdit()
@@ -717,10 +730,13 @@ class EventsTab(QWidget):
         add_el = QPushButton("+ Add Link")
         add_el.setObjectName("add")
         add_el.clicked.connect(self._add_event_link)
+        edit_el = QPushButton("Edit")
+        edit_el.clicked.connect(self._edit_event_link)
         rm_el = QPushButton("Remove")
         rm_el.setObjectName("remove")
         rm_el.clicked.connect(self._remove_event_link)
         tb1.addWidget(add_el)
+        tb1.addWidget(edit_el)
         tb1.addWidget(rm_el)
         tb1.addStretch()
         lo.addLayout(tb1)
@@ -733,6 +749,10 @@ class EventsTab(QWidget):
         el_hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self._el_table.doubleClicked.connect(self._edit_event_link)
         lo.addWidget(self._el_table)
+
+        el_hint = QLabel("Double-click a row to edit.")
+        el_hint.setObjectName("info")
+        lo.addWidget(el_hint)
 
         # Separator
         sep = QFrame()
@@ -749,10 +769,13 @@ class EventsTab(QWidget):
         add_th = QPushButton("+ Add Threshold")
         add_th.setObjectName("add")
         add_th.clicked.connect(self._add_threshold)
+        edit_th = QPushButton("Edit")
+        edit_th.clicked.connect(self._edit_threshold)
         rm_th = QPushButton("Remove")
         rm_th.setObjectName("remove")
         rm_th.clicked.connect(self._remove_threshold)
         tb2.addWidget(add_th)
+        tb2.addWidget(edit_th)
         tb2.addWidget(rm_th)
         tb2.addStretch()
         lo.addLayout(tb2)
@@ -765,6 +788,10 @@ class EventsTab(QWidget):
             th_hh.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         self._th_table.doubleClicked.connect(self._edit_threshold)
         lo.addWidget(self._th_table)
+
+        th_hint = QLabel("Double-click a row to edit.")
+        th_hint.setObjectName("info")
+        lo.addWidget(th_hint)
 
         self._rebuild()
 
@@ -1032,12 +1059,171 @@ class LFOsTab(QWidget):
         self.changed.emit()
 
 
+# ── Presets ───────────────────────────────────────────────────────────────────
+
+class PresetsTab(QWidget):
+    changed      = Signal()   # routing or trigger list changed → schedule save
+    needs_rebuild = Signal()  # preset was loaded → other tabs must rebuild
+
+    def __init__(self, lm: LinkManager, pm: "PropertyManager", parent=None):
+        super().__init__(parent)
+        self._lm = lm
+        self._pm = pm
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(4, 4, 4, 4)
+        lo.setSpacing(4)
+
+        # ── Preset list ───────────────────────────────────────────────────────
+        hdr1 = QLabel("Link Presets")
+        hdr1.setObjectName("hdr")
+        lo.addWidget(hdr1)
+
+        tb1 = QHBoxLayout()
+        save_btn = QPushButton("Save Current As…")
+        save_btn.setObjectName("add")
+        save_btn.clicked.connect(self._save_preset)
+        load_btn = QPushButton("Load")
+        load_btn.clicked.connect(self._load_preset)
+        del_btn = QPushButton("Delete")
+        del_btn.setObjectName("remove")
+        del_btn.clicked.connect(self._delete_preset)
+        tb1.addWidget(save_btn)
+        tb1.addWidget(load_btn)
+        tb1.addWidget(del_btn)
+        tb1.addStretch()
+        lo.addLayout(tb1)
+
+        self._preset_table = _make_table(["Name"])
+        self._preset_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        self._preset_table.doubleClicked.connect(self._load_preset)
+        lo.addWidget(self._preset_table)
+
+        info1 = QLabel("Double-click a preset to load it immediately.")
+        info1.setObjectName("info")
+        lo.addWidget(info1)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setObjectName("sep")
+        lo.addWidget(sep)
+
+        # ── Preset triggers ───────────────────────────────────────────────────
+        hdr2 = QLabel("Preset Triggers  —  survive preset switches")
+        hdr2.setObjectName("hdr")
+        lo.addWidget(hdr2)
+
+        tb2 = QHBoxLayout()
+        add_btn = QPushButton("+ Add Trigger")
+        add_btn.setObjectName("add")
+        add_btn.clicked.connect(self._add_trigger)
+        rm_btn = QPushButton("Remove")
+        rm_btn.setObjectName("remove")
+        rm_btn.clicked.connect(self._remove_trigger)
+        tb2.addWidget(add_btn)
+        tb2.addWidget(rm_btn)
+        tb2.addStretch()
+        lo.addLayout(tb2)
+
+        self._trigger_table = _make_table(["On", "Event", "Action", "Condition"])
+        th = self._trigger_table.horizontalHeader()
+        th.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        th.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._trigger_table.doubleClicked.connect(self._edit_trigger)
+        lo.addWidget(self._trigger_table)
+
+        info2 = QLabel("Action syntax:  link_preset('name')")
+        info2.setObjectName("info")
+        lo.addWidget(info2)
+
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        names = self._lm.list_link_presets()
+        self._preset_table.setRowCount(len(names))
+        for r, name in enumerate(names):
+            self._preset_table.setItem(r, 0, _cell(name))
+
+        triggers = self._lm._preset_triggers
+        self._trigger_table.setRowCount(len(triggers))
+        for r, link in enumerate(triggers):
+            self._trigger_table.setItem(r, 0, _bool_cell(link.enabled))
+            self._trigger_table.setItem(r, 1, _cell(link.event))
+            self._trigger_table.setItem(r, 2, _cell(link.action))
+            self._trigger_table.setItem(r, 3, _cell(link.condition or ""))
+
+    # Preset CRUD
+
+    def _save_preset(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
+        if ok and name.strip():
+            self._lm.save_link_preset(name.strip())
+            self._rebuild()
+            self.changed.emit()
+
+    def _load_preset(self) -> None:
+        row = self._preset_table.currentRow()
+        if row < 0:
+            return
+        item = self._preset_table.item(row, 0)
+        if item:
+            self._lm.load_link_preset(item.text())
+            self.needs_rebuild.emit()
+            self.changed.emit()
+
+    def _delete_preset(self) -> None:
+        row = self._preset_table.currentRow()
+        if row < 0:
+            return
+        item = self._preset_table.item(row, 0)
+        if item:
+            self._lm.delete_link_preset(item.text())
+            self._rebuild()
+            self.changed.emit()
+
+    # Preset trigger CRUD
+
+    def _add_trigger(self) -> None:
+        dlg = EventLinkDialog(self._lm, self._pm, parent=self,
+                              action_completions=_trigger_action_completions(self._lm))
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            link = dlg.result_link()
+            if link.event and link.action:
+                self._lm.add_preset_trigger(link)
+                self._rebuild()
+                self.changed.emit()
+
+    def _edit_trigger(self) -> None:
+        row = self._trigger_table.currentRow()
+        if row < 0 or row >= len(self._lm._preset_triggers):
+            return
+        old = self._lm._preset_triggers[row]
+        dlg = EventLinkDialog(self._lm, self._pm, link=old, parent=self,
+                              action_completions=_trigger_action_completions(self._lm))
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._lm._preset_triggers[row] = dlg.result_link()
+            self._rebuild()
+            self.changed.emit()
+
+    def _remove_trigger(self) -> None:
+        row = self._trigger_table.currentRow()
+        if row < 0 or row >= len(self._lm._preset_triggers):
+            return
+        link = self._lm._preset_triggers[row]
+        self._lm.remove_preset_trigger(link.event, link.action)
+        self._rebuild()
+        self.changed.emit()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main panel
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LinkManagerPanel(QWidget):
-    """Main panel: tabs for Signal Links, Events, Envelopes, LFOs, Sources."""
+    """Main panel: tabs for Signal Links, Events, Envelopes, LFOs, Presets, Sources."""
 
     _STATE_PATH = pathlib.Path(__file__).with_name("link_state.json")
 
@@ -1055,17 +1241,19 @@ class LinkManagerPanel(QWidget):
         lo.setSpacing(4)
 
         tabs = QTabWidget()
-        self._sig_tab = SignalLinksTab(lm, pm)
-        self._evt_tab = EventsTab(lm, pm)
-        self._env_tab = EnvelopesTab(lm)
-        self._lfo_tab = LFOsTab(lm)
-        self._src_tab = SourcesTab(lm)
+        self._sig_tab     = SignalLinksTab(lm, pm)
+        self._evt_tab     = EventsTab(lm, pm)
+        self._env_tab     = EnvelopesTab(lm)
+        self._lfo_tab     = LFOsTab(lm)
+        self._preset_tab  = PresetsTab(lm, pm)
+        self._src_tab     = SourcesTab(lm)
 
-        tabs.addTab(self._sig_tab, "Signal Links")
-        tabs.addTab(self._evt_tab, "Events")
-        tabs.addTab(self._env_tab, "Envelopes")
-        tabs.addTab(self._lfo_tab, "LFOs")
-        tabs.addTab(self._src_tab, "Sources")
+        tabs.addTab(self._sig_tab,    "Signal Links")
+        tabs.addTab(self._evt_tab,    "Events")
+        tabs.addTab(self._env_tab,    "Envelopes")
+        tabs.addTab(self._lfo_tab,    "LFOs")
+        tabs.addTab(self._preset_tab, "Presets")
+        tabs.addTab(self._src_tab,    "Sources")
         lo.addWidget(tabs)
 
         # Footer
@@ -1085,14 +1273,22 @@ class LinkManagerPanel(QWidget):
         self._save_timer.setInterval(5000)
         self._save_timer.timeout.connect(self._save_now)
 
-        for tab in (self._sig_tab, self._evt_tab, self._env_tab, self._lfo_tab):
+        for tab in (self._sig_tab, self._evt_tab, self._env_tab,
+                    self._lfo_tab, self._preset_tab):
             tab.changed.connect(self._on_changed)
+
+        self._preset_tab.needs_rebuild.connect(self._rebuild_routing_tabs)
 
         self._auto_load()
 
     def _on_changed(self) -> None:
         self._save_timer.start()
         self._status.setText("unsaved changes")
+
+    def _rebuild_routing_tabs(self) -> None:
+        """Rebuild all routing tabs after a preset load changes the routing state."""
+        for tab in (self._sig_tab, self._evt_tab, self._env_tab, self._lfo_tab):
+            tab._rebuild()
 
     def _save_now(self) -> None:
         try:
@@ -1106,7 +1302,8 @@ class LinkManagerPanel(QWidget):
             return
         try:
             self._lm.load_state(self._STATE_PATH)
-            for tab in (self._sig_tab, self._evt_tab, self._env_tab, self._lfo_tab):
+            for tab in (self._sig_tab, self._evt_tab, self._env_tab,
+                        self._lfo_tab, self._preset_tab):
                 tab._rebuild()
             self._status.setText(f"loaded  ({self._STATE_PATH.name})")
         except Exception as exc:

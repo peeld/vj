@@ -556,6 +556,11 @@ class LinkManager:
 
         self._const_ns = types.SimpleNamespace()  # user-defined named constants
 
+        # Link presets: named snapshots of routing state
+        self._presets         : dict[str, dict]  = {}
+        # Preset triggers: EventLinks that survive preset switches
+        self._preset_triggers : list[EventLink]  = []
+
     # ── SignalLink management ─────────────────────────────────────────────────
 
     def add_link(self, link: SignalLink) -> None:
@@ -682,8 +687,14 @@ class LinkManager:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def clear_state(self) -> None:
-        """Remove all signal links, envelopes, LFOs, event links, and thresholds."""
+        """Remove all routing state: links, envelopes, LFOs, event links, thresholds.
+
+        Does NOT touch _presets or _preset_triggers.
+        """
         self._signal_links.clear()
+        for name in list(self._envelopes):
+            for token in self._envelope_sub_tokens.pop(name, []):
+                self.event_bus.unsubscribe(token)
         self._envelope_defs.clear()
         self._envelopes.clear()
         self._lfo_defs.clear()
@@ -694,20 +705,26 @@ class LinkManager:
         self._threshold_last_t.clear()
 
     def save_state(self, path) -> None:
-        """Serialise all links/envelopes/LFOs/events/thresholds to JSON."""
+        """Serialise all routing state, presets, and preset triggers to JSON."""
         import json as _json
         from pathlib import Path as _Path
         data = {
-            "signal_links" : [l.to_dict() for l in self._signal_links],
-            "envelopes"    : [d.to_dict() for d in self._envelope_defs],
-            "lfos"         : [d.to_dict() for d in self._lfo_defs],
-            "event_links"  : [l.to_dict() for l in self._event_links],
-            "thresholds"   : [d.to_dict() for d in self._threshold_defs],
+            "signal_links"    : [l.to_dict() for l in self._signal_links],
+            "envelopes"       : [d.to_dict() for d in self._envelope_defs],
+            "lfos"            : [d.to_dict() for d in self._lfo_defs],
+            "event_links"     : [l.to_dict() for l in self._event_links],
+            "thresholds"      : [d.to_dict() for d in self._threshold_defs],
+            "presets"         : self._presets,
+            "preset_triggers" : [l.to_dict() for l in self._preset_triggers],
         }
         _Path(path).write_text(_json.dumps(data, indent=2))
 
     def load_state(self, path, replace: bool = False) -> None:
-        """Load state from JSON.  If replace=True, clear existing state first."""
+        """Load state from JSON.  If replace=True, clear existing routing state first.
+
+        Presets and preset_triggers in the file are merged (not replaced) into
+        the current instance so navigation links accumulate across multiple loads.
+        """
         import json as _json
         from pathlib import Path as _Path
         data = _json.loads(_Path(path).read_text())
@@ -723,6 +740,63 @@ class LinkManager:
             self.add_event_link(EventLink.from_dict(d))
         for d in data.get("thresholds", []):
             self.add_threshold(ThresholdDef.from_dict(d))
+        for name, snap in data.get("presets", {}).items():
+            self._presets[name] = snap
+        for d in data.get("preset_triggers", []):
+            self.add_preset_trigger(EventLink.from_dict(d))
+
+    # ── Link preset management ────────────────────────────────────────────────
+
+    def save_link_preset(self, name: str) -> None:
+        """Snapshot the current routing state under a named preset."""
+        self._presets[name] = {
+            "signal_links" : [l.to_dict() for l in self._signal_links],
+            "envelopes"    : [d.to_dict() for d in self._envelope_defs],
+            "lfos"         : [d.to_dict() for d in self._lfo_defs],
+            "event_links"  : [l.to_dict() for l in self._event_links],
+            "thresholds"   : [d.to_dict() for d in self._threshold_defs],
+        }
+        print(f"[lm] preset saved: '{name}'")
+
+    def load_link_preset(self, name: str) -> None:
+        """Restore a named preset, replacing current routing state.
+
+        _preset_triggers and _presets are left untouched.
+        """
+        if name not in self._presets:
+            print(f"[lm] preset '{name}' not found. Available: {list(self._presets)}")
+            return
+        snap = self._presets[name]
+        self.clear_state()
+        for d in snap.get("signal_links", []):
+            self.add_link(SignalLink.from_dict(d))
+        for d in snap.get("envelopes", []):
+            self.add_envelope(EnvelopeDef.from_dict(d))
+        for d in snap.get("lfos", []):
+            self.add_lfo(LFODef.from_dict(d))
+        for d in snap.get("event_links", []):
+            self.add_event_link(EventLink.from_dict(d))
+        for d in snap.get("thresholds", []):
+            self.add_threshold(ThresholdDef.from_dict(d))
+        print(f"[lm] preset loaded: '{name}'")
+
+    def delete_link_preset(self, name: str) -> None:
+        self._presets.pop(name, None)
+
+    def list_link_presets(self) -> list[str]:
+        return list(self._presets)
+
+    # ── Preset trigger management ─────────────────────────────────────────────
+
+    def add_preset_trigger(self, link: EventLink) -> None:
+        """Register a navigation EventLink that survives preset switches."""
+        self._preset_triggers.append(link)
+
+    def remove_preset_trigger(self, event: str, action: str) -> None:
+        self._preset_triggers = [
+            l for l in self._preset_triggers
+            if not (l.event == event and l.action == action)
+        ]
 
     # ── EventLink management ──────────────────────────────────────────────────
 
@@ -737,11 +811,12 @@ class LinkManager:
 
     # ── Action dispatcher ─────────────────────────────────────────────────────
 
-    _RE_TOGGLE     = re.compile(r"^toggle\(([^)]+)\)$")
-    _RE_CYCLE      = re.compile(r"^cycle\(([^)]+)\)$")
-    _RE_CYCLE_BACK = re.compile(r"^cycle_back\(([^)]+)\)$")
-    _RE_SET        = re.compile(r"^set\(([^,]+),\s*(.+)\)$")
-    _RE_PRESET     = re.compile(r"""^preset\(['"]([^'"]+)['"]\)$""")
+    _RE_TOGGLE      = re.compile(r"^toggle\(([^)]+)\)$")
+    _RE_CYCLE       = re.compile(r"^cycle\(([^)]+)\)$")
+    _RE_CYCLE_BACK  = re.compile(r"^cycle_back\(([^)]+)\)$")
+    _RE_SET         = re.compile(r"^set\(([^,]+),\s*(.+)\)$")
+    _RE_PRESET      = re.compile(r"""^preset\(['"]([^'"]+)['"]\)$""")
+    _RE_LINK_PRESET = re.compile(r"""^link_preset\(['"]([^'"]+)['"]\)$""")
 
     def _dispatch_action(self, action: str, pm: Any) -> None:
         action = action.strip()
@@ -784,6 +859,11 @@ class LinkManager:
             pm.load_preset(m.group(1))
             return
 
+        m = self._RE_LINK_PRESET.match(action)
+        if m:
+            self.load_link_preset(m.group(1))
+            return
+
         if action == "regen":
             # Fires "regen" as an event; subscribers (e.g. MergedGUI) handle it.
             self.event_bus.fire("regen")
@@ -791,31 +871,37 @@ class LinkManager:
 
     # ── Event evaluation ──────────────────────────────────────────────────────
 
+    def _fire_links(self, links: list, event_id: str, ns: dict, pm: Any) -> None:
+        for link in links:
+            if not link.enabled or link.event != event_id:
+                continue
+            if link.condition:
+                try:
+                    if not eval(link.condition, {"__builtins__": {}}, ns):
+                        continue
+                except Exception:
+                    continue
+            try:
+                self._dispatch_action(link.action, pm)
+            except Exception:
+                pass
+
     def evaluate_events(self, pm: Any) -> None:
         """Drain the EventBus and dispatch events to subscribers and EventLinks.
 
         Called from the GL thread once per frame, after tick_thresholds() and
         before evaluate_links().  Envelope triggers are handled via subscriptions
-        wired in add_envelope(); EventLinks are processed here.
+        wired in add_envelope(); EventLinks and preset triggers are processed here.
+        Preset triggers are evaluated before routing EventLinks so navigation takes
+        effect in the same frame.
         """
         fired = self.event_bus.drain()  # also dispatches to subscribers (envelopes etc.)
-        if not fired or not self._event_links:
+        if not fired or not (self._event_links or self._preset_triggers):
             return
 
         snap = self.source_registry.snapshot()
         ns   = {**_flat_to_ns(snap), **EVAL_MATH_NS}
 
         for event_id, _payload in fired:
-            for link in self._event_links:
-                if not link.enabled or link.event != event_id:
-                    continue
-                if link.condition:
-                    try:
-                        if not eval(link.condition, {"__builtins__": {}}, ns):
-                            continue
-                    except Exception:
-                        continue
-                try:
-                    self._dispatch_action(link.action, pm)
-                except Exception:
-                    pass
+            self._fire_links(self._preset_triggers, event_id, ns, pm)
+            self._fire_links(self._event_links,     event_id, ns, pm)

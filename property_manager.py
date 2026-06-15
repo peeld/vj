@@ -8,10 +8,11 @@ Every adjustable parameter across all scene modules is declared here with:
 
 The manager additionally owns:
   • Preset snapshots  — save / load / list  (JSON-persisted)
-  • Keyboard mappings — key name → increment / decrement / toggle / cycle action
 
 Signal routing (audio, MIDI, envelopes, LFOs, events) is handled by
 LinkManager (link_manager.py), which calls pm.set() from the GL thread.
+Link presets (snapshots of routing state) and preset triggers (keyboard/MIDI
+events that recall them) are also managed by LinkManager.
 
 Typical usage (in gui_merged.py)
 ---------------------------------
@@ -23,13 +24,10 @@ Typical usage (in gui_merged.py)
     pm.get("feedback.decay")          # -> float
     pm.set("feedback.decay", 0.995)
 
-    # key handler
-    pm.apply_key_action("Z")          # uses registered KeyBinding
-
     # preset round-trip
     pm.save_preset("my_look")
     pm.load_preset("my_look")
-    pm.save_json("presets.json")      # persists presets + key bindings
+    pm.save_json("presets.json")      # persists presets
 """
 
 from __future__ import annotations
@@ -108,27 +106,6 @@ class PropDef:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Mapping types
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class KeyBinding:
-    """Maps a keyboard key name to a property action.
-
-    action values:
-      "increment"  — add step (or 1 for int, not valid for str)
-      "decrement"  — subtract step
-      "toggle"     — flip bool
-      "cycle"      — advance through choices list
-      "cycle_back" — retreat through choices list
-    """
-    key_name  : str          # e.g. "Z", "TAB", "NUMBER_1"
-    prop_key  : str          # e.g. "feedback.scene_alpha"
-    action    : str          # increment / decrement / toggle / cycle / cycle_back
-    amount    : float | None = None   # override step if provided
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  PropertyManager
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -156,9 +133,6 @@ class PropertyManager:
 
         # internal storage for unbound props
         self._values: dict[str, Any] = {}
-
-        # mappings
-        self._key_bindings: dict[str, KeyBinding] = {}   # key_name -> binding
 
         # presets:  name -> {prop_key -> value}
         self._presets: dict[str, dict[str, Any]] = {}
@@ -299,80 +273,18 @@ class PropertyManager:
     def list_presets(self) -> list[str]:
         return list(self._presets)
 
-    # ── Keyboard mappings ─────────────────────────────────────────────────────
-
-    def bind_key(self, binding: KeyBinding) -> None:
-        """Register a keyboard binding (overwrites any previous binding for that key)."""
-        self._key_bindings[binding.key_name] = binding
-
-    def apply_key_action(self, key_name: str) -> bool:
-        """Apply the action for a registered key.  Returns True if consumed."""
-        b = self._key_bindings.get(key_name)
-        if b is None:
-            return False
-        prop = self._defs[b.prop_key]
-        cur  = self.get(b.prop_key)
-
-        if b.action == "toggle":
-            self.set(b.prop_key, not cur)
-        elif b.action == "cycle":
-            self.set(b.prop_key, prop.next_choice(cur))
-        elif b.action == "cycle_back":
-            self.set(b.prop_key, prop.prev_choice(cur))
-        elif b.action in ("increment", "decrement"):
-            delta = b.amount if b.amount is not None else (prop.step or 1)
-            if b.action == "decrement":
-                delta = -delta
-            self.set(b.prop_key, cur + delta)
-        else:
-            return False
-
-        live = self.get(b.prop_key)
-        print(f"[pm] {b.prop_key} {b.action} → {live!r}")
-        return True
-
-    def key_bindings(self) -> list[KeyBinding]:
-        return list(self._key_bindings.values())
-
     # ── Serialisation ─────────────────────────────────────────────────────────
 
-    def _presets_to_dict(self) -> dict:
-        return {name: dict(snap) for name, snap in self._presets.items()}
-
-    def _key_bindings_to_list(self) -> list:
-        return [
-            {
-                "key_name": b.key_name,
-                "prop_key": b.prop_key,
-                "action"  : b.action,
-                "amount"  : b.amount,
-            }
-            for b in self._key_bindings.values()
-        ]
-
     def to_dict(self) -> dict:
-        """Serialise presets and key bindings to a plain dict (JSON-safe)."""
+        """Serialise presets to a plain dict (JSON-safe)."""
         return {
-            "presets"      : self._presets_to_dict(),
-            "key_bindings" : self._key_bindings_to_list(),
+            "presets": {name: dict(snap) for name, snap in self._presets.items()},
         }
 
     def from_dict(self, data: dict) -> None:
-        """Restore presets and key bindings from a dict.
-
-        Unknown keys (e.g. legacy midi_cc / midi_notes / audio from old JSON
-        files) are silently ignored.
-        """
+        """Restore presets from a dict.  Unknown keys are silently ignored."""
         for name, snap in data.get("presets", {}).items():
             self._presets[name] = snap
-
-        for kb in data.get("key_bindings", []):
-            self.bind_key(KeyBinding(
-                key_name=kb["key_name"],
-                prop_key=kb["prop_key"],
-                action  =kb["action"],
-                amount  =kb.get("amount"),
-            ))
 
     def save_json(self, path: str | Path) -> None:
         """Persist presets and mappings to a JSON file."""
@@ -613,67 +525,4 @@ def build_default_manager(
                   description="Blade side length as a fraction of circle radius"),
           circles, "blade_size_factor")
 
-    _register_default_key_bindings(pm)
-
     return pm
-
-
-def _register_default_key_bindings(pm: PropertyManager) -> None:
-    """Register the keyboard bindings hard-coded in gui_merged.on_key_event.
-
-    Idempotent: if a key is already bound it is left unchanged.
-    """
-    def _bind(b: KeyBinding) -> None:
-        if b.key_name not in pm._key_bindings:
-            pm.bind_key(b)
-    B = _bind  # reuse name so call sites stay the same
-
-    def _B(*args, **kw) -> KeyBinding:
-        return KeyBinding(*args, **kw)
-
-    # Scene visibility toggles
-    B(_B("NUMBER_1", "scene.show_cloud",   "toggle"))
-    B(_B("NUMBER_2", "scene.show_nn",      "toggle"))
-    B(_B("NUMBER_3", "scene.show_circles", "toggle"))
-    B(_B("NUMBER_4", "scene.show_lasers",  "toggle"))
-
-    # Active effect / blend / smear cycle
-    B(_B("TAB", "scene.active_effect", "cycle"))
-    B(_B("G",   "scene.blend_mode",    "cycle"))
-    B(_B("M",   "scene.smear_pattern", "cycle"))
-
-    # scene_alpha  Z/X
-    B(_B("Z", "scene.scene_alpha", "decrement"))
-    B(_B("X", "scene.scene_alpha", "increment"))
-
-    # decay  D/F
-    B(_B("D", "feedback.decay", "decrement"))
-    B(_B("F", "feedback.decay", "increment"))
-
-    # base_rot  Q/W
-    B(_B("Q", "feedback.base_rot", "decrement"))
-    B(_B("W", "feedback.base_rot", "increment"))
-
-    # base_zoom  A/S
-    B(_B("A", "feedback.base_zoom", "decrement"))
-    B(_B("S", "feedback.base_zoom", "increment"))
-
-    # hue_shift  H/J
-    B(_B("H", "feedback.hue_shift", "decrement"))
-    B(_B("J", "feedback.hue_shift", "increment"))
-
-    # chroma_offset  C/V
-    B(_B("C", "feedback.chroma_offset", "decrement"))
-    B(_B("V", "feedback.chroma_offset", "increment"))
-
-    # sat_boost  B/N
-    B(_B("B", "feedback.sat_boost", "decrement"))
-    B(_B("N", "feedback.sat_boost", "increment"))
-
-    # smear_strength  K/L
-    B(_B("K", "feedback.smear_strength", "decrement"))
-    B(_B("L", "feedback.smear_strength", "increment"))
-
-    # fisheye_strength  I/U
-    B(_B("I", "feedback.fisheye_strength", "decrement"))
-    B(_B("U", "feedback.fisheye_strength", "increment"))
