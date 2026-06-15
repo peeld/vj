@@ -423,7 +423,12 @@ if __name__ == "__main__":
         _restore_geometry(audio, saved, "AudioPanel")
         audio.show()
 
-        _qt_windows = {"ParamDialog": dlg, "MidiPanel": midi, "AudioPanel": audio}
+        from color_panel import ColorPanel
+        colors = ColorPanel(title="Color Harmony")
+        _restore_geometry(colors, saved, "ColorPanel")
+        colors.show()
+
+        _qt_windows = {"ParamDialog": dlg, "MidiPanel": midi, "AudioPanel": audio, "ColorPanel": colors}
         app.aboutToQuit.connect(lambda: _save_positions(_qt_windows))
 
         app.exec()
