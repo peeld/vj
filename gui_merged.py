@@ -39,7 +39,7 @@ from elements.laser_ribbons import LaserRibbons
 from elements.nn_graph import NNGraph
 
 from property_manager import PropertyManager, build_default_manager
-from link_manager import LinkManager
+from link_manager import LinkManager, KEY_NAMES
 
 # Late-bound audio callbacks registered by MergedGUI after it constructs its
 # scene elements.  AudioPanel calls each entry from the audio thread so that
@@ -63,13 +63,6 @@ _current_palette: list = []
 # elements without a full regen.  Same pattern as _pending_monitor.
 _pending_palette_apply: bool = False
 
-# Key names tracked for hold-state sources (key.<name>_hold)
-_ALL_KEY_NAMES = (
-    "NUMBER_1", "NUMBER_2", "NUMBER_3", "NUMBER_4",
-    "TAB",
-    "Z", "X", "D", "F", "Q", "W", "A", "S",
-    "H", "J", "C", "V", "B", "N", "K", "L", "I", "U", "G", "M",
-)
 
 wp.init()
 DEVICE = "cuda" if wp.get_cuda_device_count() > 0 else "cpu"
@@ -240,7 +233,7 @@ class MergedGUI(mglw.WindowConfig):
         # ── Source registry: clock + keyboard hold ────────────────────────────
         reg = self.lm.source_registry
         reg.update("clock.t", self.time)
-        for _kn in _ALL_KEY_NAMES:
+        for _kn in KEY_NAMES:
             reg.update(f"key.{_kn}_hold", 1.0 if _kn in self._held_keys else 0.0)
 
         # ── Tick envelopes + LFOs + parameters → source registry ─────────────
@@ -334,21 +327,8 @@ class MergedGUI(mglw.WindowConfig):
         keys = self.wnd.keys
 
         # -- Keyboard hold-state tracking (press AND release) -----------------
-        _KEY_MAP = {
-            keys.NUMBER_1: "NUMBER_1", keys.NUMBER_2: "NUMBER_2",
-            keys.NUMBER_3: "NUMBER_3", keys.NUMBER_4: "NUMBER_4",
-            keys.TAB: "TAB",
-            keys.Z: "Z", keys.X: "X",
-            keys.D: "D", keys.F: "F",
-            keys.Q: "Q", keys.W: "W",
-            keys.A: "A", keys.S: "S",
-            keys.H: "H", keys.J: "J",
-            keys.C: "C", keys.V: "V",
-            keys.B: "B", keys.N: "N",
-            keys.K: "K", keys.L: "L",
-            keys.I: "I", keys.U: "U",
-            keys.G: "G", keys.M: "M",
-        }
+        # moderngl_window's `keys` attribute names match KEY_NAMES exactly.
+        _KEY_MAP = {getattr(keys, name): name for name in KEY_NAMES}
         key_name = _KEY_MAP.get(key)
         if key_name is not None:
             if action == keys.ACTION_PRESS:

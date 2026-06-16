@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from link_manager import (
     LinkManager, SignalLink, EnvelopeDef, LFODef, EventLink, ThresholdDef,
-    ParameterDef, EVAL_MATH_NS, _flat_to_ns,
+    ParameterDef, EVAL_MATH_NS, _flat_to_ns, KEY_NAMES,
 )
 
 if TYPE_CHECKING:
@@ -182,12 +182,6 @@ QDialogButtonBox QPushButton { min-width: 70px; }
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-_KEY_NAMES = (
-    "NUMBER_1", "NUMBER_2", "NUMBER_3", "NUMBER_4",
-    "TAB", "Z", "X", "D", "F", "Q", "W", "A", "S",
-    "H", "J", "C", "V", "B", "N", "K", "L", "I", "U", "G", "M",
-)
-
 _LFO_SHAPES = ("sine", "saw", "square", "tri")
 
 _PARAMETER_KINDS = ("toggle", "gate", "latch", "pulse", "counter")
@@ -199,7 +193,7 @@ _SOURCE_GROUP_ORDER = ["audio", "midi", "clock", "lfo", "env", "p"]
 
 def _event_completions(lm: LinkManager) -> list[str]:
     srcs = ["audio.onset", "clock.beat"]
-    for k in _KEY_NAMES:
+    for k in KEY_NAMES:
         srcs.append(f"key.{k}.press")
     for defn in lm._threshold_defs:
         srcs.append(f"audio.threshold.{defn.name}")
@@ -241,21 +235,18 @@ def _make_completer(words: list[str], parent=None) -> QCompleter:
 
 # ── MIDI / key capture helpers ────────────────────────────────────────────────
 
-# Qt key code → _KEY_NAMES string (matches gui_merged.py _KEY_MAP)
+def _qt_key_attr(name: str) -> str:
+    if name.startswith("NUMBER_"):
+        return f"Key_{name[len('NUMBER_'):]}"
+    if name == "TAB":
+        return "Key_Tab"
+    return f"Key_{name}"
+
+
+# Qt key code → KEY_NAMES string, derived from link_manager.KEY_NAMES so this
+# stays in sync with the canonical key list without a second list to drift.
 _QT_KEY_TO_NAME: dict[int, str] = {
-    Qt.Key.Key_1: "NUMBER_1", Qt.Key.Key_2: "NUMBER_2",
-    Qt.Key.Key_3: "NUMBER_3", Qt.Key.Key_4: "NUMBER_4",
-    Qt.Key.Key_Tab: "TAB",
-    Qt.Key.Key_Z: "Z", Qt.Key.Key_X: "X",
-    Qt.Key.Key_D: "D", Qt.Key.Key_F: "F",
-    Qt.Key.Key_Q: "Q", Qt.Key.Key_W: "W",
-    Qt.Key.Key_A: "A", Qt.Key.Key_S: "S",
-    Qt.Key.Key_H: "H", Qt.Key.Key_J: "J",
-    Qt.Key.Key_C: "C", Qt.Key.Key_V: "V",
-    Qt.Key.Key_B: "B", Qt.Key.Key_N: "N",
-    Qt.Key.Key_K: "K", Qt.Key.Key_L: "L",
-    Qt.Key.Key_I: "I", Qt.Key.Key_U: "U",
-    Qt.Key.Key_G: "G", Qt.Key.Key_M: "M",
+    getattr(Qt.Key, _qt_key_attr(name)): name for name in KEY_NAMES
 }
 
 
@@ -291,6 +282,55 @@ class _KeyCaptureDialog(QDialog):
         return self._result
 
 
+class _ChoiceCaptureDialog(QDialog):
+    """Modal: pick an enum sink, then one of its valid choice values."""
+
+    def __init__(self, pm: "PropertyManager", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pick Sink + Choice")
+        self.setStyleSheet(_STYLESHEET)
+        self.setMinimumWidth(360)
+
+        self._enum_defs = [d for d in pm.all_props() if d.choices]
+
+        lo = QVBoxLayout(self)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Sink:"))
+        self._sink = QComboBox()
+        self._sink.addItems([d.key for d in self._enum_defs])
+        self._sink.currentIndexChanged.connect(self._refresh_choices)
+        row1.addWidget(self._sink, 1)
+        lo.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Choice:"))
+        self._choice = QComboBox()
+        row2.addWidget(self._choice, 1)
+        lo.addLayout(row2)
+
+        self._refresh_choices()
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lo.addWidget(btns)
+
+    def _refresh_choices(self) -> None:
+        self._choice.clear()
+        idx = self._sink.currentIndex()
+        if 0 <= idx < len(self._enum_defs):
+            self._choice.addItems([str(c) for c in self._enum_defs[idx].choices])
+
+    def result(self) -> tuple[str, str] | None:
+        idx = self._sink.currentIndex()
+        if idx < 0 or idx >= len(self._enum_defs) or self._choice.currentIndex() < 0:
+            return None
+        return (self._enum_defs[idx].key, self._choice.currentText())
+
+
 def _eval_preview(expr: str, lm: LinkManager) -> tuple[str, bool]:
     """Return (display_text, is_error)."""
     if not expr.strip():
@@ -298,6 +338,7 @@ def _eval_preview(expr: str, lm: LinkManager) -> tuple[str, bool]:
     try:
         snap = lm.source_registry.snapshot()
         ns = {**_flat_to_ns(snap), **EVAL_MATH_NS, "dt": 0.016, "const": lm._const_ns}
+        ns.setdefault("smooth", lambda x, tau=0.0: x)
         result = eval(expr, {"__builtins__": {}}, ns)
         if isinstance(result, float):
             return (f"→ {result:.4f}", False)
@@ -766,6 +807,14 @@ class SourcesTab(QWidget):
 
 # ── Channels model ───────────────────────────────────────────────────────────
 
+# Live Value / Expression foreground colors, matching the QLabel#value/#info/#err
+# stylesheet colors (link_panel.py:53-56) and the default QWidget text color.
+_FG_DEFAULT = QColor("#c8c8d0")
+_FG_BLUE    = QColor("#5eaeff")
+_FG_GREY    = QColor("#707078")
+_FG_RED     = QColor("#e07070")
+
+
 class ChannelsModel(QStandardItemModel):
     """QStandardItemModel backing the property-bay Channels table.
 
@@ -862,11 +911,15 @@ class _ChannelsDelegate(QStyledItemDelegate):
     """Custom delegate: persistent QCheckBox for bool Default cells,
     persistent QComboBox for choice-type Default cells."""
 
+    previewChanged = Signal(str, bool)
+    previewEnded = Signal()
+
     def __init__(self, model: ChannelsModel, proxy: "QSortFilterProxyModel",
-                 pm: "PropertyManager", parent=None):
+                 lm: LinkManager, pm: "PropertyManager", parent=None):
         super().__init__(parent)
         self._model = model
         self._proxy = proxy
+        self._lm    = lm
         self._pm    = pm
 
     def _prop_defn_for(self, proxy_index):
@@ -887,6 +940,13 @@ class _ChannelsDelegate(QStyledItemDelegate):
         return defn is not None and defn.type is bool
 
     def createEditor(self, parent, option, index):
+        src = self._proxy.mapToSource(index)
+        if src.column() == ChannelsModel.COL_EXPR:
+            editor = QLineEdit(parent)
+            editor.setCompleter(_make_completer(_expr_completions(self._lm), editor))
+            editor.textChanged.connect(self._emit_preview)
+            editor.destroyed.connect(lambda *_: self.previewEnded.emit())
+            return editor
         if self._is_bool_for(index):
             cb = QCheckBox(parent)
             cb.clicked.connect(lambda _checked: self.commitData.emit(cb))
@@ -922,6 +982,10 @@ class _ChannelsDelegate(QStyledItemDelegate):
         else:
             super().setModelData(editor, model, index)
 
+    def _emit_preview(self, text: str) -> None:
+        display, is_error = _eval_preview(text, self._lm)
+        self.previewChanged.emit(display, is_error)
+
 
 # ── Channels ─────────────────────────────────────────────────────────────────
 
@@ -947,9 +1011,10 @@ class ChannelsTab(QWidget):
         self._view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._view.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
-        self._view.setItemDelegate(
-            _ChannelsDelegate(self._model, self._proxy, pm, self._view)
-        )
+        self._delegate = _ChannelsDelegate(self._model, self._proxy, lm, pm, self._view)
+        self._delegate.previewChanged.connect(self._on_expr_preview_changed)
+        self._delegate.previewEnded.connect(self._on_expr_preview_ended)
+        self._view.setItemDelegate(self._delegate)
         hh = self._view.horizontalHeader()
         hh.setSectionResizeMode(ChannelsModel.COL_ON,   QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(ChannelsModel.COL_KEY,  QHeaderView.ResizeMode.ResizeToContents)
@@ -962,9 +1027,14 @@ class ChannelsTab(QWidget):
         lo.addLayout(self._build_filter_bar())
         lo.addWidget(self._view)
 
-        hint = QLabel("Double-click Expression to edit · ⊕ to assign a source · Bool/choice defaults update on click.")
-        hint.setObjectName("info")
-        lo.addWidget(hint)
+        self._hint_default_text = (
+            "Double-click Expression to edit · ⊕ to assign a source · "
+            "Bool/choice defaults update on click. · "
+            "Live Value: red = eval error · grey = disabled-row preview"
+        )
+        self._hint = QLabel(self._hint_default_text)
+        self._hint.setObjectName("info")
+        lo.addWidget(self._hint)
 
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(100)
@@ -1038,15 +1108,64 @@ class ChannelsTab(QWidget):
         self._updating = True
         try:
             for key, row in self._model.row_for_key.items():
-                try:
-                    new_text = f"{self._pm.get(key):.4f}"
-                except (TypeError, ValueError):
-                    new_text = str(self._pm.get(key))
+                expr_item = self._model.item(row, ChannelsModel.COL_EXPR)
                 live_item = self._model.item(row, ChannelsModel.COL_LIVE)
-                if live_item is not None and live_item.text() != new_text:
-                    live_item.setText(new_text)
+                expr_text = expr_item.text().strip() if expr_item is not None else ""
+
+                if not expr_text:
+                    try:
+                        new_text = f"{self._pm.get(key):.4f}"
+                    except (TypeError, ValueError):
+                        new_text = str(self._pm.get(key))
+                    self._set_cell_style(live_item, new_text, _FG_BLUE, "")
+                    self._set_cell_style(expr_item, None, _FG_DEFAULT, "")
+                    continue
+
+                display, is_error = _eval_preview(expr_text, self._lm)
+                if is_error:
+                    self._set_cell_style(live_item, "⚠ error", _FG_RED, display)
+                    self._set_cell_style(expr_item, None, _FG_RED, display)
+                    continue
+
+                value_text = display[2:] if display.startswith("→ ") else display
+                on_item = self._model.item(row, ChannelsModel.COL_ON)
+                enabled = on_item is not None and on_item.checkState() == Qt.CheckState.Checked
+                if enabled:
+                    self._set_cell_style(live_item, value_text, _FG_BLUE, "")
+                else:
+                    self._set_cell_style(
+                        live_item, value_text, _FG_GREY,
+                        "Disabled — preview of what this link would evaluate to if enabled.",
+                    )
+                self._set_cell_style(expr_item, None, _FG_DEFAULT, "")
         finally:
             self._updating = False
+
+    @staticmethod
+    def _set_cell_style(item: "QStandardItem | None", text: "str | None", color: QColor, tooltip: str) -> None:
+        """Apply text/foreground/tooltip to item, skipping writes that wouldn't change anything
+        (text=None leaves the item's text untouched -- used for the Expression cell, which this
+        is only ever tinting, not retexting)."""
+        if item is None:
+            return
+        if text is not None and item.text() != text:
+            item.setText(text)
+        if item.foreground().color() != color:
+            item.setForeground(color)
+        if item.toolTip() != tooltip:
+            item.setToolTip(tooltip)
+
+    def _on_expr_preview_changed(self, display: str, is_error: bool) -> None:
+        self._hint.setText(display or self._hint_default_text)
+        self._hint.setObjectName("err" if is_error else "info")
+        self._hint.style().unpolish(self._hint)
+        self._hint.style().polish(self._hint)
+
+    def _on_expr_preview_ended(self) -> None:
+        self._hint.setText(self._hint_default_text)
+        self._hint.setObjectName("info")
+        self._hint.style().unpolish(self._hint)
+        self._hint.style().polish(self._hint)
 
     # ── Filter bar (layout inserted by Stage 6) ───────────────────────────────
 
@@ -1224,11 +1343,17 @@ class EventsTab(QWidget):
         key_btn.setObjectName("add")
         key_btn.setToolTip("Press a key to create an event link pre-filled with that key event.")
         key_btn.clicked.connect(self._capture_key)
+        choice_btn = QPushButton("+ Choice")
+        choice_btn.setObjectName("add")
+        choice_btn.setToolTip("Pick an enum sink and one of its choices, then press a key to "
+                               "create a key → choice event link.")
+        choice_btn.clicked.connect(self._capture_choice)
         tb1.addWidget(add_el)
         tb1.addWidget(edit_el)
         tb1.addWidget(rm_el)
         tb1.addWidget(midi_btn)
         tb1.addWidget(key_btn)
+        tb1.addWidget(choice_btn)
         tb1.addStretch()
 
         self._capture_status = QLabel("")
@@ -1325,9 +1450,27 @@ class EventsTab(QWidget):
             if event_str:
                 self._open_with_event(event_str)
 
-    def _open_with_event(self, event_str: str) -> None:
+    def _capture_choice(self) -> None:
+        if not any(d.choices for d in self._pm.all_props()):
+            self._capture_status.setText("no enum sinks")
+            return
+        choice_dlg = _ChoiceCaptureDialog(self._pm, self)
+        if choice_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        picked = choice_dlg.result()
+        if picked is None:
+            return
+        sink_key, choice = picked
+
+        key_dlg = _KeyCaptureDialog(self)
+        if key_dlg.exec() == QDialog.DialogCode.Accepted:
+            event_str = key_dlg.captured_event()
+            if event_str:
+                self._open_with_event(event_str, f"set({sink_key}, {choice!r})")
+
+    def _open_with_event(self, event_str: str, action_str: str = "") -> None:
         self._capture_status.setText("")
-        prefilled = EventLink(event=event_str, action="", enabled=True)
+        prefilled = EventLink(event=event_str, action=action_str, enabled=True)
         dlg = EventLinkDialog(self._lm, self._pm, link=prefilled, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             link = dlg.result_link()

@@ -23,6 +23,22 @@ from typing import Any, Callable
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Keyboard sources
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Canonical key names for the key.<name>.press / key.<name>_hold sources.
+# Single source of truth: gui_merged.py derives its moderngl_window key map
+# from this (attribute names match exactly), and link_panel.py derives its
+# Qt key map and event-completion list from this too.
+KEY_NAMES = (
+    "NUMBER_1", "NUMBER_2", "NUMBER_3", "NUMBER_4", "NUMBER_5",
+    "NUMBER_6", "NUMBER_7", "NUMBER_8", "NUMBER_9", "NUMBER_0",
+    "TAB", "Z", "X", "D", "F", "Q", "W", "A", "S",
+    "H", "J", "C", "V", "B", "N", "K", "L", "I", "U", "G", "M",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Dataclasses
 # ─────────────────────────────────────────────────────────────────────────────
 
