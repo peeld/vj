@@ -21,8 +21,11 @@ Quick start
     # CC #1 → _controls.scene_alpha, range 0–1
     router.map_cc(1, _controls, "scene_alpha", section="Scene")
 
-    # Note 60 → toggle _controls.show_cloud
-    router.map_note_to_param(60, _controls, "show_cloud", section="Scene")
+    # Note 60 → toggle a boolean field on any bound object
+    router.map_note_to_param(60, _controls, "some_bool_field", section="Scene")
+    # (per-element visibility is no longer a _controls field -- it's
+    #  DrawingElement.visible, toggled via the Elements panel or by firing
+    #  lm.event_bus.fire("element.set_visible", (name, value)))
 
     # Note 62 → arbitrary callback
     router.map_note(62, lambda vel: print("hi", vel), field="debug", section="Custom")

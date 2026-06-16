@@ -1,7 +1,4 @@
 """
-gui_merged.py - MergedGUI
-Combines the cloud/ball/NN-graph scene (gui.py) with the circle-axis scene
-(gui3.py) into a single window with per-element visibility toggles.
 
 App-level controls (not user-configurable):
   R          -- regenerate all elements
@@ -32,10 +29,8 @@ from post import (
 )
 from drawlib.camera import OrbitCamera
 
-from elements.cloud import CloudElement
-from elements.circleaxis import CircleAxisDrawing
-from elements.laser_ribbons import LaserRibbons
-from elements.nn_graph import NNGraph
+from elements.base import DrawingElement, FrameContext, ELEMENT_TYPES
+import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons  # noqa: F401 -- registers cloud/nn_graph/circles/lasers
 
 from property_manager import PropertyManager, build_default_manager
 from link_manager import LinkManager, KEY_NAMES
@@ -66,6 +61,12 @@ _current_palette: list = []
 # elements without a full regen.  Same pattern as _pending_monitor.
 _pending_palette_apply: bool = False
 
+# Read-only snapshot of the live scene-element list, rebuilt once per frame in
+# on_render().  ElementsPanel polls this (Qt thread) to mirror GL-thread state
+# without touching GL objects directly.  Simple list assignment is thread-safe
+# in CPython, same pattern as _current_palette.
+_element_snapshot: list[dict] = []
+
 
 wp.init()
 DEVICE = "cuda" if wp.get_cuda_device_count() > 0 else "cpu"
@@ -94,10 +95,9 @@ _EFFECT_NAMES = ["feedback", "pass_through", "glitch", "bokeh"]
 
 @dataclass
 class SceneControls:
-    show_cloud    : bool  = True
-    show_nn       : bool  = True
-    show_circles  : bool  = True
-    show_lasers   : bool  = True
+    # Per-element visibility lives on each DrawingElement instance (.visible)
+    # instead of named booleans here, since the element list is dynamic --
+    # see MergedGUI.elements / add_element() / remove_element().
     scene_alpha   : float = 0.18
     blend_mode    : str   = "screen"   # screen keeps trail persistence = decay only
     smear_pattern : str   = "outward"
@@ -298,10 +298,13 @@ class MergedGUI(mglw.WindowConfig):
         super().__init__(**kwargs)
 
         # -- Scene elements ---------------------------------------------------
-        self._cloud     = CloudElement(self.ctx)
-        self.nn_graph   = NNGraph(self.ctx, device=DEVICE)
-        self._circles   = CircleAxisDrawing(self.ctx)
-        self._lasers    = LaserRibbons(self.ctx)
+        # Dynamic list -- see add_element()/remove_element().  The startup set
+        # mirrors the previous hardcoded cloud/nn_graph/circles/lasers members;
+        # draw order follows list order, so this also preserves the original
+        # back-to-front draw sequence.
+        self.elements: list[DrawingElement] = []
+        for kind in ("cloud", "nn_graph", "circles", "lasers"):
+            self.add_element(kind)
 
         # -- GL state ---------------------------------------------------------
         self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
@@ -345,23 +348,29 @@ class MergedGUI(mglw.WindowConfig):
         self.lm = _lm
         self._held_keys: set[str] = set()
         self.lm.event_bus.subscribe("regen", lambda _: self._regen_all())
+        self.lm.event_bus.subscribe("element.add", lambda kind: self.add_element(kind))
+        self.lm.event_bus.subscribe("element.remove", lambda name: self.remove_element(name))
+        self.lm.event_bus.subscribe("element.set_visible", self._on_set_visible_event)
 
         # -- Property manager -------------------------------------------------
         # Extend the shared module-level PM with element-specific properties now
         # that the GL elements exist.  If _pm was already created by the Qt thread
         # (see __main__), properties that were registered earlier are skipped
         # (idempotent); only element sections are added here.
+        # NOTE: still bound to the first nn_graph/lasers/circles instance found --
+        # build_default_manager moves to a per-element-instance scheme if/when
+        # the UI needs to bind properties for more than one instance per kind.
         global _pm
         self.pm = build_default_manager(
             _params, _controls,
-            self.nn_graph, self._lasers, self._circles,
+            self._first_of_kind("nn_graph"), self._first_of_kind("lasers"), self._first_of_kind("circles"),
             pm=_pm,
         )
         _pm = self.pm   # keep module ref in sync
 
         effect_names = "  |  ".join(e.name for e in self._effects)
         print(f"[merged] effects: {effect_names}")
-        print("[merged] 1=cloud  2=nn  3=circles  4=lasers  5=nn  R=regen  P=post  O=orbit  Tab=effect  ESC=quit")
+        print("[merged] R=regen  P=post  O=orbit  Tab=effect  ESC=quit")
         print("[merged] pm.describe() to list all properties  |  pm.save_preset('name') to snapshot")
 
     # -- Convenience ----------------------------------------------------------
@@ -370,31 +379,79 @@ class MergedGUI(mglw.WindowConfig):
     def _active_effect(self):
         return self._effects[self._effect_idx]
 
+    # -- Dynamic element list ---------------------------------------------------
+
+    def add_element(self, kind: str, **kwargs) -> DrawingElement:
+        """Construct a new DrawingElement of *kind* and append it to self.elements.
+
+        *kind* must be a key in elements.base.ELEMENT_TYPES.  At most one
+        live instance per kind is permitted, since "<kind>.visible" is the
+        permanent Channels identity for that kind.  Must be called on the
+        GL thread (it touches moderngl_window's ctx).
+        """
+        global _pm
+        factory = ELEMENT_TYPES.get(kind)
+        if factory is None:
+            raise ValueError(f"unknown element kind '{kind}' (known: {sorted(ELEMENT_TYPES)})")
+        if any(el.kind == kind for el in self.elements):
+            raise ValueError(f"element kind '{kind}' already has a live instance")
+        element = factory(self.ctx, DEVICE, **kwargs)
+        if _current_palette:
+            element.set_palette(_current_palette)
+        self.elements.append(element)
+        _pm.bind(f"{kind}.visible", element, "visible")
+        print(f"[merged] added element '{element.name}'")
+        return element
+
+    def remove_element(self, name: str) -> bool:
+        """Remove the element with the given .name. Must be called on the GL thread."""
+        global _pm
+        for i, el in enumerate(self.elements):
+            if el.name == name:
+                _pm.unbind(f"{el.kind}.visible")
+                del self.elements[i]
+                print(f"[merged] removed element '{name}'")
+                return True
+        return False
+
+    def _first_of_kind(self, kind: str):
+        """Return the first element of *kind*, or None. Used to bind
+        build_default_manager's element-specific properties to a live
+        instance before any per-element-instance UI exists."""
+        for el in self.elements:
+            if el.kind == kind:
+                return el
+        return None
+
+    def _on_set_visible_event(self, payload) -> None:
+        name, value = payload
+        for el in self.elements:
+            if el.name == name:
+                el.visible = bool(value)
+                break
+
     # -- Palette --------------------------------------------------------------
 
     def _apply_palette(self) -> None:
         """Push the current module-level palette to all scene elements."""
         if not _current_palette:
             return
-        self._circles.set_palette(_current_palette)
-        self._lasers.set_palette(_current_palette)
-        self.nn_graph.set_palette(_current_palette)
+        for el in self.elements:
+            el.set_palette(_current_palette)
 
     # -- Regenerate -----------------------------------------------------------
 
     def _regen_all(self) -> None:
         self._apply_palette()
-        self._circles.regen()
-        self._cloud.randomize()
-        nn_seed = random.randint(0, 2**31 - 1)
-        self.nn_graph.randomize(nn_seed)
-        print(f"[merged] regenerated  (nn_seed={nn_seed})")
+        for el in self.elements:
+            el.regen()
+        print("[merged] regenerated")
 
     # -- Per-frame ------------------------------------------------------------
 
     def on_render(self, current_time: float, frame_time: float):
 
-        global _pending_monitor, _pending_palette_apply
+        global _pending_monitor, _pending_palette_apply, _element_snapshot
         if _pending_monitor is not None:
             apply_fullscreen_to_monitor(self.wnd, _pending_monitor)
             _pending_monitor = None
@@ -418,22 +475,12 @@ class MergedGUI(mglw.WindowConfig):
         # ── Threshold detectors → EventBus ────────────────────────────────────
         self.lm.tick_thresholds()
 
-        # ── Drain EventBus → envelope triggers + EventLinks ───────────────────
+        # ── Drain EventBus → envelope triggers + EventLinks (incl. element add/
+        # remove/visibility events fired from the Qt-thread Elements panel) ────
         self.lm.evaluate_events(self.pm)
 
         # ── Evaluate all signal links → write to PM ───────────────────────────
         self.lm.evaluate_links(self.pm, frame_time)
-
-        self._cloud.step(self.time, frame_time, _controls.show_cloud)
-
-        if _controls.show_nn and not self.nn_graph.is_active():
-            self.nn_graph.activate()
-
-        if not _controls.show_nn and self.nn_graph.is_active():
-            self.nn_graph.deactivate()
-
-        self.nn_graph.step(self.time)
-        self.nn_graph.upload()
 
         # Sync active_effect selection from param_dialog -> _effect_idx.
         desired = _controls.active_effect
@@ -461,27 +508,35 @@ class MergedGUI(mglw.WindowConfig):
 
         self.camera.tick(frame_time)
         mvp = self.camera.mvp(self.window_size)
-
         cam_eye, cam_fwd, cam_right, cam_up = self.camera.position_and_axes()
-        self._lasers.step(frame_time, cam_eye, cam_fwd, cam_right, cam_up, _controls.show_lasers)
-        self._circles.step(frame_time, current_time, _controls.show_circles)
+
+        ctx = FrameContext(
+            time=self.time, current_time=current_time, frame_time=frame_time,
+            cam_eye=cam_eye, cam_fwd=cam_fwd, cam_right=cam_right, cam_up=cam_up,
+        )
+        for el in self.elements:
+            el.step(ctx)
+
+        _element_snapshot = [
+            {"name": el.name, "kind": el.kind, "visible": el.visible}
+            for el in self.elements
+        ]
 
         if self.post_effect_on:
             eff.bind_scene_fbo()
-            self._draw_scene(mvp, current_time)
+            self._draw_scene(mvp, ctx)
             eff.process(eff.fbo, current_time, dt=0.0)
             eff.blit_to_screen(self.ctx.screen)
         else:
             self.ctx.screen.use()
             self.ctx.enable(moderngl.DEPTH_TEST)
             self.ctx.clear(0.04, 0.04, 0.06, 1.0)
-            self._draw_scene(mvp)
+            self._draw_scene(mvp, ctx)
 
-    def _draw_scene(self, mvp, t: float) -> None:
-        self._cloud.draw(mvp)
-        self.nn_graph.draw(mvp)
-        self._circles.draw(mvp, t)
-        self._lasers.draw(mvp)
+    def _draw_scene(self, mvp, ctx: FrameContext) -> None:
+        for el in self.elements:
+            if el.visible:
+                el.draw(mvp, ctx)
 
     # -- Input ----------------------------------------------------------------
 
@@ -613,11 +668,19 @@ if __name__ == "__main__":
 
         colors = ColorPanel(title="Color Harmony", on_change=_on_palette_change, on_apply=_on_palette_apply)
 
+        from elements_panel import ElementsPanel
+        elements_tab = ElementsPanel(
+            event_bus    = _lm.event_bus,
+            get_snapshot = lambda: _element_snapshot,
+            title        = "Scene Elements",
+        )
+
         from link_panel import LinkManagerPanel
         links = LinkManagerPanel(
             _lm, _pm,
             title="Warp Controls",
             extra_tabs=[
+                ("Elements", elements_tab),
                 ("MIDI",     midi),
                 ("Audio",    audio),
                 ("Colors",   colors),

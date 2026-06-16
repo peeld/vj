@@ -7,27 +7,31 @@ Owns:
   - PointCloudOperation / BallOperation (kernel drivers)
   - PointsDrawable / LinesDrawable / ShapeDrawable (GL renderables)
 
+Implements the DrawingElement interface (elements/base.py) directly so
+MergedGUI.elements can drive it the same as every other scene element.
+
 Usage::
 
     cloud = CloudElement(ctx)
 
     # each frame
-    cloud.step(time, frame_time)   # run Warp kernels + upload to GL
-    cloud.draw(mvp)                # issue draw calls
+    cloud.step(ctx)        # run Warp kernels + upload to GL
+    cloud.draw(mvp, ctx)   # issue draw calls
 
     # on R-key
-    cloud.randomize()
+    cloud.regen()
 """
 
 import moderngl
 
+from .base import DrawingElement, FrameContext, register_element_type
 from drawlib.data import BallData, PointCloudData
 from drawlib.operation import BallOperation, PointCloudOperation
 from drawlib.drawable import LinesDrawable, PointsDrawable, ShapeDrawable
 from drawlib.helpers import build_wireframe
 
 
-class CloudElement:
+class CloudElement(DrawingElement):
     """Point-cloud + bouncing-ball scene element.
 
     Parameters
@@ -35,8 +39,10 @@ class CloudElement:
     ctx:
         Active ModernGL context.
     """
+    kind = "cloud"
 
-    def __init__(self, ctx: moderngl.Context):
+    def __init__(self, ctx: moderngl.Context, device=None, **kwargs):
+        super().__init__()
         self.cloud_data = PointCloudData()
         self.ball_data  = BallData(cube_half=self.cloud_data.cube_half)
         self.cloud_op   = PointCloudOperation(self.cloud_data)
@@ -56,32 +62,35 @@ class CloudElement:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def step(self, time: float, frame_time: float, enabled: bool = True) -> None:
+    def step(self, ctx: FrameContext) -> None:
         """Run physics kernels and upload results to GL buffers.
 
-        When *enabled* is True, dead particles are probabilistically spawned in.
-        When False, live particles are probabilistically killed off.
+        While visible, dead particles are probabilistically spawned in.
+        While hidden, live particles are probabilistically killed off.
         """
-        if enabled:
+        if self.visible:
             self.cloud_op.spawn_particles()
-            self.ball_op.step(frame_time)
+            self.ball_op.step(ctx.frame_time)
         else:
             self.cloud_op.kill_particles()
 
-        self.cloud_op.step(time, frame_time, self.ball_data)
+        self.cloud_op.step(ctx.time, ctx.frame_time, self.ball_data)
         self.cloud_draw.write_warp(self.cloud_data.wp_pos, self.cloud_data.wp_col)
         self.ball_draw.write_warp(self.ball_data.wp_pos)
 
-    def draw(self, mvp) -> None:
+    def draw(self, mvp, ctx: FrameContext) -> None:
         """Issue draw calls for the cloud, wireframe, and balls."""
         self.cloud_draw.draw(mvp)
         self.wire_draw.draw(mvp)
         # self.ball_draw.draw(mvp, point_size=80.0)
 
-    def randomize(self) -> None:
+    def regen(self) -> None:
         """Reset cloud points to a fresh random distribution."""
         self.cloud_data.randomize()
         self.cloud_draw.update(
             self.cloud_data.positions_numpy(),
             self.cloud_data.colors_numpy(),
         )
+
+
+register_element_type("cloud", CloudElement)

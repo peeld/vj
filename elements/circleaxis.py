@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 import moderngl
 
+from .base import DrawingElement, FrameContext, register_element_type
 from drawlib.drawable import RibbonDrawable
 from color_harmony import ColorScheme, generate_palette
 
@@ -326,7 +327,7 @@ def build_geometry(
 # Drawing class (public)
 # ---------------------------------------------------------------------------
 
-class CircleAxisDrawing:
+class CircleAxisDrawing(DrawingElement):
     """
     Encapsulates all geometry, animation, and draw calls for the circle-axis scene.
 
@@ -334,14 +335,19 @@ class CircleAxisDrawing:
     particles) while the element is active; traversal lines are a separate,
     always-drawn persistent layer.
 
+    Implements the DrawingElement interface (elements/base.py) directly so
+    MergedGUI.elements can drive it the same as every other scene element.
+
     Usage:
         drawing = CircleAxisDrawing(ctx)
         drawing.amplitude = ...                # drive via LinkManager expression
-        drawing.draw(mvp, current_time)        # call each frame
+        drawing.draw(mvp, ctx)                 # call each frame
         drawing.on_key(key, action, keys)      # returns True if key was consumed
     """
+    kind = "circles"
 
-    def __init__(self, ctx: moderngl.Context):
+    def __init__(self, ctx: moderngl.Context, device=None, **kwargs):
+        super().__init__()
         self._ctx = ctx
         self._seed = 0
         self._geo: RibbonDrawable | None = None        # traversal lines only
@@ -411,15 +417,17 @@ class CircleAxisDrawing:
             return True
         return False
 
-    def step(self, dt: float, t: float, enabled: bool) -> None:
+    def step(self, ctx: FrameContext) -> None:
         """Advance the circle+blade pool: age out dead entries, spawn new ones when active."""
+        dt, t = ctx.frame_time, ctx.current_time
+
         # Age out expired circles
         for i, ec in enumerate(self._emit_pool):
             if ec is not None and (t - ec.birth) >= EMIT_LIFETIME:
                 self._emit_pool[i] = None
 
         # Spawn new circles when active
-        if enabled:
+        if self.visible:
             self._spawn_timer += dt
             while self._spawn_timer >= EMIT_INTERVAL:
                 self._spawn_timer -= EMIT_INTERVAL
@@ -427,8 +435,9 @@ class CircleAxisDrawing:
         else:
             self._spawn_timer = 0.0
 
-    def draw(self, mvp: np.ndarray, t: float) -> None:
+    def draw(self, mvp: np.ndarray, ctx: FrameContext) -> None:
         """Update animated positions and issue the draw calls."""
+        t = ctx.current_time
         # Traversal lines: always-on persistent layer.
         if self._trav_metas:
             trav_verts = self._animated_trav_positions(t)
@@ -623,3 +632,6 @@ class CircleAxisDrawing:
             parts.append(_ribbon_positions(pts, LINE_HALF_W))
 
         return np.vstack(parts).astype(np.float32)
+
+
+register_element_type("circles", CircleAxisDrawing)

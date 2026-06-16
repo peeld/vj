@@ -162,12 +162,12 @@ class EventLink:
     Example::
         EventLink(
             event     = "midi.note36.on",
-            action    = "toggle(scene.show_cloud)",
+            action    = "toggle(some.bool_key)",
             condition = None,
         )
     """
     event     : str
-    action    : str             # e.g. "toggle(scene.show_cloud)", "preset('my_look')"
+    action    : str             # e.g. "toggle(some.bool_key)", "cycle(scene.blend_mode)", "preset('my_look')"
     enabled   : bool = True
     condition : str | None = None  # optional guard expression evaluated in source ns
 

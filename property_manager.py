@@ -165,6 +165,24 @@ class PropertyManager:
 
         return self  # fluent API
 
+    def bind(self, key: str, obj: Any, attr: str) -> None:
+        """Attach a live (obj, attr) binding to an already-registered key.
+
+        If the key currently holds an unbound value (e.g. no instance was
+        live yet), that value is latched onto obj.attr before the binding
+        takes effect, so the new instance picks up the last-known state.
+        """
+        self._require(key)
+        if key in self._values:
+            setattr(obj, attr, self._values.pop(key))
+        self._bindings[key] = (obj, attr)
+
+    def unbind(self, key: str) -> None:
+        """Detach a key's live binding, preserving its last value internally."""
+        if key in self._bindings:
+            obj, attr = self._bindings.pop(key)
+            self._values[key] = getattr(obj, attr)
+
     # ── Get / Set ─────────────────────────────────────────────────────────────
 
     def get(self, key: str) -> Any:
@@ -327,6 +345,7 @@ def build_default_manager(
     All properties are bound to live objects so get/set proxy directly.
     """
     from post.feedback import BLEND_MODES, SMEAR_PATTERNS, PRESETS
+    from elements.base import ELEMENT_TYPES
 
     if pm is None:
         pm = PropertyManager()
@@ -340,6 +359,14 @@ def build_default_manager(
                 pm._values.pop(prop.key, None)
             return pm
         return pm.register(prop, obj, attr)
+
+    # ── per-kind visibility (one permanent key per draw kind, drivable from
+    #    Channels regardless of whether an instance is currently live) ──────────
+    for kind in ELEMENT_TYPES:
+        R(PropDef(f"{kind}.visible", kind, "visible", "Visible",
+                  bool, True, widget_hint="check",
+                  description=f"Show/hide {kind} (drivable via Link Manager "
+                              f"expressions)"))
 
     # ── feedback (FeedbackParams) ─────────────────────────────────────────────
     _F = "feedback"
@@ -405,27 +432,11 @@ def build_default_manager(
       params, "fisheye_strength")
 
     # ── scene (SceneControls) ─────────────────────────────────────────────────
+    # Per-element visibility is no longer here -- it lives on each
+    # DrawingElement instance (.visible) and is managed via the Elements
+    # panel / MergedGUI.add_element()/remove_element(), since the element
+    # list is dynamic rather than a fixed cloud/nn/circles/lasers set.
     _S = "scene"
-
-    R(PropDef(f"{_S}.show_cloud",    _S, "show_cloud",    "Cloud/Ball",
-              bool, True,    widget_hint="check",
-              description="Toggle cloud + ball element"),
-      controls, "show_cloud")
-
-    R(PropDef(f"{_S}.show_nn",       _S, "show_nn",       "NN Graph",
-              bool, False,    widget_hint="check",
-              description="Toggle nearest-neighbour graph element"),
-      controls, "show_nn")
-
-    R(PropDef(f"{_S}.show_circles",  _S, "show_circles",  "Circle Axis",
-              bool, False,    widget_hint="check",
-              description="Toggle circle-axis ribbons element"),
-      controls, "show_circles")
-
-    R(PropDef(f"{_S}.show_lasers",   _S, "show_lasers",   "Laser Ribbons",
-              bool, False,    widget_hint="check",
-              description="Toggle laser ribbon element"),
-      controls, "show_lasers")
 
     R(PropDef(f"{_S}.scene_alpha",   _S, "scene_alpha",   "Scene Alpha",
               float, 0.18,   0.02,  1.0,   0.05,

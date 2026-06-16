@@ -25,7 +25,6 @@ import numpy as np
 import moderngl
 
 from drawlib.scene import Scene
-from drawlib.post_effect import FeedbackPostEffect
 from drawlib.drawable import LinesDrawable, PointsDrawable, ShapeDrawable
 from drawlib.helpers import wireframe_cube
 from drawlib.data import BallData, PointCloudData
@@ -41,23 +40,6 @@ class PointCloudScene(Scene):
 
     title       = "Warp — Point Cloud"
     auto_rotate = True
-
-    # Post-effect — comment out or set to None to render direct
-    post_effect = FeedbackPostEffect(
-        params=FeedbackParams(
-            base_zoom        = 1.008,
-            zoom_sensitivity = 0.0,
-            base_rot         = 0.003,
-            rot_sensitivity  = 0.0,
-            decay            = 0.985,
-            ripple_strength  = 8.0,
-            ripple_freq      = 10.0,
-            hue_shift        = 0.018,
-            chroma_offset    = 0.012,
-            sat_boost        = 1.15,
-        ),
-        scene_alpha=0.13,
-    )
 
     # ── Scene interface ───────────────────────────────────────────────────────
 

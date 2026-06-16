@@ -17,13 +17,17 @@ Design
   once per SPAWN_INTERVAL seconds.
 * draw() temporarily switches to additive blending for the neon glow look.
 
+Implements the DrawingElement interface (elements/base.py) directly so
+MergedGUI.elements can drive it the same as every other scene element.
+
 Usage::
 
     laser = LaserRibbons(ctx)
 
-    # each frame -- pass the four camera vectors from OrbitCamera.position_and_axes()
-    laser.step(frame_time, cam_eye, cam_forward, cam_right, cam_up)
-    laser.draw(mvp)
+    # each frame -- ctx carries frame_time and the four camera vectors from
+    # OrbitCamera.position_and_axes()
+    laser.step(ctx)
+    laser.draw(mvp, ctx)
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import numpy as np
 import warp as wp
 import moderngl
 
+from .base import DrawingElement, FrameContext, register_element_type
 from drawlib.drawable import DynamicTrianglesDrawable
 
 # ── Tuneable constants ────────────────────────────────────────────────────────
@@ -165,7 +170,7 @@ def _build_tris(
 
 # ── Element ───────────────────────────────────────────────────────────────────
 
-class LaserRibbons:
+class LaserRibbons(DrawingElement):
     """Pool of coloured laser ribbons fired from behind the camera.
 
     Parameters
@@ -173,8 +178,10 @@ class LaserRibbons:
     ctx:
         Active ModernGL context.
     """
+    kind = "lasers"
 
-    def __init__(self, ctx: moderngl.Context):
+    def __init__(self, ctx: moderngl.Context, device=None, **kwargs):
+        super().__init__()
         self._ctx = ctx
         self._rng = np.random.default_rng()
 
@@ -277,16 +284,12 @@ class LaserRibbons:
             [[r, g, b, 1.0] for r, g, b in palette], dtype=np.float32
         )
 
-    def step(
-        self,
-        dt:          float,
-        cam_eye:     np.ndarray,
-        cam_forward: np.ndarray,
-        cam_right:   np.ndarray,
-        cam_up:      np.ndarray,
-        enabled:     bool,
-    ) -> None:
+    def step(self, ctx: FrameContext) -> None:
         """Spawn, advance, and build triangle geometry for this frame."""
+        dt = ctx.frame_time
+        cam_eye, cam_forward, cam_right, cam_up = (
+            ctx.cam_eye, ctx.cam_fwd, ctx.cam_right, ctx.cam_up,
+        )
 
         # Cache cam_eye as a Warp vec3 for the kernel
         self._cam_eye = wp.vec3(
@@ -294,7 +297,7 @@ class LaserRibbons:
         )
 
         # Spawn (may fire multiple times if dt > spawn_interval)
-        if enabled:
+        if self.visible:
             self._spawn_timer += dt
             while self._spawn_timer >= self.spawn_interval:
                 self._spawn_timer -= self.spawn_interval
@@ -327,8 +330,11 @@ class LaserRibbons:
         # GPU -> GL upload via CUDA interop
         self._drawable.write_warp(self._wp_tris_pos, self._wp_tris_col)
 
-    def draw(self, mvp: np.ndarray) -> None:
+    def draw(self, mvp: np.ndarray, ctx: FrameContext) -> None:
         """Draw all ribbons with additive blending for the neon glow effect."""
         self._ctx.blend_func = moderngl.ONE, moderngl.ONE
         self._drawable.draw(mvp)
         self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+
+
+register_element_type("lasers", LaserRibbons)

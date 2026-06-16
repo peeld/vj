@@ -43,7 +43,6 @@ import moderngl
 
 from drawlib.scene import Scene
 from drawlib.drawable import PointsDrawable, DynamicLinesDrawable
-from drawlib.post_effect import FeedbackPostEffect
 from drawlib.warp_feedback import FeedbackParams
 
 
@@ -226,22 +225,6 @@ class NNGraphScene(Scene):
     auto_rotate = True
     cam_dist    = 3.2
     cam_pitch   = -20.0
-
-    post_effect = FeedbackPostEffect(
-        params=FeedbackParams(
-            base_zoom        = 1.007,
-            zoom_sensitivity = 0.0,
-            base_rot         = 0.007,
-            rot_sensitivity  = 0.0,
-            decay            = 0.978,
-            ripple_strength  = 14.0,
-            ripple_freq      = 7.0,
-            hue_shift        = 0.030,
-            chroma_offset    = 0.022,
-            sat_boost        = 1.55,
-        ),
-        scene_alpha=0.12,
-    )
 
     # ── Setup ──────────────────────────────────────────────────────────────────
 

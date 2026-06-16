@@ -39,6 +39,7 @@ import warp as wp
 import numpy as np
 import moderngl
 
+from .base import DrawingElement, FrameContext, register_element_type
 from drawlib.drawable import DynamicLinesDrawable
 
 
@@ -194,16 +195,22 @@ def _build_edges(
 
 # -- NNGraph class -------------------------------------------------------------
 
-class NNGraph:
+class NNGraph(DrawingElement):
     """
     Animated KNN graph with DFS traversal reveal.
 
     Always simulates (points drift, edge buffer written) every frame, but
-    nothing is drawn until activate() is called.
+    nothing is drawn until activate() is called. Setting .visible drives
+    activate()/deactivate() directly (see the property below) instead of an
+    enabled flag passed into step() -- the underlying simulation keeps
+    running while hidden, only the revealed-edge traversal pauses.
 
     The KNN is computed ONCE per activation cycle (inside activate()), not
     every frame.  The snapshot is held in _wp_knn_snap / _knn_snap and used
     for both the DFS traversal and the VBO kernel.
+
+    Implements the DrawingElement interface (elements/base.py) directly so
+    MergedGUI.elements can drive it the same as every other scene element.
 
     Parameters
     ----------
@@ -220,6 +227,7 @@ class NNGraph:
     edges_per_frame:
         How many edges to reveal (and separately, to hide) each frame.
     """
+    kind = "nn_graph"
 
     def __init__(
         self,
@@ -274,6 +282,25 @@ class NNGraph:
 
         # Colour palette — applied to node colours on next randomize()
         self._palette: list = []
+
+        super().__init__()   # triggers the visible property setter below -> activate()
+
+    # -- DrawingElement visibility ---------------------------------------------
+    # Visibility drives activate()/deactivate() directly rather than being a
+    # plain flag, so toggling it has an immediate effect on the traversal.
+
+    @property
+    def visible(self) -> bool:
+        return self._visible
+
+    @visible.setter
+    def visible(self, value: bool) -> None:
+        value = bool(value)
+        self._visible = value
+        if value and not self.is_active():
+            self.activate()
+        elif not value and self.is_active():
+            self.deactivate()
 
     # -- Palette API ----------------------------------------------------------
 
@@ -340,16 +367,17 @@ class NNGraph:
 
     # -- Frame pipeline -------------------------------------------------------
 
-    def step(self, time: float) -> None:
+    def step(self, ctx: FrameContext) -> None:
         """
-        Animate points, advance the traversal, and rebuild the edge VBO.
+        Animate points, advance the traversal, rebuild the edge VBO, and
+        upload the result to GL.
 
         _find_knn5 is NOT called here.  The KNN snapshot is stable for the
         entire build+unwind cycle; only activate() refreshes it.
         """
         wp.launch(
             _animate_points, dim=N,
-            inputs=[self._wp_pos, self._wp_base_pos, time, self.amplitude],
+            inputs=[self._wp_pos, self._wp_base_pos, ctx.time, self.amplitude],
             device=self._device,
         )
 
@@ -372,13 +400,21 @@ class NNGraph:
             device=self._device,
         )
 
+        self.upload()
+
     def upload(self) -> None:
         """Push Warp arrays -> ModernGL buffers (CUDA-GL interop)."""
         self._edge_draw.write_warp(self._wp_edge_pos, self._wp_edge_col)
 
-    def draw(self, mvp: np.ndarray) -> None:
+    def draw(self, mvp: np.ndarray, ctx: FrameContext) -> None:
         """Issue draw call for edges (points are never drawn)."""
         self._edge_draw.draw(mvp)
+
+    def regen(self) -> None:
+        """Re-seed with a fresh random seed (DrawingElement hook)."""
+        seed = random.randint(0, 2**31 - 1)
+        self.randomize(seed)
+        print(f"[nn_graph] regenerated  (seed={seed})")
 
     def randomize(self, seed: int) -> None:
         """Re-seed point positions and colours; reset all state."""
@@ -450,3 +486,6 @@ class NNGraph:
                 if found > 3:
                     return True
         return False
+
+
+register_element_type("nn_graph", NNGraph)
