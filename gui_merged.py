@@ -243,9 +243,10 @@ class MergedGUI(mglw.WindowConfig):
         for _kn in _ALL_KEY_NAMES:
             reg.update(f"key.{_kn}_hold", 1.0 if _kn in self._held_keys else 0.0)
 
-        # ── Tick envelopes + LFOs → source registry ──────────────────────────
+        # ── Tick envelopes + LFOs + parameters → source registry ─────────────
         self.lm.tick_envelopes(frame_time)
         self.lm.tick_lfos(frame_time)
+        self.lm.tick_parameters(frame_time)
 
         # ── Threshold detectors → EventBus ────────────────────────────────────
         self.lm.tick_thresholds()

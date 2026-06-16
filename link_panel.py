@@ -1,8 +1,9 @@
 """
 link_panel.py — Qt panel for the LinkManager signal routing layer.
 
-PySide6 widget with 5 tabs:
-  Signal Links — expression-based continuous source → sink mappings
+PySide6 widget with 6 tabs:
+  Channels     — expression-based continuous source → sink mappings
+  Parameters   — event-driven stateful sources (p.* namespace)
   Events       — discrete event → action links; threshold detectors
   Envelopes    — ADSR envelopes triggered by events
   LFOs         — low-frequency oscillators
@@ -23,14 +24,15 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QCheckBox, QHeaderView,
-    QTabWidget, QFrame, QDoubleSpinBox,
+    QTabWidget, QFrame, QDoubleSpinBox, QSpinBox,
     QCompleter, QAbstractItemView, QDialog, QDialogButtonBox, QInputDialog,
     QTableView, QStyledItemDelegate, QAbstractItemDelegate,
+    QTreeWidget, QTreeWidgetItem,
 )
 
 from link_manager import (
     LinkManager, SignalLink, EnvelopeDef, LFODef, EventLink, ThresholdDef,
-    EVAL_MATH_NS, _flat_to_ns,
+    ParameterDef, EVAL_MATH_NS, _flat_to_ns,
 )
 
 if TYPE_CHECKING:
@@ -102,6 +104,8 @@ QPushButton#remove  { color: #e07070; border-color: #5a2a2a; min-width: 20px; pa
 QPushButton#remove:hover { border-color: #e07070; }
 QPushButton#trigger { color: #ffb347; border-color: #5a3a00; }
 QPushButton#trigger:hover { border-color: #ffb347; }
+QPushButton#pick { color: #5eaeff; border-color: #1e3050; min-width: 20px; padding: 1px 2px; }
+QPushButton#pick:hover { border-color: #5eaeff; }
 
 QTableWidget, QTableView {
     background-color: #111118;
@@ -186,6 +190,10 @@ _KEY_NAMES = (
 
 _LFO_SHAPES = ("sine", "saw", "square", "tri")
 
+_PARAMETER_KINDS = ("toggle", "gate", "latch", "pulse", "counter")
+
+_SOURCE_GROUP_ORDER = ["audio", "midi", "clock", "lfo", "env", "p"]
+
 
 # ── helper: completion lists ──────────────────────────────────────────────────
 
@@ -215,14 +223,6 @@ def _action_completions(lm: LinkManager, pm: "PropertyManager") -> list[str]:
             actions.append(f"link_preset('{name}')")
     else:
         actions.append("link_preset('')")
-    for prop in pm.all_props():
-        k = prop.key
-        if prop.type is bool:
-            actions.append(f"toggle({k})")
-        if prop.choices:
-            actions.append(f"cycle({k})")
-            actions.append(f"cycle_back({k})")
-        actions.append(f"set({k}, )")
     return actions
 
 
@@ -378,7 +378,7 @@ class EventLinkDialog(_BaseDialog):
         self._row("Event:", self._event)
 
         self._action = QLineEdit()
-        self._action.setPlaceholderText("toggle(scene.show_cloud)")
+        self._action.setPlaceholderText("regen")
         if link:
             self._action.setText(link.action)
         actions = action_completions if action_completions is not None else _action_completions(lm, pm)
@@ -550,6 +550,170 @@ class ThresholdDialog(_BaseDialog):
         )
 
 
+# ── Parameter ─────────────────────────────────────────────────────────────────
+
+class ParameterDialog(_BaseDialog):
+    def __init__(self, lm: LinkManager, defn: ParameterDef | None = None, parent=None):
+        super().__init__("Parameter" if defn is None else "Edit Parameter", parent)
+        self.setMinimumWidth(420)
+
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("scene_toggle")
+        if defn:
+            self._name.setText(defn.name)
+        self._row("Name:", self._name)
+
+        self._kind = QComboBox()
+        self._kind.addItems(list(_PARAMETER_KINDS))
+        if defn:
+            idx = self._kind.findText(defn.kind)
+            if idx >= 0:
+                self._kind.setCurrentIndex(idx)
+        self._row("Kind:", self._kind)
+
+        self._trigger = QLineEdit()
+        self._trigger.setPlaceholderText("audio.onset")
+        if defn:
+            self._trigger.setText(defn.trigger)
+        self._trigger.setCompleter(_make_completer(_event_completions(lm), self))
+        self._row("Trigger:", self._trigger)
+
+        self._off_event = QLineEdit()
+        self._off_event.setPlaceholderText("midi.note36.off")
+        if defn and defn.off_event:
+            self._off_event.setText(defn.off_event)
+        self._off_event.setCompleter(_make_completer(_event_completions(lm), self))
+        self._off_event_widget = self._cond_row("Off Event:", self._off_event)
+
+        self._wrap_at = QSpinBox()
+        self._wrap_at.setRange(2, 64)
+        self._wrap_at.setValue(defn.wrap_at if defn else 8)
+        self._wrap_at_widget = self._cond_row("Wrap At:", self._wrap_at)
+
+        self._pulse_ms = QDoubleSpinBox()
+        self._pulse_ms.setRange(1.0, 10000.0)
+        self._pulse_ms.setSingleStep(10.0)
+        self._pulse_ms.setDecimals(1)
+        self._pulse_ms.setValue(defn.pulse_ms if defn else 100.0)
+        self._pulse_ms_widget = self._cond_row("Pulse (ms):", self._pulse_ms)
+
+        self._snap_n = QSpinBox()
+        self._snap_n.setRange(0, 16)
+        self._snap_n.setValue(defn.snap_n if defn else 0)
+        self._snap_n_widget = self._cond_row("Snap N:", self._snap_n)
+
+        self._add_buttons()
+
+        self._kind.currentTextChanged.connect(self._update_visibility)
+        self._update_visibility(self._kind.currentText())
+
+    def _cond_row(self, label: str, widget: QWidget) -> QWidget:
+        container = QWidget()
+        r = QHBoxLayout(container)
+        r.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(label)
+        lbl.setMinimumWidth(110)
+        r.addWidget(lbl)
+        r.addWidget(widget, 1)
+        self._layout.addWidget(container)
+        return container
+
+    def _update_visibility(self, kind: str) -> None:
+        self._off_event_widget.setVisible(kind in ("gate", "latch"))
+        self._wrap_at_widget.setVisible(kind == "counter")
+        self._pulse_ms_widget.setVisible(kind == "pulse")
+        self._snap_n_widget.setVisible(kind == "counter")
+
+    def result_def(self) -> ParameterDef:
+        return ParameterDef(
+            name      = self._name.text().strip(),
+            kind      = self._kind.currentText(),
+            trigger   = self._trigger.text().strip(),
+            off_event = self._off_event.text().strip() or None,
+            wrap_at   = self._wrap_at.value(),
+            pulse_ms  = self._pulse_ms.value(),
+            snap_n    = self._snap_n.value(),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Source picker popup
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SourcePickerPopup(QFrame):
+    """Popup for picking a source key to insert as a channel expression."""
+
+    def __init__(self, snapshot: dict, callback, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup)
+        self._callback = callback
+
+        self.setStyleSheet(_STYLESHEET)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(4, 4, 4, 4)
+        lo.setSpacing(4)
+
+        self._filter = QLineEdit()
+        self._filter.setPlaceholderText("filter…")
+        lo.addWidget(self._filter)
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setRootIsDecorated(True)
+        lo.addWidget(self._tree)
+
+        self._build_tree(snapshot)
+
+        self._filter.textChanged.connect(self._apply_filter)
+        self._tree.itemClicked.connect(self._on_item_clicked)
+
+    def _build_tree(self, snapshot: dict) -> None:
+        groups: dict[str, list[str]] = {}
+        for key in sorted(snapshot.keys()):
+            if key.endswith("_smooth") or key.endswith("_peak"):
+                continue
+            prefix = key.split(".")[0] if "." in key else "other"
+            groups.setdefault(prefix, []).append(key)
+
+        ordered = [g for g in _SOURCE_GROUP_ORDER if g in groups]
+        rest = sorted(k for k in groups if k not in _SOURCE_GROUP_ORDER and k != "other")
+        if "other" in groups:
+            rest.append("other")
+        ordered.extend(rest)
+
+        for group_name in ordered:
+            group_item = QTreeWidgetItem(self._tree, [group_name])
+            group_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            for key in groups[group_name]:
+                short = key[len(group_name) + 1:] if key.startswith(group_name + ".") else key
+                val = snapshot.get(key, 0.0)
+                child = QTreeWidgetItem(group_item, [f"{short}  {val:.4f}"])
+                child.setData(0, Qt.ItemDataRole.UserRole, key)
+
+        self._tree.expandAll()
+
+    def _apply_filter(self, text: str) -> None:
+        text = text.lower()
+        for gi in range(self._tree.topLevelItemCount()):
+            group_item = self._tree.topLevelItem(gi)
+            any_visible = False
+            for ci in range(group_item.childCount()):
+                child = group_item.child(ci)
+                full_key = child.data(0, Qt.ItemDataRole.UserRole) or ""
+                visible = not text or text in full_key.lower()
+                child.setHidden(not visible)
+                if visible:
+                    any_visible = True
+            group_item.setHidden(not any_visible)
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        if key:
+            self._callback(key)
+            self.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tab widgets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -600,12 +764,12 @@ class SourcesTab(QWidget):
             self._table.setItem(r, 1, _cell(f"{snap[k]:.4f}"))
 
 
-# ── Signal Links model ────────────────────────────────────────────────────────
+# ── Channels model ───────────────────────────────────────────────────────────
 
-class SignalLinksModel(QStandardItemModel):
-    """QStandardItemModel backing the property-bay Signal Links table.
+class ChannelsModel(QStandardItemModel):
+    """QStandardItemModel backing the property-bay Channels table.
 
-    Columns: 0=On  1=Key  2=Default  3=Expression  4=Live Value
+    Columns: 0=On  1=Channel  2=Default  3=Expression  4=Live Value
     """
 
     COL_ON   = 0
@@ -613,10 +777,11 @@ class SignalLinksModel(QStandardItemModel):
     COL_DEF  = 2
     COL_EXPR = 3
     COL_LIVE = 4
+    COL_PICK = 5
 
     def __init__(self, parent=None):
-        super().__init__(0, 5, parent)
-        self.setHorizontalHeaderLabels(["✓", "Key", "Default", "Expression", "Live Value"])
+        super().__init__(0, 6, parent)
+        self.setHorizontalHeaderLabels(["✓", "Channel", "Default", "Expression", "Live Value", ""])
         self.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.row_for_key: dict[str, int] = {}
 
@@ -674,26 +839,30 @@ class SignalLinksModel(QStandardItemModel):
             live_item.setForeground(QColor("#5eaeff"))
             live_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
 
-            self.appendRow([on_item, key_item, def_item, expr_item, live_item])
+            # Col 5: Pick — placeholder; button set via setIndexWidget
+            pick_item = QStandardItem("")
+            pick_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+
+            self.appendRow([on_item, key_item, def_item, expr_item, live_item, pick_item])
             self.row_for_key[key] = row
 
 
-def _make_signal_links_proxy(model: SignalLinksModel) -> QSortFilterProxyModel:
+def _make_channels_proxy(model: ChannelsModel) -> QSortFilterProxyModel:
     """Create a QSortFilterProxyModel over model, filtering on the Key column."""
     proxy = QSortFilterProxyModel()
     proxy.setSourceModel(model)
-    proxy.setFilterKeyColumn(SignalLinksModel.COL_KEY)
+    proxy.setFilterKeyColumn(ChannelsModel.COL_KEY)
     proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
     return proxy
 
 
-# ── Signal Links delegate ─────────────────────────────────────────────────────
+# ── Channels delegate ────────────────────────────────────────────────────────
 
-class _SignalLinksDelegate(QStyledItemDelegate):
+class _ChannelsDelegate(QStyledItemDelegate):
     """Custom delegate: persistent QCheckBox for bool Default cells,
     persistent QComboBox for choice-type Default cells."""
 
-    def __init__(self, model: SignalLinksModel, proxy: "QSortFilterProxyModel",
+    def __init__(self, model: ChannelsModel, proxy: "QSortFilterProxyModel",
                  pm: "PropertyManager", parent=None):
         super().__init__(parent)
         self._model = model
@@ -702,9 +871,9 @@ class _SignalLinksDelegate(QStyledItemDelegate):
 
     def _prop_defn_for(self, proxy_index):
         src = self._proxy.mapToSource(proxy_index)
-        if src.column() != SignalLinksModel.COL_DEF:
+        if src.column() != ChannelsModel.COL_DEF:
             return None
-        key_item = self._model.item(src.row(), SignalLinksModel.COL_KEY)
+        key_item = self._model.item(src.row(), ChannelsModel.COL_KEY)
         if key_item is None:
             return None
         return self._pm._defs.get(key_item.text())
@@ -754,9 +923,9 @@ class _SignalLinksDelegate(QStyledItemDelegate):
             super().setModelData(editor, model, index)
 
 
-# ── Signal Links ──────────────────────────────────────────────────────────────
+# ── Channels ─────────────────────────────────────────────────────────────────
 
-class SignalLinksTab(QWidget):
+class ChannelsTab(QWidget):
     changed = Signal()
 
     def __init__(self, lm: LinkManager, pm: "PropertyManager", parent=None):
@@ -768,8 +937,8 @@ class SignalLinksTab(QWidget):
         lo = QVBoxLayout(self)
         lo.setContentsMargins(4, 4, 4, 4)
 
-        self._model = SignalLinksModel(self)
-        self._proxy = _make_signal_links_proxy(self._model)
+        self._model = ChannelsModel(self)
+        self._proxy = _make_channels_proxy(self._model)
 
         self._view = QTableView()
         self._view.setModel(self._proxy)
@@ -779,19 +948,21 @@ class SignalLinksTab(QWidget):
         self._view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._view.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
         self._view.setItemDelegate(
-            _SignalLinksDelegate(self._model, self._proxy, pm, self._view)
+            _ChannelsDelegate(self._model, self._proxy, pm, self._view)
         )
         hh = self._view.horizontalHeader()
-        hh.setSectionResizeMode(SignalLinksModel.COL_ON,   QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(SignalLinksModel.COL_KEY,  QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(SignalLinksModel.COL_DEF,  QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(SignalLinksModel.COL_EXPR, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(SignalLinksModel.COL_LIVE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(ChannelsModel.COL_ON,   QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(ChannelsModel.COL_KEY,  QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(ChannelsModel.COL_DEF,  QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(ChannelsModel.COL_EXPR, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(ChannelsModel.COL_LIVE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(ChannelsModel.COL_PICK, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(ChannelsModel.COL_PICK, 26)
 
         lo.addLayout(self._build_filter_bar())
         lo.addWidget(self._view)
 
-        hint = QLabel("Double-click Expression to edit · Bool/choice defaults update on click.")
+        hint = QLabel("Double-click Expression to edit · ⊕ to assign a source · Bool/choice defaults update on click.")
         hint.setObjectName("info")
         lo.addWidget(hint)
 
@@ -815,22 +986,50 @@ class SignalLinksTab(QWidget):
 
     def _close_persistent_editors(self) -> None:
         for row in range(self._model.rowCount()):
-            proxy_index = self._proxy.mapFromSource(
-                self._model.index(row, SignalLinksModel.COL_DEF)
+            proxy_def = self._proxy.mapFromSource(
+                self._model.index(row, ChannelsModel.COL_DEF)
             )
-            if proxy_index.isValid() and self._view.isPersistentEditorOpen(proxy_index):
-                self._view.closePersistentEditor(proxy_index)
+            if proxy_def.isValid() and self._view.isPersistentEditorOpen(proxy_def):
+                self._view.closePersistentEditor(proxy_def)
+            proxy_pick = self._proxy.mapFromSource(
+                self._model.index(row, ChannelsModel.COL_PICK)
+            )
+            if proxy_pick.isValid():
+                self._view.setIndexWidget(proxy_pick, None)
 
     def _open_persistent_editors(self) -> None:
         for key, row in self._model.row_for_key.items():
             defn = self._pm._defs.get(key)
-            if defn is None:
-                continue
-            if defn.type is bool or defn.choices:
-                src_index = self._model.index(row, SignalLinksModel.COL_DEF)
+            if defn is not None and (defn.type is bool or defn.choices):
+                src_index = self._model.index(row, ChannelsModel.COL_DEF)
                 proxy_index = self._proxy.mapFromSource(src_index)
                 if proxy_index.isValid():
                     self._view.openPersistentEditor(proxy_index)
+            btn = QPushButton("⊕")
+            btn.setObjectName("pick")
+            btn.setFixedSize(22, 20)
+            btn.clicked.connect(lambda checked=False, sk=key, b=btn: self._open_picker(b, sk))
+            src_pick = self._model.index(row, ChannelsModel.COL_PICK)
+            proxy_pick = self._proxy.mapFromSource(src_pick)
+            if proxy_pick.isValid():
+                self._view.setIndexWidget(proxy_pick, btn)
+
+    def _open_picker(self, anchor: QPushButton, sink_key: str) -> None:
+        snap = self._lm.source_registry.snapshot()
+
+        def on_select(source_key: str) -> None:
+            row = self._model.row_for_key.get(sink_key)
+            if row is None:
+                return
+            expr_item = self._model.item(row, ChannelsModel.COL_EXPR)
+            if expr_item is not None:
+                expr_item.setText(source_key)
+
+        popup = _SourcePickerPopup(snap, on_select)
+        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        popup.move(pos)
+        popup.resize(280, 320)
+        popup.show()
 
     def _refresh_live_values(self) -> None:
         """Update the Live Value column; skips unchanged cells to suppress repaints."""
@@ -843,7 +1042,7 @@ class SignalLinksTab(QWidget):
                     new_text = f"{self._pm.get(key):.4f}"
                 except (TypeError, ValueError):
                     new_text = str(self._pm.get(key))
-                live_item = self._model.item(row, SignalLinksModel.COL_LIVE)
+                live_item = self._model.item(row, ChannelsModel.COL_LIVE)
                 if live_item is not None and live_item.text() != new_text:
                     live_item.setText(new_text)
         finally:
@@ -891,16 +1090,16 @@ class SignalLinksTab(QWidget):
 
         col = item.column()
         row = item.row()
-        key_item = self._model.item(row, SignalLinksModel.COL_KEY)
+        key_item = self._model.item(row, ChannelsModel.COL_KEY)
         if key_item is None:
             return
         key = key_item.text()
         link_map = {l.sink_key: l for l in self._lm._signal_links}
 
-        if col == SignalLinksModel.COL_EXPR:
+        if col == ChannelsModel.COL_EXPR:
             new_expr = item.text().strip()
             link     = link_map.get(key)
-            on_item  = self._model.item(row, SignalLinksModel.COL_ON)
+            on_item  = self._model.item(row, ChannelsModel.COL_ON)
 
             if new_expr:
                 if link:
@@ -931,7 +1130,7 @@ class SignalLinksTab(QWidget):
 
             self.changed.emit()
 
-        elif col == SignalLinksModel.COL_DEF:
+        elif col == ChannelsModel.COL_DEF:
             text = item.text().strip()
             defn = self._pm._defs.get(key)
 
@@ -971,13 +1170,13 @@ class SignalLinksTab(QWidget):
 
             self._lm.set_baseline(key, val)
             link    = link_map.get(key)
-            on_item = self._model.item(row, SignalLinksModel.COL_ON)
+            on_item = self._model.item(row, ChannelsModel.COL_ON)
             if not (link and link.expression) or \
                     on_item.checkState() == Qt.CheckState.Unchecked:
                 self._pm.set(key, val)
             self.changed.emit()
 
-        elif col == SignalLinksModel.COL_ON:
+        elif col == ChannelsModel.COL_ON:
             link = link_map.get(key)
             if link is None:
                 return
@@ -1403,6 +1602,106 @@ class LFOsTab(QWidget):
         self.changed.emit()
 
 
+# ── Parameters ────────────────────────────────────────────────────────────────
+
+class ParametersTab(QWidget):
+    changed = Signal()
+
+    def __init__(self, lm: LinkManager, parent=None):
+        super().__init__(parent)
+        self._lm = lm
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(4, 4, 4, 4)
+
+        tb = QHBoxLayout()
+        add_btn = QPushButton("+ Add")
+        add_btn.setObjectName("add")
+        add_btn.clicked.connect(self._add)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self._edit)
+        rm_btn = QPushButton("Remove")
+        rm_btn.setObjectName("remove")
+        rm_btn.clicked.connect(self._remove)
+        tb.addWidget(add_btn)
+        tb.addWidget(edit_btn)
+        tb.addWidget(rm_btn)
+        tb.addStretch()
+        lo.addLayout(tb)
+
+        self._table = _make_table(["Name", "Kind", "Trigger", "Off Event", "State"])
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.doubleClicked.connect(self._edit)
+        lo.addWidget(self._table)
+
+        info = QLabel("p.<name> values visible in Sources tab.")
+        info.setObjectName("info")
+        lo.addWidget(info)
+
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(100)
+        self._live_timer.timeout.connect(self._refresh_state_column)
+        self._live_timer.start()
+
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        defs = self._lm._parameter_defs
+        self._table.setRowCount(len(defs))
+        for r, d in enumerate(defs):
+            self._table.setItem(r, 0, _cell(d.name))
+            self._table.setItem(r, 1, _cell(d.kind))
+            self._table.setItem(r, 2, _cell(d.trigger))
+            self._table.setItem(r, 3, _cell(d.off_event or ""))
+            self._table.setItem(r, 4, _cell(""))
+
+    def _refresh_state_column(self) -> None:
+        snap = self._lm.source_registry.snapshot()
+        defs = self._lm._parameter_defs
+        for r, d in enumerate(defs):
+            val = snap.get(f"p.{d.name}", 0.0)
+            new_text = f"{val:.4f}"
+            item = self._table.item(r, 4)
+            if item is not None and item.text() != new_text:
+                item.setText(new_text)
+
+    def _add(self) -> None:
+        dlg = ParameterDialog(self._lm, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            defn = dlg.result_def()
+            if defn.name and defn.trigger:
+                self._lm.add_parameter(defn)
+                self._rebuild()
+                self.changed.emit()
+
+    def _edit(self) -> None:
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._lm._parameter_defs):
+            return
+        old = self._lm._parameter_defs[row]
+        dlg = ParameterDialog(self._lm, defn=old, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_def = dlg.result_def()
+            self._lm.remove_parameter(old.name)
+            self._lm.add_parameter(new_def)
+            self._rebuild()
+            self.changed.emit()
+
+    def _remove(self) -> None:
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._lm._parameter_defs):
+            return
+        defn = self._lm._parameter_defs[row]
+        self._lm.remove_parameter(defn.name)
+        self._rebuild()
+        self.changed.emit()
+
+
 # ── Presets ───────────────────────────────────────────────────────────────────
 
 class PresetsTab(QWidget):
@@ -1567,7 +1866,7 @@ class PresetsTab(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LinkManagerPanel(QWidget):
-    """Main panel: tabs for Signal Links, Events, Envelopes, LFOs, Presets, Sources.
+    """Main panel: tabs for Channels, Parameters, Events, Envelopes, LFOs, Presets, Sources.
 
     extra_tabs: optional list of (label, widget) pairs appended after the core tabs.
     """
@@ -1589,19 +1888,21 @@ class LinkManagerPanel(QWidget):
         lo.setSpacing(4)
 
         tabs = QTabWidget()
-        self._sig_tab     = SignalLinksTab(lm, pm)
-        self._evt_tab     = EventsTab(lm, pm)
-        self._env_tab     = EnvelopesTab(lm)
-        self._lfo_tab     = LFOsTab(lm)
-        self._preset_tab  = PresetsTab(lm, pm)
-        self._src_tab     = SourcesTab(lm)
+        self._channels_tab = ChannelsTab(lm, pm)
+        self._param_tab    = ParametersTab(lm)
+        self._evt_tab      = EventsTab(lm, pm)
+        self._env_tab      = EnvelopesTab(lm)
+        self._lfo_tab      = LFOsTab(lm)
+        self._preset_tab   = PresetsTab(lm, pm)
+        self._src_tab      = SourcesTab(lm)
 
-        tabs.addTab(self._sig_tab,    "Signal Links")
-        tabs.addTab(self._evt_tab,    "Events")
-        tabs.addTab(self._env_tab,    "Envelopes")
-        tabs.addTab(self._lfo_tab,    "LFOs")
-        tabs.addTab(self._preset_tab, "Presets")
-        tabs.addTab(self._src_tab,    "Sources")
+        tabs.addTab(self._channels_tab, "Channels")
+        tabs.addTab(self._param_tab,    "Parameters")
+        tabs.addTab(self._evt_tab,      "Events")
+        tabs.addTab(self._env_tab,      "Envelopes")
+        tabs.addTab(self._lfo_tab,      "LFOs")
+        tabs.addTab(self._preset_tab,   "Presets")
+        tabs.addTab(self._src_tab,      "Sources")
 
         for label, widget in (extra_tabs or []):
             tabs.addTab(widget, label)
@@ -1625,8 +1926,8 @@ class LinkManagerPanel(QWidget):
         self._save_timer.setInterval(5000)
         self._save_timer.timeout.connect(self._save_now)
 
-        for tab in (self._sig_tab, self._evt_tab, self._env_tab,
-                    self._lfo_tab, self._preset_tab):
+        for tab in (self._channels_tab, self._param_tab, self._evt_tab,
+                    self._env_tab, self._lfo_tab, self._preset_tab):
             tab.changed.connect(self._on_changed)
 
         self._preset_tab.needs_rebuild.connect(self._rebuild_routing_tabs)
@@ -1639,7 +1940,8 @@ class LinkManagerPanel(QWidget):
 
     def _rebuild_routing_tabs(self) -> None:
         """Rebuild all routing tabs after a preset load changes the routing state."""
-        for tab in (self._sig_tab, self._evt_tab, self._env_tab, self._lfo_tab):
+        for tab in (self._channels_tab, self._param_tab, self._evt_tab,
+                    self._env_tab, self._lfo_tab):
             tab._rebuild()
 
     def _save_now(self) -> None:
@@ -1654,8 +1956,8 @@ class LinkManagerPanel(QWidget):
             return
         try:
             self._lm.load_state(self._STATE_PATH)
-            for tab in (self._sig_tab, self._evt_tab, self._env_tab,
-                        self._lfo_tab, self._preset_tab):
+            for tab in (self._channels_tab, self._param_tab, self._evt_tab,
+                        self._env_tab, self._lfo_tab, self._preset_tab):
                 tab._rebuild()
             # Push saved baselines into PM for every property that has no active link.
             # Properties WITH an active enabled link will be overridden by evaluate_links

@@ -215,6 +215,94 @@ class ThresholdDef:
         )
 
 
+@dataclass
+class ParameterDef:
+    """Event-driven stateful source; output available as p.<name>.
+
+    Kinds:
+      toggle  — flip 0↔1 on each trigger
+      gate    — 1.0 on trigger; 0.0 on off_event
+      latch   — 1.0 on trigger (stays 1 until off_event; trigger doesn't re-toggle)
+      pulse   — 1.0 on trigger; returns to 0.0 after pulse_ms milliseconds
+      counter — increments 0..wrap_at-1 on each trigger; normalized 0-1 output;
+                if snap_n > 0, output is quantized to snap_n discrete steps
+    """
+    name      : str
+    kind      : str          # "toggle" | "gate" | "latch" | "pulse" | "counter"
+    trigger   : str          # event id for the primary trigger
+    off_event : str | None = None   # gate/latch: event that resets to 0
+    wrap_at   : int         = 8     # counter: wraps at this count
+    pulse_ms  : float       = 100.0 # pulse: duration in ms before returning to 0
+    snap_n    : int         = 0     # counter: number of discrete output steps (0 = continuous)
+
+    def to_dict(self) -> dict:
+        return {
+            "name"     : self.name,
+            "kind"     : self.kind,
+            "trigger"  : self.trigger,
+            "off_event": self.off_event,
+            "wrap_at"  : self.wrap_at,
+            "pulse_ms" : self.pulse_ms,
+            "snap_n"   : self.snap_n,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ParameterDef":
+        return cls(
+            name      = d["name"],
+            kind      = d["kind"],
+            trigger   = d["trigger"],
+            off_event = d.get("off_event"),
+            wrap_at   = d.get("wrap_at",  8),
+            pulse_ms  = d.get("pulse_ms", 100.0),
+            snap_n    = d.get("snap_n",   0),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  _ParameterState — runtime state for a ParameterDef (not serialized)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ParameterState:
+    """Holds the mutable runtime state for one ParameterDef."""
+
+    def __init__(self, defn: ParameterDef) -> None:
+        self._defn             = defn
+        self._value            : float = 0.0
+        self._counter          : int   = 0
+        self._pulse_remaining  : float = 0.0
+
+    def on_trigger(self, _payload=None) -> None:
+        kind = self._defn.kind
+        if kind == "toggle":
+            self._value = 0.0 if self._value > 0.5 else 1.0
+        elif kind == "gate":
+            self._value = 1.0
+        elif kind == "latch":
+            self._value = 1.0
+        elif kind == "pulse":
+            self._value           = 1.0
+            self._pulse_remaining = self._defn.pulse_ms / 1000.0
+        elif kind == "counter":
+            self._counter = (self._counter + 1) % self._defn.wrap_at
+            raw = self._counter / self._defn.wrap_at
+            if self._defn.snap_n > 0:
+                self._value = round(raw * self._defn.snap_n) / self._defn.snap_n
+            else:
+                self._value = raw
+
+    def on_off_event(self, _payload=None) -> None:
+        self._value = 0.0
+
+    def tick(self, dt: float) -> float:
+        if self._defn.kind == "pulse" and self._pulse_remaining > 0.0:
+            self._pulse_remaining -= dt
+            if self._pulse_remaining <= 0.0:
+                self._pulse_remaining = 0.0
+                self._value           = 0.0
+        return self._value
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Source Registry
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,10 +332,17 @@ class SourceRegistry:
     # -- write (any thread) ---------------------------------------------------
 
     def update(self, key: str, value: float) -> None:
-        """Write a 0-1 float; automatically updates <key>_smooth and <key>_peak."""
+        """Write a 0-1 float; automatically updates <key>_smooth and <key>_peak.
+
+        p.* keys (parameters) are discrete/stateful — smooth and peak variants
+        are skipped for them to avoid misleading interpolated values.
+        """
         now = time.perf_counter()
         with self._lock:
             self._data[key] = value
+
+            if key.startswith("p."):
+                return
 
             # smooth variant -- exponential low-pass
             prev_t            = self._last_t.get(key, now)
@@ -340,7 +435,7 @@ class EventBus:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Math helpers -- injected into expression eval namespace in Phase 2
+#  Math helpers -- injected into expression eval namespace
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _lerp(a: float, b: float, t: float) -> float:
@@ -553,6 +648,9 @@ class LinkManager:
         self._threshold_state : dict[str, bool]        = {}  # name -> currently_above_high
         self._threshold_last_t: dict[str, float]       = {}  # name -> perf_counter of last fire
         self._envelope_sub_tokens: dict[str, list[int]] = {}  # name -> EventBus tokens
+        self._parameter_defs      : list[ParameterDef]           = []
+        self._parameter_states    : dict[str, _ParameterState]   = {}  # name → state
+        self._parameter_sub_tokens: dict[str, list[int]]          = {}  # name → EventBus tokens
 
         self._const_ns = types.SimpleNamespace()  # user-defined named constants
 
@@ -702,6 +800,29 @@ class LinkManager:
             elif was_above and val < defn.low:
                 self._threshold_state[defn.name] = False
 
+    # ── Parameter management ──────────────────────────────────────────────────
+
+    def add_parameter(self, defn: ParameterDef) -> None:
+        """Register a ParameterDef, create its runtime state, and wire event subscriptions."""
+        state = _ParameterState(defn)
+        self._parameter_states[defn.name] = state
+        self._parameter_defs.append(defn)
+        tokens = [self.event_bus.subscribe(defn.trigger, state.on_trigger)]
+        if defn.off_event:
+            tokens.append(self.event_bus.subscribe(defn.off_event, state.on_off_event))
+        self._parameter_sub_tokens[defn.name] = tokens
+
+    def remove_parameter(self, name: str) -> None:
+        for token in self._parameter_sub_tokens.pop(name, []):
+            self.event_bus.unsubscribe(token)
+        self._parameter_states.pop(name, None)
+        self._parameter_defs = [d for d in self._parameter_defs if d.name != name]
+
+    def tick_parameters(self, dt: float) -> None:
+        """Advance all parameter states and write p.<name> into the source registry."""
+        for name, state in self._parameter_states.items():
+            self.source_registry.update(f"p.{name}", state.tick(dt))
+
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def clear_state(self) -> None:
@@ -722,6 +843,11 @@ class LinkManager:
         self._threshold_defs.clear()
         self._threshold_state.clear()
         self._threshold_last_t.clear()
+        for name in list(self._parameter_states):
+            for token in self._parameter_sub_tokens.pop(name, []):
+                self.event_bus.unsubscribe(token)
+        self._parameter_defs.clear()
+        self._parameter_states.clear()
 
     def save_state(self, path) -> None:
         """Serialise all routing state, presets, and preset triggers to JSON."""
@@ -733,6 +859,7 @@ class LinkManager:
             "lfos"            : [d.to_dict() for d in self._lfo_defs],
             "event_links"     : [l.to_dict() for l in self._event_links],
             "thresholds"      : [d.to_dict() for d in self._threshold_defs],
+            "parameters"      : [d.to_dict() for d in self._parameter_defs],
             "baselines"       : dict(self._baselines),
             "presets"         : self._presets,
             "preset_triggers" : [l.to_dict() for l in self._preset_triggers],
@@ -760,6 +887,8 @@ class LinkManager:
             self.add_event_link(EventLink.from_dict(d))
         for d in data.get("thresholds", []):
             self.add_threshold(ThresholdDef.from_dict(d))
+        for d in data.get("parameters", []):
+            self.add_parameter(ParameterDef.from_dict(d))
         self._baselines.update(data.get("baselines", {}))
         for name, snap in data.get("presets", {}).items():
             self._presets[name] = snap
@@ -776,6 +905,7 @@ class LinkManager:
             "lfos"         : [d.to_dict() for d in self._lfo_defs],
             "event_links"  : [l.to_dict() for l in self._event_links],
             "thresholds"   : [d.to_dict() for d in self._threshold_defs],
+            "parameters"   : [d.to_dict() for d in self._parameter_defs],
         }
         print(f"[lm] preset saved: '{name}'")
 
@@ -799,6 +929,8 @@ class LinkManager:
             self.add_event_link(EventLink.from_dict(d))
         for d in snap.get("thresholds", []):
             self.add_threshold(ThresholdDef.from_dict(d))
+        for d in snap.get("parameters", []):
+            self.add_parameter(ParameterDef.from_dict(d))
         print(f"[lm] preset loaded: '{name}'")
 
     def delete_link_preset(self, name: str) -> None:
@@ -832,6 +964,9 @@ class LinkManager:
 
     # ── Action dispatcher ─────────────────────────────────────────────────────
 
+    # Deprecated: toggle/cycle/cycle_back/set are superseded by Parameters (p.*).
+    # Handlers retained for backward-compat with saved link_state.json files.
+    # These actions no longer appear in _action_completions() suggestions.
     _RE_TOGGLE      = re.compile(r"^toggle\(([^)]+)\)$")
     _RE_CYCLE       = re.compile(r"^cycle\(([^)]+)\)$")
     _RE_CYCLE_BACK  = re.compile(r"^cycle_back\(([^)]+)\)$")
