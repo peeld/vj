@@ -608,9 +608,12 @@ if __name__ == "__main__":
     from PySide6.QtWidgets import QApplication
     from midi_input   import get_router
     from midi_panel   import MidiPanel
+    from osc_input    import get_router as get_osc_router
+    from osc_panel    import OscPanel
     from audio_panel  import AudioPanel
 
-    _router = get_router()
+    _router     = get_router()
+    _osc_router = get_osc_router()
 
     # Build base PM now (feedback + scene props only; elements added in GL __init__)
     _pm = build_default_manager(_params, _controls, None, None, None)
@@ -650,6 +653,10 @@ if __name__ == "__main__":
                          source_registry=_lm.source_registry,
                          event_bus=_lm.event_bus)
 
+        osc = OscPanel(_osc_router, title="OSC Input",
+                       source_registry=_lm.source_registry,
+                       event_bus=_lm.event_bus)
+
         audio = AudioPanel(
             title           = "Audio Input",
             source_registry = _lm.source_registry,
@@ -682,6 +689,7 @@ if __name__ == "__main__":
             extra_tabs=[
                 ("Elements", elements_tab),
                 ("MIDI",     midi),
+                ("OSC",      osc),
                 ("Audio",    audio),
                 ("Colors",   colors),
                 ("Settings", settings),

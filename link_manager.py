@@ -405,6 +405,7 @@ class EventBus:
         self._queue: queue.Queue = queue.Queue()
         self._next_token: int = 0
         self._token_map: dict[int, tuple[str, Callable]] = {}
+        self._seen_ids: set[str] = set()
 
     def subscribe(self, event_id: str, callback: Callable) -> int:
         """Register callback(payload) for event_id.  Returns an unsubscribe token."""
@@ -427,7 +428,12 @@ class EventBus:
 
     def fire(self, event_id: str, payload: Any = None) -> None:
         """Enqueue an event.  Thread-safe; returns immediately."""
+        self._seen_ids.add(event_id)
         self._queue.put_nowait((event_id, payload))
+
+    def seen_ids(self) -> list[str]:
+        """All distinct event ids ever fired, e.g. for completion lists."""
+        return sorted(self._seen_ids)
 
     def drain(self) -> list[tuple[str, Any]]:
         """Drain the queue, call subscribers, return list of (event_id, payload).

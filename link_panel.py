@@ -201,7 +201,8 @@ def _event_completions(lm: LinkManager) -> list[str]:
     for n in range(128):
         srcs.append(f"midi.note{n}.on")
         srcs.append(f"midi.note{n}.off")
-    return srcs
+    srcs.extend(lm.event_bus.seen_ids())
+    return sorted(set(srcs))
 
 
 def _expr_completions(lm: LinkManager) -> list[str]:
