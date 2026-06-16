@@ -17,13 +17,15 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QSortFilterProxyModel, QEvent
+from PySide6.QtGui import QColor, QKeyEvent, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QCheckBox, QHeaderView,
     QTabWidget, QFrame, QDoubleSpinBox,
     QCompleter, QAbstractItemView, QDialog, QDialogButtonBox, QInputDialog,
+    QTableView, QStyledItemDelegate, QAbstractItemDelegate,
 )
 
 from link_manager import (
@@ -101,7 +103,7 @@ QPushButton#remove:hover { border-color: #e07070; }
 QPushButton#trigger { color: #ffb347; border-color: #5a3a00; }
 QPushButton#trigger:hover { border-color: #ffb347; }
 
-QTableWidget {
+QTableWidget, QTableView {
     background-color: #111118;
     alternate-background-color: #141420;
     color: #c8c8d0;
@@ -110,14 +112,14 @@ QTableWidget {
     selection-background-color: #1e3050;
     selection-color: #c8c8d0;
 }
-QTableWidget QHeaderView::section {
+QTableWidget QHeaderView::section, QTableView QHeaderView::section {
     background-color: #1a1a22;
     color: #707078;
     border: none;
     border-bottom: 1px solid #38383f;
     padding: 3px 6px;
 }
-QTableWidget::item { padding: 2px 4px; }
+QTableWidget::item, QTableView::item { padding: 2px 4px; }
 
 QTabWidget::pane {
     border: 1px solid #38383f;
@@ -237,6 +239,58 @@ def _make_completer(words: list[str], parent=None) -> QCompleter:
     return c
 
 
+# ── MIDI / key capture helpers ────────────────────────────────────────────────
+
+# Qt key code → _KEY_NAMES string (matches gui_merged.py _KEY_MAP)
+_QT_KEY_TO_NAME: dict[int, str] = {
+    Qt.Key.Key_1: "NUMBER_1", Qt.Key.Key_2: "NUMBER_2",
+    Qt.Key.Key_3: "NUMBER_3", Qt.Key.Key_4: "NUMBER_4",
+    Qt.Key.Key_Tab: "TAB",
+    Qt.Key.Key_Z: "Z", Qt.Key.Key_X: "X",
+    Qt.Key.Key_D: "D", Qt.Key.Key_F: "F",
+    Qt.Key.Key_Q: "Q", Qt.Key.Key_W: "W",
+    Qt.Key.Key_A: "A", Qt.Key.Key_S: "S",
+    Qt.Key.Key_H: "H", Qt.Key.Key_J: "J",
+    Qt.Key.Key_C: "C", Qt.Key.Key_V: "V",
+    Qt.Key.Key_B: "B", Qt.Key.Key_N: "N",
+    Qt.Key.Key_K: "K", Qt.Key.Key_L: "L",
+    Qt.Key.Key_I: "I", Qt.Key.Key_U: "U",
+    Qt.Key.Key_G: "G", Qt.Key.Key_M: "M",
+}
+
+
+class _KeyCaptureDialog(QDialog):
+    """Modal that waits for one mapped key press and returns its event string."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Capture Key")
+        self.setStyleSheet(_STYLESHEET)
+        self.setFixedSize(300, 100)
+        self._result: str | None = None
+
+        lo = QVBoxLayout(self)
+        self._lbl = QLabel("Press a key…")
+        self._lbl.setObjectName("hdr")
+        self._lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lo.addWidget(self._lbl)
+
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        lo.addWidget(cancel)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        name = _QT_KEY_TO_NAME.get(event.key())
+        if name:
+            self._result = f"key.{name}.press"
+            self.accept()
+        elif event.key() == Qt.Key.Key_Escape:
+            self.reject()
+
+    def captured_event(self) -> str | None:
+        return self._result
+
+
 def _eval_preview(expr: str, lm: LinkManager) -> tuple[str, bool]:
     """Return (display_text, is_error)."""
     if not expr.strip():
@@ -306,60 +360,6 @@ class _BaseDialog(QDialog):
         sb.setDecimals(decimals)
         sb.setValue(val)
         return sb
-
-
-# ── Signal Link ───────────────────────────────────────────────────────────────
-
-class SignalLinkDialog(_BaseDialog):
-    def __init__(self, lm: LinkManager, pm: "PropertyManager",
-                 link: SignalLink | None = None, parent=None):
-        super().__init__("Signal Link" if link is None else "Edit Signal Link", parent)
-        self._lm = lm
-
-        self._sink = QComboBox()
-        sink_keys = [p.key for p in pm.all_props()]
-        self._sink.addItems(sink_keys)
-        if link and link.sink_key in sink_keys:
-            self._sink.setCurrentIndex(sink_keys.index(link.sink_key))
-        self._row("Sink:", self._sink)
-
-        self._expr = QLineEdit()
-        self._expr.setPlaceholderText("lerp(0.98, 0.999, audio.bass)")
-        if link:
-            self._expr.setText(link.expression)
-        self._expr.setCompleter(_make_completer(_expr_completions(lm), self))
-        self._row("Expression:", self._expr)
-
-        self._preview = QLabel("")
-        self._preview.setObjectName("value")
-        self._layout.addWidget(self._preview)
-
-        self._enabled = QCheckBox("Enabled")
-        self._enabled.setChecked(link.enabled if link else True)
-        self._layout.addWidget(self._enabled)
-
-        self._add_buttons()
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(200)
-        self._timer.timeout.connect(self._refresh_preview)
-        self._timer.start()
-        self._expr.textChanged.connect(self._refresh_preview)
-        self._refresh_preview()
-
-    def _refresh_preview(self) -> None:
-        text, is_err = _eval_preview(self._expr.text(), self._lm)
-        self._preview.setObjectName("err" if is_err else "value")
-        self._preview.setText(text)
-        self._preview.style().unpolish(self._preview)
-        self._preview.style().polish(self._preview)
-
-    def result_link(self) -> SignalLink:
-        return SignalLink(
-            sink_key   = self._sink.currentText(),
-            expression = self._expr.text().strip(),
-            enabled    = self._enabled.isChecked(),
-        )
 
 
 # ── Event Link ────────────────────────────────────────────────────────────────
@@ -600,6 +600,160 @@ class SourcesTab(QWidget):
             self._table.setItem(r, 1, _cell(f"{snap[k]:.4f}"))
 
 
+# ── Signal Links model ────────────────────────────────────────────────────────
+
+class SignalLinksModel(QStandardItemModel):
+    """QStandardItemModel backing the property-bay Signal Links table.
+
+    Columns: 0=On  1=Key  2=Default  3=Expression  4=Live Value
+    """
+
+    COL_ON   = 0
+    COL_KEY  = 1
+    COL_DEF  = 2
+    COL_EXPR = 3
+    COL_LIVE = 4
+
+    def __init__(self, parent=None):
+        super().__init__(0, 5, parent)
+        self.setHorizontalHeaderLabels(["✓", "Key", "Default", "Expression", "Live Value"])
+        self.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.row_for_key: dict[str, int] = {}
+
+    def populate(self, lm: "LinkManager", pm: "PropertyManager") -> None:
+        self.setRowCount(0)
+        self.row_for_key.clear()
+        link_map = {l.sink_key: l for l in lm._signal_links}
+
+        for row, prop in enumerate(pm.all_props()):
+            key  = prop.key
+            link = link_map.get(key)
+            expr = link.expression if link else ""
+
+            # Col 0: On checkbox — UserCheckable only when an expression exists
+            on_item = QStandardItem()
+            on_item.setCheckState(
+                Qt.CheckState.Checked
+                if (link and link.enabled and expr)
+                else Qt.CheckState.Unchecked
+            )
+            base_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            on_item.setFlags(
+                base_flags | Qt.ItemFlag.ItemIsUserCheckable if expr else base_flags
+            )
+
+            # Col 1: Key — read-only
+            key_item = QStandardItem(key)
+            key_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+
+            # Col 2: Default — editable, seeded from baseline or property default
+            stored = lm.get_baseline(key, prop.default)
+            if isinstance(stored, bool):
+                def_text = str(stored)
+            else:
+                try:
+                    def_text = f"{float(stored):.4f}"
+                except (TypeError, ValueError):
+                    def_text = str(stored)
+            def_item = QStandardItem(def_text)
+            def_item.setForeground(QColor("#5eaeff"))
+            def_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEditable
+            )
+
+            # Col 3: Expression — editable, seeded from active link or ""
+            expr_item = QStandardItem(expr)
+            expr_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEditable
+            )
+
+            # Col 4: Live Value — read-only, populated by the refresh timer
+            live_item = QStandardItem("")
+            live_item.setForeground(QColor("#5eaeff"))
+            live_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+
+            self.appendRow([on_item, key_item, def_item, expr_item, live_item])
+            self.row_for_key[key] = row
+
+
+def _make_signal_links_proxy(model: SignalLinksModel) -> QSortFilterProxyModel:
+    """Create a QSortFilterProxyModel over model, filtering on the Key column."""
+    proxy = QSortFilterProxyModel()
+    proxy.setSourceModel(model)
+    proxy.setFilterKeyColumn(SignalLinksModel.COL_KEY)
+    proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    return proxy
+
+
+# ── Signal Links delegate ─────────────────────────────────────────────────────
+
+class _SignalLinksDelegate(QStyledItemDelegate):
+    """Custom delegate: persistent QCheckBox for bool Default cells,
+    persistent QComboBox for choice-type Default cells."""
+
+    def __init__(self, model: SignalLinksModel, proxy: "QSortFilterProxyModel",
+                 pm: "PropertyManager", parent=None):
+        super().__init__(parent)
+        self._model = model
+        self._proxy = proxy
+        self._pm    = pm
+
+    def _prop_defn_for(self, proxy_index):
+        src = self._proxy.mapToSource(proxy_index)
+        if src.column() != SignalLinksModel.COL_DEF:
+            return None
+        key_item = self._model.item(src.row(), SignalLinksModel.COL_KEY)
+        if key_item is None:
+            return None
+        return self._pm._defs.get(key_item.text())
+
+    def _choices_for(self, proxy_index) -> list | None:
+        defn = self._prop_defn_for(proxy_index)
+        return [str(c) for c in defn.choices] if (defn and defn.choices) else None
+
+    def _is_bool_for(self, proxy_index) -> bool:
+        defn = self._prop_defn_for(proxy_index)
+        return defn is not None and defn.type is bool
+
+    def createEditor(self, parent, option, index):
+        if self._is_bool_for(index):
+            cb = QCheckBox(parent)
+            cb.clicked.connect(lambda _checked: self.commitData.emit(cb))
+            return cb
+        choices = self._choices_for(index)
+        if choices is not None:
+            combo = QComboBox(parent)
+            combo.addItems(choices)
+            combo.activated.connect(lambda _: self.commitData.emit(combo))
+            return combo
+        return super().createEditor(parent, option, index)
+
+    def setEditorData(self, editor, index):
+        if isinstance(editor, QCheckBox):
+            src  = self._proxy.mapToSource(index)
+            item = self._model.itemFromIndex(src)
+            if item:
+                editor.setChecked(item.text().lower() in ("true", "1", "yes", "on"))
+        elif isinstance(editor, QComboBox):
+            src  = self._proxy.mapToSource(index)
+            item = self._model.itemFromIndex(src)
+            if item:
+                i = editor.findText(item.text())
+                editor.setCurrentIndex(max(i, 0))
+        else:
+            super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):
+        if isinstance(editor, QCheckBox):
+            model.setData(index, str(editor.isChecked()), Qt.ItemDataRole.EditRole)
+        elif isinstance(editor, QComboBox):
+            model.setData(index, editor.currentText(), Qt.ItemDataRole.EditRole)
+        else:
+            super().setModelData(editor, model, index)
+
+
 # ── Signal Links ──────────────────────────────────────────────────────────────
 
 class SignalLinksTab(QWidget):
@@ -609,102 +763,230 @@ class SignalLinksTab(QWidget):
         super().__init__(parent)
         self._lm = lm
         self._pm = pm
+        self._updating = False  # re-entrancy guard for _on_item_changed
 
         lo = QVBoxLayout(self)
         lo.setContentsMargins(4, 4, 4, 4)
 
-        tb = QHBoxLayout()
-        add_btn = QPushButton("+ Add")
-        add_btn.setObjectName("add")
-        add_btn.clicked.connect(self._add)
-        rm_btn = QPushButton("Remove")
-        rm_btn.setObjectName("remove")
-        rm_btn.clicked.connect(self._remove)
-        tb.addWidget(add_btn)
-        tb.addWidget(rm_btn)
-        tb.addStretch()
-        lo.addLayout(tb)
+        self._model = SignalLinksModel(self)
+        self._proxy = _make_signal_links_proxy(self._model)
 
-        self._table = _make_table(["On", "Sink", "Expression", "Value"])
-        hh = self._table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.doubleClicked.connect(self._edit)
-        lo.addWidget(self._table)
+        self._view = QTableView()
+        self._view.setModel(self._proxy)
+        self._view.setAlternatingRowColors(True)
+        self._view.verticalHeader().hide()
+        self._view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._view.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self._view.setItemDelegate(
+            _SignalLinksDelegate(self._model, self._proxy, pm, self._view)
+        )
+        hh = self._view.horizontalHeader()
+        hh.setSectionResizeMode(SignalLinksModel.COL_ON,   QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(SignalLinksModel.COL_KEY,  QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(SignalLinksModel.COL_DEF,  QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(SignalLinksModel.COL_EXPR, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(SignalLinksModel.COL_LIVE, QHeaderView.ResizeMode.ResizeToContents)
 
-        hint = QLabel("Double-click a row to edit its expression.")
+        lo.addLayout(self._build_filter_bar())
+        lo.addWidget(self._view)
+
+        hint = QLabel("Double-click Expression to edit · Bool/choice defaults update on click.")
         hint.setObjectName("info")
         lo.addWidget(hint)
 
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(100)
-        self._live_timer.timeout.connect(self._update_live_values)
+        self._live_timer.timeout.connect(self._refresh_live_values)
         self._live_timer.start()
+
+        self._model.itemChanged.connect(self._on_item_changed)
 
         self._rebuild()
 
     def _rebuild(self) -> None:
-        links = self._lm._signal_links
-        self._table.setRowCount(len(links))
-        for r, link in enumerate(links):
-            self._table.setItem(r, 0, _bool_cell(link.enabled))
-            self._table.setItem(r, 1, _cell(link.sink_key))
-            self._table.setItem(r, 2, _cell(link.expression))
-            self._table.setItem(r, 3, _cell(""))
+        self._close_persistent_editors()
+        self._updating = True
+        try:
+            self._model.populate(self._lm, self._pm)
+        finally:
+            self._updating = False
+        self._open_persistent_editors()
 
-    def _update_live_values(self) -> None:
-        if not self._lm._signal_links:
-            return
-        snap = self._lm.source_registry.snapshot()
-        ns = {**_flat_to_ns(snap), **EVAL_MATH_NS, "dt": 0.016, "const": self._lm._const_ns}
-        for r, link in enumerate(self._lm._signal_links):
-            item = self._table.item(r, 3)
-            if item is None:
+    def _close_persistent_editors(self) -> None:
+        for row in range(self._model.rowCount()):
+            proxy_index = self._proxy.mapFromSource(
+                self._model.index(row, SignalLinksModel.COL_DEF)
+            )
+            if proxy_index.isValid() and self._view.isPersistentEditorOpen(proxy_index):
+                self._view.closePersistentEditor(proxy_index)
+
+    def _open_persistent_editors(self) -> None:
+        for key, row in self._model.row_for_key.items():
+            defn = self._pm._defs.get(key)
+            if defn is None:
                 continue
-            if not link.enabled:
-                item.setText("—")
-                continue
-            try:
-                v = eval(link.expression, {"__builtins__": {}}, ns)
-                item.setText(f"{v:.4f}" if isinstance(v, float) else str(v))
-            except Exception:
-                item.setText("err")
+            if defn.type is bool or defn.choices:
+                src_index = self._model.index(row, SignalLinksModel.COL_DEF)
+                proxy_index = self._proxy.mapFromSource(src_index)
+                if proxy_index.isValid():
+                    self._view.openPersistentEditor(proxy_index)
 
-    def _add(self) -> None:
-        dlg = SignalLinkDialog(self._lm, self._pm, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            link = dlg.result_link()
-            if link.sink_key and link.expression:
-                self._lm.add_link(link)
-                self._rebuild()
-                self.changed.emit()
-
-    def _edit(self) -> None:
-        row = self._table.currentRow()
-        if row < 0 or row >= len(self._lm._signal_links):
+    def _refresh_live_values(self) -> None:
+        """Update the Live Value column; skips unchanged cells to suppress repaints."""
+        if not hasattr(self, "_model"):
             return
-        old = self._lm._signal_links[row]
-        dlg = SignalLinkDialog(self._lm, self._pm, link=old, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new = dlg.result_link()
-            if new.expression != old.expression and hasattr(old, "smooth_helper"):
-                old.smooth_helper._states.clear()
-            old.sink_key   = new.sink_key
-            old.expression = new.expression
-            old.enabled    = new.enabled
-            self._rebuild()
+        self._updating = True
+        try:
+            for key, row in self._model.row_for_key.items():
+                try:
+                    new_text = f"{self._pm.get(key):.4f}"
+                except (TypeError, ValueError):
+                    new_text = str(self._pm.get(key))
+                live_item = self._model.item(row, SignalLinksModel.COL_LIVE)
+                if live_item is not None and live_item.text() != new_text:
+                    live_item.setText(new_text)
+        finally:
+            self._updating = False
+
+    # ── Filter bar (layout inserted by Stage 6) ───────────────────────────────
+
+    def _build_filter_bar(self) -> "QHBoxLayout":
+        """Create the filter QLineEdit + ✕ button; returns the row layout for Stage 6."""
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("filter properties…")
+        self._filter_edit.textChanged.connect(self._apply_filter)
+        self._filter_edit.installEventFilter(self)
+
+        clear_btn = QPushButton("✕")
+        clear_btn.setFixedWidth(24)
+        clear_btn.setObjectName("remove")
+        clear_btn.setToolTip("Clear filter")
+        clear_btn.clicked.connect(self._filter_edit.clear)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(self._filter_edit, 1)
+        row.addWidget(clear_btn)
+        return row
+
+    def _apply_filter(self, text: str) -> None:
+        if hasattr(self, "_proxy"):
+            self._proxy.setFilterFixedString(text)
+
+    def eventFilter(self, obj, event) -> bool:
+        if hasattr(self, "_filter_edit") and obj is self._filter_edit:
+            if (event.type() == QEvent.Type.KeyPress
+                    and event.key() == Qt.Key.Key_Escape):
+                self._filter_edit.clear()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ── itemChanged handler (wired to self._model in Stage 6) ────────────────
+
+    def _on_item_changed(self, item: "QStandardItem") -> None:
+        """Commit inline edits from the property-bay table to lm / pm."""
+        if self._updating:
+            return
+
+        col = item.column()
+        row = item.row()
+        key_item = self._model.item(row, SignalLinksModel.COL_KEY)
+        if key_item is None:
+            return
+        key = key_item.text()
+        link_map = {l.sink_key: l for l in self._lm._signal_links}
+
+        if col == SignalLinksModel.COL_EXPR:
+            new_expr = item.text().strip()
+            link     = link_map.get(key)
+            on_item  = self._model.item(row, SignalLinksModel.COL_ON)
+
+            if new_expr:
+                if link:
+                    if new_expr != link.expression and hasattr(link, "smooth_helper"):
+                        link.smooth_helper._states.clear()
+                    link.expression = new_expr
+                else:
+                    self._lm.add_link(
+                        SignalLink(sink_key=key, expression=new_expr, enabled=True)
+                    )
+                self._updating = True
+                on_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                if on_item.checkState() == Qt.CheckState.Unchecked:
+                    on_item.setCheckState(Qt.CheckState.Checked)
+                self._updating = False
+            else:
+                self._lm.remove_link(key)
+                self._lm.apply_baseline(key, self._pm)
+                self._updating = True
+                on_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                )
+                on_item.setCheckState(Qt.CheckState.Unchecked)
+                self._updating = False
+
             self.changed.emit()
 
-    def _remove(self) -> None:
-        row = self._table.currentRow()
-        if row < 0 or row >= len(self._lm._signal_links):
-            return
-        link = self._lm._signal_links[row]
-        self._lm.remove_link(link.sink_key)
-        self._rebuild()
-        self.changed.emit()
+        elif col == SignalLinksModel.COL_DEF:
+            text = item.text().strip()
+            defn = self._pm._defs.get(key)
+
+            val = None
+            parsed = False
+
+            if defn is not None and defn.type is bool:
+                if text.lower() in ("true", "1", "yes", "on"):
+                    val, parsed = True, True
+                elif text.lower() in ("false", "0", "no", "off"):
+                    val, parsed = False, True
+            elif defn is not None and defn.choices and text in [str(c) for c in defn.choices]:
+                val, parsed = text, True
+
+            if not parsed:
+                try:
+                    val = float(text)
+                    parsed = True
+                except ValueError:
+                    pass
+
+            if not parsed:
+                self._updating = True
+                try:
+                    fallback = defn.default if defn is not None else 0.0
+                    stored = self._lm.get_baseline(key, fallback)
+                    if isinstance(stored, bool):
+                        item.setText(str(stored))
+                    else:
+                        try:
+                            item.setText(f"{float(stored):.4f}")
+                        except (TypeError, ValueError):
+                            item.setText(str(stored))
+                finally:
+                    self._updating = False
+                return
+
+            self._lm.set_baseline(key, val)
+            link    = link_map.get(key)
+            on_item = self._model.item(row, SignalLinksModel.COL_ON)
+            if not (link and link.expression) or \
+                    on_item.checkState() == Qt.CheckState.Unchecked:
+                self._pm.set(key, val)
+            self.changed.emit()
+
+        elif col == SignalLinksModel.COL_ON:
+            link = link_map.get(key)
+            if link is None:
+                return
+            if item.checkState() == Qt.CheckState.Checked:
+                link.enabled = True
+            else:
+                link.enabled = False
+                self._lm.apply_baseline(key, self._pm)
+            self.changed.emit()
 
 
 # ── Events (EventLinks + Thresholds) ─────────────────────────────────────────
@@ -735,10 +1017,25 @@ class EventsTab(QWidget):
         rm_el = QPushButton("Remove")
         rm_el.setObjectName("remove")
         rm_el.clicked.connect(self._remove_event_link)
+        midi_btn = QPushButton("+ Midi")
+        midi_btn.setObjectName("add")
+        midi_btn.setToolTip("Wait for the next MIDI note, then open a new event link pre-filled with that event.")
+        midi_btn.clicked.connect(self._capture_midi)
+        key_btn = QPushButton("+ Key")
+        key_btn.setObjectName("add")
+        key_btn.setToolTip("Press a key to create an event link pre-filled with that key event.")
+        key_btn.clicked.connect(self._capture_key)
         tb1.addWidget(add_el)
         tb1.addWidget(edit_el)
         tb1.addWidget(rm_el)
+        tb1.addWidget(midi_btn)
+        tb1.addWidget(key_btn)
         tb1.addStretch()
+
+        self._capture_status = QLabel("")
+        self._capture_status.setObjectName("ok")
+        tb1.addWidget(self._capture_status)
+
         lo.addLayout(tb1)
 
         self._el_table = _make_table(["On", "Event", "Action", "Condition"])
@@ -794,6 +1091,53 @@ class EventsTab(QWidget):
         lo.addWidget(th_hint)
 
         self._rebuild()
+
+    # ── MIDI capture ──────────────────────────────────────────────────────────
+
+    def _capture_midi(self) -> None:
+        try:
+            from midi_input import get_router
+            router = get_router()
+        except Exception:
+            self._capture_status.setText("no MIDI router")
+            return
+
+        self._capture_status.setText("waiting for MIDI…")
+        self._capture_status.setObjectName("info")
+        self._capture_status.style().unpolish(self._capture_status)
+        self._capture_status.style().polish(self._capture_status)
+
+        def _on_event(evt: dict) -> None:
+            if evt.get("type") != "note":
+                return
+            router.remove_listener(_on_event)
+            note = evt["number"]
+            vel  = evt.get("value", 0)
+            event_str = f"midi.note{note}.{'on' if vel > 0 else 'off'}"
+            # Marshal back to Qt thread
+            QTimer.singleShot(0, lambda: self._open_with_event(event_str))
+
+        router.add_listener(_on_event)
+
+    def _capture_key(self) -> None:
+        dlg = _KeyCaptureDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            event_str = dlg.captured_event()
+            if event_str:
+                self._open_with_event(event_str)
+
+    def _open_with_event(self, event_str: str) -> None:
+        self._capture_status.setText("")
+        prefilled = EventLink(event=event_str, action="", enabled=True)
+        dlg = EventLinkDialog(self._lm, self._pm, link=prefilled, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            link = dlg.result_link()
+            if link.event and link.action:
+                self._lm.add_event_link(link)
+                self._rebuild()
+                self.changed.emit()
+
+    # ── rebuild ───────────────────────────────────────────────────────────────
 
     def _rebuild(self) -> None:
         links = self._lm._event_links
@@ -1223,18 +1567,22 @@ class PresetsTab(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LinkManagerPanel(QWidget):
-    """Main panel: tabs for Signal Links, Events, Envelopes, LFOs, Presets, Sources."""
+    """Main panel: tabs for Signal Links, Events, Envelopes, LFOs, Presets, Sources.
+
+    extra_tabs: optional list of (label, widget) pairs appended after the core tabs.
+    """
 
     _STATE_PATH = pathlib.Path(__file__).with_name("link_state.json")
 
     def __init__(self, lm: LinkManager, pm: "PropertyManager",
-                 title: str = "Link Manager", parent=None):
+                 title: str = "Link Manager", parent=None,
+                 extra_tabs: "list[tuple[str, QWidget]] | None" = None):
         super().__init__(parent)
         self._lm = lm
         self._pm = pm
         self.setWindowTitle(title)
         self.setStyleSheet(_STYLESHEET)
-        self.resize(740, 540)
+        self.resize(820, 600)
 
         lo = QVBoxLayout(self)
         lo.setContentsMargins(6, 6, 6, 6)
@@ -1254,6 +1602,10 @@ class LinkManagerPanel(QWidget):
         tabs.addTab(self._lfo_tab,    "LFOs")
         tabs.addTab(self._preset_tab, "Presets")
         tabs.addTab(self._src_tab,    "Sources")
+
+        for label, widget in (extra_tabs or []):
+            tabs.addTab(widget, label)
+
         lo.addWidget(tabs)
 
         # Footer
@@ -1305,6 +1657,15 @@ class LinkManagerPanel(QWidget):
             for tab in (self._sig_tab, self._evt_tab, self._env_tab,
                         self._lfo_tab, self._preset_tab):
                 tab._rebuild()
+            # Push saved baselines into PM for every property that has no active link.
+            # Properties WITH an active enabled link will be overridden by evaluate_links
+            # on the first frame anyway, so it is safe to write all of them here.
+            active_keys = {
+                l.sink_key for l in self._lm._signal_links if l.enabled and l.expression
+            }
+            for prop in self._pm.all_props():
+                if prop.key not in active_keys:
+                    self._lm.apply_baseline(prop.key, self._pm)
             self._status.setText(f"loaded  ({self._STATE_PATH.name})")
         except Exception as exc:
             self._status.setText(f"auto-load error: {exc}")

@@ -55,6 +55,14 @@ _pm: PropertyManager | None = None
 # and read by the GL thread each frame.
 _lm = LinkManager()
 
+# Current palette from ColorPanel — updated by the Qt listener, read by the GL thread
+# at element spawn / regen time.  Simple list assignment is thread-safe in CPython.
+_current_palette: list = []
+
+# Set to True by the Apply button; consumed in on_render() to push the palette to
+# elements without a full regen.  Same pattern as _pending_monitor.
+_pending_palette_apply: bool = False
+
 # Key names tracked for hold-state sources (key.<name>_hold)
 _ALL_KEY_NAMES = (
     "NUMBER_1", "NUMBER_2", "NUMBER_3", "NUMBER_4",
@@ -157,6 +165,10 @@ class MergedGUI(mglw.WindowConfig):
         for eff in self._effects:
             eff.setup(self.ctx, w, h)
 
+        # -- Palette ----------------------------------------------------------
+        if _current_palette:
+            self._apply_palette()
+
         # -- Link manager -----------------------------------------------------
         self.lm = _lm
         self._held_keys: set[str] = set()
@@ -191,24 +203,37 @@ class MergedGUI(mglw.WindowConfig):
     def _active_effect(self):
         return self._effects[self._effect_idx]
 
+    # -- Palette --------------------------------------------------------------
+
+    def _apply_palette(self) -> None:
+        """Push the current module-level palette to all scene elements."""
+        if not _current_palette:
+            return
+        self._circles.set_palette(_current_palette)
+        self._lasers.set_palette(_current_palette)
+        self.nn_graph.set_palette(_current_palette)
+
     # -- Regenerate -----------------------------------------------------------
 
     def _regen_all(self) -> None:
+        self._apply_palette()
         self._circles.regen()
         self._cloud.randomize()
         nn_seed = random.randint(0, 2**31 - 1)
         self.nn_graph.randomize(nn_seed)
-        self._nn.randomize(nn_seed)
         print(f"[merged] regenerated  (nn_seed={nn_seed})")
 
     # -- Per-frame ------------------------------------------------------------
 
     def on_render(self, current_time: float, frame_time: float):
 
-        global _pending_monitor
+        global _pending_monitor, _pending_palette_apply
         if _pending_monitor is not None:
             apply_fullscreen_to_monitor(self.wnd, _pending_monitor)
             _pending_monitor = None
+        if _pending_palette_apply:
+            self._apply_palette()
+            _pending_palette_apply = False
 
         self.time += frame_time
 
@@ -402,7 +427,7 @@ if __name__ == "__main__":
             widget.setGeometry(g["x"], g["y"], g["w"], g["h"])
 
     def _run_qt() -> None:
-        """Single Qt thread — one QApplication, both panels."""
+        """Single Qt thread — one QApplication, one combined control panel."""
         app = QApplication.instance() or QApplication([])
 
         saved = _load_positions()
@@ -419,45 +444,45 @@ if __name__ == "__main__":
             title="MergedGUI Params",
             on_monitor_change=lambda idx: globals().__setitem__('_pending_monitor', idx),
         )
-        _restore_geometry(dlg, saved, "ParamDialog")
-        dlg.show()
 
-        # MidiPanel now uses PropertyManager directly.
-        # _pm initially has feedback + scene; element sections (nn_graph, lasers,
-        # circles) are added to the same object when MergedGUI.__init__ runs.
         midi = MidiPanel(_router, title="MIDI Input",
                          source_registry=_lm.source_registry,
                          event_bus=_lm.event_bus)
-        _restore_geometry(midi, saved, "MidiPanel")
-        midi.show()
 
-        # AudioPanel owns the single audio stream; _circles_audio_fns is
-        # populated by MergedGUI.__init__ so circles receive audio even though
-        # the GL window starts after this Qt thread.
         audio = AudioPanel(
             title           = "Audio Input",
             extra_on_frame  = lambda m: [fn(m) for fn in _circles_audio_fns],
             source_registry = _lm.source_registry,
         )
-        _restore_geometry(audio, saved, "AudioPanel")
-        audio.show()
 
         from color_panel import ColorPanel
-        colors = ColorPanel(title="Color Harmony")
-        _restore_geometry(colors, saved, "ColorPanel")
-        colors.show()
+
+        def _on_palette_change(palette: list) -> None:
+            global _current_palette
+            _current_palette = palette
+
+        def _on_palette_apply(palette: list) -> None:
+            global _current_palette, _pending_palette_apply
+            _current_palette = palette
+            _pending_palette_apply = True
+
+        colors = ColorPanel(title="Color Harmony", on_change=_on_palette_change, on_apply=_on_palette_apply)
 
         from link_panel import LinkManagerPanel
-        links = LinkManagerPanel(_lm, _pm, title="Link Manager")
-        _restore_geometry(links, saved, "LinkManagerPanel")
+        links = LinkManagerPanel(
+            _lm, _pm,
+            title="Warp Controls",
+            extra_tabs=[
+                ("Params", dlg),
+                ("MIDI",   midi),
+                ("Audio",  audio),
+                ("Colors", colors),
+            ],
+        )
+        _restore_geometry(links, saved, "ControlPanel")
         links.show()
 
-        _qt_windows = {
-            "ParamDialog": dlg, "MidiPanel": midi,
-            "AudioPanel": audio, "ColorPanel": colors,
-            "LinkManagerPanel": links,
-        }
-        app.aboutToQuit.connect(lambda: _save_positions(_qt_windows))
+        app.aboutToQuit.connect(lambda: _save_positions({"ControlPanel": links}))
 
         app.exec()
 

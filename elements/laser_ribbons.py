@@ -187,6 +187,9 @@ class LaserRibbons:
         self.spawn_spread   = SPAWN_SPREAD
         self.max_dist       = MAX_DIST
 
+        # Active spawn palette — updated by set_palette(); defaults to the neon set
+        self._palette = _PALETTE.copy()
+
         # CPU shadow arrays (source of truth for spawning)
         n = MAX_RIBBONS
         self._np_pos   = np.zeros((n, 3), dtype=np.float32)
@@ -256,17 +259,23 @@ class LaserRibbons:
         # Velocity: strictly in the forward direction frozen at birth
         spawn_vel = cam_forward * self.ribbon_speed
 
-        color_idx = int(self._rng.integers(0, len(_PALETTE)))
+        color_idx = int(self._rng.integers(0, len(self._palette)))
 
         self._np_pos[slot]   = spawn_pos
         self._np_vel[slot]   = spawn_vel
-        self._np_col[slot]   = _PALETTE[color_idx]
+        self._np_col[slot]   = self._palette[color_idx]
         self._np_alive[slot] = 1
         self._np_dist[slot]  = 0.0
 
         self._sync_to_warp()
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_palette(self, palette: list) -> None:
+        """Replace the spawn colour palette with the given RGB list."""
+        self._palette = np.array(
+            [[r, g, b, 1.0] for r, g, b in palette], dtype=np.float32
+        )
 
     def step(
         self,

@@ -256,6 +256,7 @@ def build_geometry(
     blade_size_factor: float      = BLADE_SIZE_FACTOR,
     bound            : float      = BOUND,
     seed             : int | None = None,
+    palette          : list | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list, list]:
     """
     Returns (verts, colors, indices, circle_metas, trav_metas).
@@ -267,8 +268,13 @@ def build_geometry(
     rng = np.random.default_rng(seed)
     pseed = int(seed) if seed is not None else 0
 
-    cool = generate_palette(ColorScheme.TRIADIC,       seed=pseed)
-    warm = generate_palette(ColorScheme.COMPLEMENTARY, seed=pseed + 13)
+    if palette and len(palette) >= 1:
+        mid  = max(1, len(palette) // 2)
+        cool = palette[:mid] if mid > 0 else palette
+        warm = palette[mid:] if palette[mid:] else palette
+    else:
+        cool = generate_palette(ColorScheme.TRIADIC,       seed=pseed)
+        warm = generate_palette(ColorScheme.COMPLEMENTARY, seed=pseed + 13)
     cool_hs = [colorsys.rgb_to_hsv(*rgb)[:2] for rgb in cool]
     warm_hs = [colorsys.rgb_to_hsv(*rgb)[:2] for rgb in warm]
 
@@ -421,6 +427,9 @@ class CircleAxisDrawing:
         self.blade_size_factor = BLADE_SIZE_FACTOR
         self.blade_spin_speed  = BLADE_SPIN_SPEED
 
+        # Current colour palette — set via set_palette(); used by regen() and _spawn_emit()
+        self._palette: list = []
+
         # Emitted circle pool
         self._rng          = np.random.default_rng()
         self._emit_pool:   list[EmitCircle | None] = [None] * MAX_EMIT_CIRCLES
@@ -434,6 +443,10 @@ class CircleAxisDrawing:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_palette(self, palette: list) -> None:
+        """Store the colour palette; takes effect on the next regen() call."""
+        self._palette = list(palette)
 
     def update_audio(self, m: audio_metrics.AudioMetrics) -> None:
         """Receive a fresh AudioMetrics value to drive animation parameters."""
@@ -449,6 +462,7 @@ class CircleAxisDrawing:
             n_blades    = self.n_blades,
             blade_size_factor = self.blade_size_factor,
             seed        = self._seed,
+            palette     = self._palette or None,
         )
         self._geo.setup(verts, colors, idx)
         self._circle_metas = circle_metas
@@ -549,7 +563,11 @@ class CircleAxisDrawing:
 
         cx     = float(self._rng.uniform(-BOUND * 0.85, BOUND * 0.85))
         radius = float(self._rng.uniform(EMIT_RADIUS_MIN, EMIT_RADIUS_MAX))
-        hue    = float(self._rng.uniform(0.0, 1.0))
+        if self._palette:
+            rgb = self._palette[int(self._rng.integers(0, len(self._palette)))]
+            hue = colorsys.rgb_to_hsv(*rgb)[0]
+        else:
+            hue = float(self._rng.uniform(0.0, 1.0))
         self._emit_pool[slot] = EmitCircle(cx=cx, radius=radius, birth=t, hue=hue)
 
     @staticmethod

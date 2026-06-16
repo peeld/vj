@@ -561,6 +561,10 @@ class LinkManager:
         # Preset triggers: EventLinks that survive preset switches
         self._preset_triggers : list[EventLink]  = []
 
+        # Baseline values: persistent per-property floats written to PM when an
+        # expression is disabled or cleared.  Intentionally NOT cleared by clear_state().
+        self._baselines: dict[str, float] = {}
+
     # ── SignalLink management ─────────────────────────────────────────────────
 
     def add_link(self, link: SignalLink) -> None:
@@ -581,6 +585,20 @@ class LinkManager:
         for link in self._signal_links:
             if link.sink_key == sink_key:
                 link.enabled = False
+
+    # ── Baseline management ───────────────────────────────────────────────────
+
+    def set_baseline(self, key: str, val: Any) -> None:
+        self._baselines[key] = val
+
+    def get_baseline(self, key: str, fallback: Any) -> Any:
+        return self._baselines.get(key, fallback)
+
+    def apply_baseline(self, key: str, pm: Any) -> None:
+        """Write the stored baseline for key to pm; uses pm's property default if none set."""
+        defn = pm._defs.get(key)
+        prop_default = defn.default if defn is not None else 0.0
+        pm.set(key, self.get_baseline(key, prop_default))
 
     # ── Per-frame evaluation ──────────────────────────────────────────────────
 
@@ -689,7 +707,8 @@ class LinkManager:
     def clear_state(self) -> None:
         """Remove all routing state: links, envelopes, LFOs, event links, thresholds.
 
-        Does NOT touch _presets or _preset_triggers.
+        Does NOT touch _presets, _preset_triggers, or _baselines.  Baselines are a
+        persistent property overlay and must survive preset switches and state reloads.
         """
         self._signal_links.clear()
         for name in list(self._envelopes):
@@ -714,6 +733,7 @@ class LinkManager:
             "lfos"            : [d.to_dict() for d in self._lfo_defs],
             "event_links"     : [l.to_dict() for l in self._event_links],
             "thresholds"      : [d.to_dict() for d in self._threshold_defs],
+            "baselines"       : dict(self._baselines),
             "presets"         : self._presets,
             "preset_triggers" : [l.to_dict() for l in self._preset_triggers],
         }
@@ -740,6 +760,7 @@ class LinkManager:
             self.add_event_link(EventLink.from_dict(d))
         for d in data.get("thresholds", []):
             self.add_threshold(ThresholdDef.from_dict(d))
+        self._baselines.update(data.get("baselines", {}))
         for name, snap in data.get("presets", {}).items():
             self._presets[name] = snap
         for d in data.get("preset_triggers", []):

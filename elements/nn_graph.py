@@ -272,6 +272,15 @@ class NNGraph:
         self._dfs_visited:    set               = set()
         self._building:       bool              = False
 
+        # Colour palette — applied to node colours on next randomize()
+        self._palette: list = []
+
+    # -- Palette API ----------------------------------------------------------
+
+    def set_palette(self, palette: list) -> None:
+        """Store a colour palette; applied to node colours on the next randomize()."""
+        self._palette = list(palette)
+
     # -- Activation API -------------------------------------------------------
 
     def is_active(self) -> bool:
@@ -378,6 +387,10 @@ class NNGraph:
             inputs=[self._wp_pos, self._wp_base_pos, self._wp_col, seed],
             device=self._device,
         )
+        if self._palette:
+            pal = np.array([[r, g, b, 1.0] for r, g, b in self._palette], dtype=np.float32)
+            colors = np.tile(pal, (N // len(pal) + 1, 1))[:N].astype(np.float32)
+            self._wp_col = wp.array(colors, dtype=wp.vec4, device=self._device)
         self._visibility[:]  = 0.0
         self._build_path     = []
         self._build_path_set = set()

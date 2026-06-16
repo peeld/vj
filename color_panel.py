@@ -100,6 +100,8 @@ QPushButton:hover   { background-color: #32323f; border-color: #5eaeff; }
 QPushButton:pressed { background-color: #1a1a28; }
 QPushButton#gen     { color: #7ec87e; border-color: #3a5a3a; }
 QPushButton#gen:hover { border-color: #7ec87e; }
+QPushButton#apply   { color: #5eaeff; border-color: #2a4070; }
+QPushButton#apply:hover { border-color: #5eaeff; }
 QPushButton#rnd     { color: #ffb347; border-color: #5a4a1a; min-width: 28px; padding: 3px 6px; }
 QPushButton#rnd:hover { border-color: #ffb347; }
 QPushButton#lock    { min-width: 20px; padding: 2px 5px; color: #707078;
@@ -351,12 +353,14 @@ class ColorPanel(QWidget):
     def __init__(
         self,
         on_change: Optional[Callable[[list[RGB]], None]] = None,
+        on_apply : Optional[Callable[[list[RGB]], None]] = None,
         title    : str = "Color Harmony",
     ):
         super().__init__()
-        self._listeners: list[Callable[[list[RGB]], None]] = []
-        self._palette:   list[RGB] = []
-        self._slots:     list[_ColorSlot] = []
+        self._listeners:      list[Callable[[list[RGB]], None]] = []
+        self._apply_listener: Optional[Callable[[list[RGB]], None]] = on_apply
+        self._palette:        list[RGB] = []
+        self._slots:          list[_ColorSlot] = []
 
         self.setWindowTitle(title)
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
@@ -368,6 +372,8 @@ class ColorPanel(QWidget):
 
         if on_change is not None:
             self.add_change_listener(on_change)
+        if on_apply is not None:
+            self._apply_listener = on_apply
 
         # Generate initial palette
         self._generate()
@@ -455,7 +461,7 @@ class ColorPanel(QWidget):
         root.addWidget(_sep())
         root.addLayout(self._build_range_row("lit", DEFAULT_LIT))
 
-        # ── Generate button ───────────────────────────────────────────────────
+        # ── Generate / Apply buttons ──────────────────────────────────────────
         root.addSpacing(6)
         gen_row = QHBoxLayout()
         gen_row.addStretch()
@@ -463,6 +469,11 @@ class ColorPanel(QWidget):
         self._gen_btn.setObjectName("gen")
         self._gen_btn.clicked.connect(self._generate)
         gen_row.addWidget(self._gen_btn)
+        self._apply_btn = QPushButton("Apply")
+        self._apply_btn.setObjectName("apply")
+        self._apply_btn.setToolTip("Push this palette to scene elements (new spawns only, no regen)")
+        self._apply_btn.clicked.connect(self._on_apply_clicked)
+        gen_row.addWidget(self._apply_btn)
         root.addLayout(gen_row)
 
         # ── Palette swatches ──────────────────────────────────────────────────
@@ -618,6 +629,13 @@ class ColorPanel(QWidget):
                 print(f"[color_panel] listener error: {exc}")
 
     # ── slots ─────────────────────────────────────────────────────────────────
+
+    def _on_apply_clicked(self) -> None:
+        if self._apply_listener is not None:
+            try:
+                self._apply_listener(list(self._palette))
+            except Exception as exc:
+                print(f"[color_panel] apply error: {exc}")
 
     def _on_slot_color_changed(self, index: int, color: RGB) -> None:
         if index < len(self._palette):
