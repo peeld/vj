@@ -286,7 +286,10 @@ class ElementsPanel(QWidget):
         for item in snap:
             row = self._rows.get(item["name"])
             if row is not None:
-                row.set_visible_checked(item["visible"])
+                value = item["visible"]
+                if isinstance(value, float):
+                    value = value > 0.5
+                row.set_visible_checked(value)
 
     def _rebuild_rows(self, snap: list[dict]) -> None:
         while self._row_layout.count() > 1:
@@ -296,7 +299,10 @@ class ElementsPanel(QWidget):
         self._rows.clear()
 
         for i, entry in enumerate(snap):
-            row = _ElementRow(entry["name"], entry["kind"], entry["visible"], parent=self._row_container)
+            visible = entry["visible"]
+            if isinstance(visible, float):
+                visible = visible > 0.5
+            row = _ElementRow(entry["name"], entry["kind"], visible, parent=self._row_container)
             row.visibility_changed.connect(self._on_row_visibility_changed)
             row.remove_clicked.connect(self._on_row_remove)
             self._rows[entry["name"]] = row

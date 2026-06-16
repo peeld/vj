@@ -321,7 +321,6 @@ class NNGraph(DrawingElement):
         The hard-reset ensures that visibility entries indexed against the
         *previous* snapshot cannot corrupt the new one.
         """
-        print('ACTIVATE')
 
         # Zero out all in-progress visibility so old slot indices don't bleed
         # into the new snapshot's slot assignments.
@@ -356,7 +355,6 @@ class NNGraph(DrawingElement):
 
     def deactivate(self) -> None:
         """Stop building; queue the current path for FIFO unwinding."""
-        print('deactivate')
         self._building = False
         if self._build_path:
             self._unwind_queue   = self._build_path + self._unwind_queue
