@@ -502,7 +502,7 @@ def build_default_manager(
 
         R(PropDef(f"{_C}.n_circles",         _C, "n_circles",         "Circle Count",
                   int,   24,    4,    64,    1,
-                  description="Number of animated circle ribbons (requires regen)"),
+                  description="Max simultaneous spawned circle+blade ribbons (requires regen)"),
           circles, "n_circles")
 
         R(PropDef(f"{_C}.n_trav_lines",      _C, "n_trav_lines",      "Traversal Lines",
@@ -524,5 +524,10 @@ def build_default_manager(
                   float, 0.125, 0.02, 0.4,   0.005,
                   description="Blade side length as a fraction of circle radius"),
           circles, "blade_size_factor")
+
+        R(PropDef(f"{_C}.amplitude",         _C, "amplitude",         "Drift Amplitude",
+                  float, 1.0,   0.0,  100.0,   0.05,
+                  description="Global multiplier on each circle's sinusoidal drift amplitude (drivable via Link Manager expressions)"),
+          circles, "amplitude")
 
     return pm

@@ -3,8 +3,8 @@ elements/circleaxis.py - CircleAxisDrawing
 Geometry, animation, and draw logic for the circle-axis scene.
 
 Exports:
-  build_geometry(n_circles, bound, seed) -> (verts, colors, indices, circle_metas, trav_metas)
-  CircleAxisDrawing(ctx)                 -> drawable scene object
+  build_geometry(n_trav_lines, bound, seed) -> (verts, colors, indices, trav_metas)
+  CircleAxisDrawing(ctx)                    -> drawable scene object
 """
 
 import colorsys
@@ -16,17 +16,14 @@ import moderngl
 from drawlib.drawable import RibbonDrawable
 from color_harmony import ColorScheme, generate_palette
 
-import audio_metrics
-
 # ---------------------------------------------------------------------------
 # Scene constants
 # ---------------------------------------------------------------------------
 
 BOUND          = 1.0
-N_CIRCLES      = 24
+N_CIRCLES      = 24    # max simultaneous spawned circle+blade entities (pool size)
 N_SEG          = 90    # segments per circle arc
 N_TRAV_LINES   = 35    # diagonal traversal lines
-CIRCLE_HALF_W  = 0.0045
 LINE_HALF_W    = 0.0022
 
 # Turbine blade constants
@@ -34,15 +31,14 @@ N_BLADES          = 64      # squares per circle
 BLADE_SIZE_FACTOR = 0.125   # blade side = radius * this
 BLADE_SPIN_SPEED  = 0.2     # radians / second
 
-# Emitted circle constants
-MAX_EMIT_CIRCLES = 24       # pool size
-EMIT_LIFETIME    = 3.5      # seconds before an emitted circle is gone
+# Spawned circle+blade constants
+EMIT_LIFETIME    = 3.5      # seconds before a spawned circle is gone
 EMIT_FADE_IN     = 0.25     # seconds to fade in
 EMIT_FADE_OUT    = 1.8      # seconds to dissolve out
 EMIT_INTERVAL    = 0.30     # seconds between spawns when active
 EMIT_RADIUS_MIN  = 0.04
 EMIT_RADIUS_MAX  = 0.75
-EMIT_HALF_W      = 0.006    # ribbon half-width for emitted circles
+EMIT_HALF_W      = 0.006    # ribbon half-width for spawned circles
 
 
 # ---------------------------------------------------------------------------
@@ -216,17 +212,6 @@ def _blade_positions(
 # ---------------------------------------------------------------------------
 
 @dataclass
-class CircleAnimMeta:
-    cx:            float
-    radius:        float
-    phase:         float
-    speed:         float
-    amplitude:     float
-    n_verts:       int     # ribbon vertex count for this circle
-    n_blade_verts: int     # = N_BLADES * 4
-
-
-@dataclass
 class TravAnimMeta:
     x1:        float
     x2:        float
@@ -239,10 +224,13 @@ class TravAnimMeta:
 
 @dataclass
 class EmitCircle:
-    cx:     float
-    radius: float
-    birth:  float   # absolute time of spawn
-    hue:    float   # HSV hue for colour
+    cx:        float
+    radius:    float
+    birth:     float   # absolute time of spawn
+    hue:       float   # HSV hue for colour
+    phase:     float   # drift phase
+    speed:     float   # drift base speed
+    amplitude: float   # this circle's own drift-amplitude factor (combined with self.amplitude)
 
 
 # ---------------------------------------------------------------------------
@@ -250,32 +238,24 @@ class EmitCircle:
 # ---------------------------------------------------------------------------
 
 def build_geometry(
-    n_circles        : int        = N_CIRCLES,
     n_trav_lines     : int        = N_TRAV_LINES,
-    n_blades         : int        = N_BLADES,
-    blade_size_factor: float      = BLADE_SIZE_FACTOR,
     bound            : float      = BOUND,
     seed             : int | None = None,
     palette          : list | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list, list]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
     """
-    Returns (verts, colors, indices, circle_metas, trav_metas).
+    Returns (verts, colors, indices, trav_metas).
 
-    Vertex layout (must match CircleAxisDrawing._animated_positions exactly):
-      for each circle:  [circle ribbon verts]  [blade quad verts]
-      for each trav:    [line ribbon verts]
+    Builds only the diagonal traversal lines -- circles and their turbine
+    blades are spawned at runtime by CircleAxisDrawing's emit pool instead.
     """
     rng = np.random.default_rng(seed)
     pseed = int(seed) if seed is not None else 0
 
     if palette and len(palette) >= 1:
-        mid  = max(1, len(palette) // 2)
-        cool = palette[:mid] if mid > 0 else palette
-        warm = palette[mid:] if palette[mid:] else palette
+        warm = palette
     else:
-        cool = generate_palette(ColorScheme.TRIADIC,       seed=pseed)
         warm = generate_palette(ColorScheme.COMPLEMENTARY, seed=pseed + 13)
-    cool_hs = [colorsys.rgb_to_hsv(*rgb)[:2] for rgb in cool]
     warm_hs = [colorsys.rgb_to_hsv(*rgb)[:2] for rgb in warm]
 
     all_verts:  list[np.ndarray] = []
@@ -292,66 +272,6 @@ def build_geometry(
         all_colors.append(c)
         all_idx.append(ix)
         vert_offset += v.shape[0]
-
-    circle_metas: list[CircleAnimMeta] = []
-
-    for ci in range(n_circles):
-        cx     = float(rng.uniform(-bound * 0.88, bound * 0.88))
-        radius = float(rng.uniform(0.04, bound * 0.88))
-
-        phase     = float(rng.uniform(0.0, 2.0 * np.pi))
-        speed     = float(rng.uniform(0.08, 0.28))
-        amplitude = float(rng.uniform(0.04, 0.22))
-
-        bh, bs = cool_hs[ci % len(cool_hs)]
-        bh = (bh + ci * 0.041) % 1.0
-
-        pts = _circle_pts(cx, radius, N_SEG)
-        t   = np.linspace(0.0, 1.0, len(pts), dtype=np.float32)
-        cols = np.stack([
-            _hsv((bh + ti * 0.10) % 1.0, max(0.55, bs), 0.40 + 0.60 * ti)
-            for ti in t
-        ])
-        add_ribbon(pts, cols, CIRCLE_HALF_W)
-
-        blade_verts_init = _blade_positions(cx, radius, 0.0,
-                                              n_blades=n_blades,
-                                              blade_size_factor=blade_size_factor)
-
-        bi_arr  = np.arange(n_blades, dtype=np.float32)
-        phi_arr = 2.0 * np.pi * bi_arr / n_blades
-        face_alpha = (np.abs(np.sin(phi_arr)) * 0.35 + 0.65).astype(np.float32)
-
-        blade_colors = np.zeros((n_blades * 4, 4), dtype=np.float32)
-        for bi in range(n_blades):
-            blade_frac = bi / n_blades
-            col = _hsv(
-                (bh + blade_frac * 0.12) % 1.0,
-                min(1.0, bs + 0.15),
-                0.75 + 0.25 * blade_frac,
-                float(face_alpha[bi] * 0.1),
-            )
-            blade_colors[bi * 4 : bi * 4 + 4] = col
-
-        blade_idx = np.zeros(n_blades * 6, dtype=np.uint32)
-        for bi in range(n_blades):
-            base = vert_offset + bi * 4
-            o    = bi * 6
-            blade_idx[o]   = base;     blade_idx[o+1] = base + 1
-            blade_idx[o+2] = base + 2; blade_idx[o+3] = base
-            blade_idx[o+4] = base + 2; blade_idx[o+5] = base + 3
-
-        all_verts.append(blade_verts_init)
-        all_colors.append(blade_colors)
-        all_idx.append(blade_idx)
-        vert_offset += n_blades * 4
-
-        circle_metas.append(CircleAnimMeta(
-            cx=cx, radius=radius,
-            phase=phase, speed=speed, amplitude=amplitude,
-            n_verts=(N_SEG + 1) * 2,
-            n_blade_verts=n_blades * 4,
-        ))
 
     trav_metas: list[TravAnimMeta] = []
 
@@ -386,11 +306,18 @@ def build_geometry(
             phase=phase, speed=speed, amplitude=amplitude,
         ))
 
+    if not all_verts:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0,), dtype=np.uint32),
+            trav_metas,
+        )
+
     return (
         np.vstack(all_verts).astype(np.float32),
         np.vstack(all_colors).astype(np.float32),
         np.concatenate(all_idx).astype(np.uint32),
-        circle_metas,
         trav_metas,
     )
 
@@ -403,9 +330,13 @@ class CircleAxisDrawing:
     """
     Encapsulates all geometry, animation, and draw calls for the circle-axis scene.
 
+    Circles and their turbine blades are spawned/dissolved as a pool (like
+    particles) while the element is active; traversal lines are a separate,
+    always-drawn persistent layer.
+
     Usage:
         drawing = CircleAxisDrawing(ctx)
-        drawing.update_audio(metrics)          # call from audio callback
+        drawing.amplitude = ...                # drive via LinkManager expression
         drawing.draw(mvp, current_time)        # call each frame
         drawing.on_key(key, action, keys)      # returns True if key was consumed
     """
@@ -413,30 +344,30 @@ class CircleAxisDrawing:
     def __init__(self, ctx: moderngl.Context):
         self._ctx = ctx
         self._seed = 0
-        self._geo: RibbonDrawable | None = None
-        self._circle_metas: list[CircleAnimMeta] = []
-        self._trav_metas:   list[TravAnimMeta]   = []
-        self._audio_data:   audio_metrics.AudioMetrics | None = None
+        self._geo: RibbonDrawable | None = None        # traversal lines only
+        self._trav_metas: list[TravAnimMeta] = []
 
         # Tuneable instance attributes (PropertyManager binds to these;
         # n_circles / n_trav_lines / n_blades / blade_size_factor take effect
-        # on the next regen(); blade_spin_speed is applied every frame).
-        self.n_circles        = N_CIRCLES
-        self.n_trav_lines     = N_TRAV_LINES
-        self.n_blades         = N_BLADES
+        # on the next regen(); blade_spin_speed and amplitude are applied every
+        # frame, so amplitude can be driven live by LinkManager expressions).
+        self.n_circles         = N_CIRCLES     # max simultaneous spawned circle+blade entities
+        self.n_trav_lines      = N_TRAV_LINES
+        self.n_blades          = N_BLADES
         self.blade_size_factor = BLADE_SIZE_FACTOR
         self.blade_spin_speed  = BLADE_SPIN_SPEED
+        self.amplitude         = 1.0   # global multiplier on each spawned circle's drift amplitude
 
         # Current colour palette — set via set_palette(); used by regen() and _spawn_emit()
         self._palette: list = []
 
-        # Emitted circle pool
-        self._rng          = np.random.default_rng()
-        self._emit_pool:   list[EmitCircle | None] = [None] * MAX_EMIT_CIRCLES
+        # Spawned circle+blade pool
+        self._rng             = np.random.default_rng()
+        self._emit_pool:   list[EmitCircle | None] = []
         self._spawn_timer  = 0.0
-        self._emit_geo     = RibbonDrawable(ctx)
-        self._emit_geo_ready = False
-        self._init_emit_geo()
+        self._emit_geo        = RibbonDrawable(ctx)
+        self._emit_geo_ready  = False
+        self._verts_per_slot  = 0
 
         self.regen()
 
@@ -448,27 +379,23 @@ class CircleAxisDrawing:
         """Store the colour palette; takes effect on the next regen() call."""
         self._palette = list(palette)
 
-    def update_audio(self, m: audio_metrics.AudioMetrics) -> None:
-        """Receive a fresh AudioMetrics value to drive animation parameters."""
-        self._audio_data = m
-
     def regen(self) -> None:
         """Rebuild geometry with the next seed, using current instance settings."""
         if self._geo is None:
             self._geo = RibbonDrawable(self._ctx)
-        verts, colors, idx, circle_metas, trav_metas = build_geometry(
-            n_circles   = self.n_circles,
+        verts, colors, idx, trav_metas = build_geometry(
             n_trav_lines= self.n_trav_lines,
-            n_blades    = self.n_blades,
-            blade_size_factor = self.blade_size_factor,
             seed        = self._seed,
             palette     = self._palette or None,
         )
-        self._geo.setup(verts, colors, idx)
-        self._circle_metas = circle_metas
-        self._trav_metas   = trav_metas
+        self._trav_metas = trav_metas
+        if len(trav_metas) > 0:
+            self._geo.setup(verts, colors, idx)
+
+        self._init_emit_geo()
+
         print(f"[circleaxis] geometry generated  (seed={self._seed}  "
-              f"circles={self.n_circles}  trav={self.n_trav_lines}  "
+              f"circle_slots={self.n_circles}  trav={self.n_trav_lines}  "
               f"blades={self.n_blades})")
         self._seed += 1
 
@@ -485,7 +412,7 @@ class CircleAxisDrawing:
         return False
 
     def step(self, dt: float, t: float, enabled: bool) -> None:
-        """Advance emitted circle pool: age out dead circles, spawn new ones when active."""
+        """Advance the circle+blade pool: age out dead entries, spawn new ones when active."""
         # Age out expired circles
         for i, ec in enumerate(self._emit_pool):
             if ec is not None and (t - ec.birth) >= EMIT_LIFETIME:
@@ -501,57 +428,77 @@ class CircleAxisDrawing:
             self._spawn_timer = 0.0
 
     def draw(self, mvp: np.ndarray, t: float) -> None:
-        """Update animated positions and issue the draw call."""
-        # Base geometry is kept alive for animation state but not drawn;
-        # only emitted circles render so the element is empty when inactive.
-        new_verts = self._animated_positions(t)
-        self._geo.update(vertices=new_verts)
+        """Update animated positions and issue the draw calls."""
+        # Traversal lines: always-on persistent layer.
+        if self._trav_metas:
+            trav_verts = self._animated_trav_positions(t)
+            self._geo.update(vertices=trav_verts)
+            self._geo.draw(mvp)
 
-        # Draw emitted circles (always, so they dissolve even after deactivation)
+        # Spawned circles + blades (drawn always, so they finish dissolving
+        # even after deactivation).
         self._update_emit_geo(t)
         self._ctx.blend_func = moderngl.ONE, moderngl.ONE
         self._emit_geo.draw(mvp)
         self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
     # ------------------------------------------------------------------
-    # Emitted circle helpers
+    # Spawned circle+blade pool helpers
     # ------------------------------------------------------------------
 
     def _init_emit_geo(self) -> None:
-        """Pre-allocate fixed-size GPU buffers for the emitted circle pool."""
-        verts_per_circle = (N_SEG + 1) * 2
-        idx_per_circle   = N_SEG * 6
+        """(Re)allocate fixed-size GPU buffers for the circle+blade spawn pool."""
+        verts_per_ring   = (N_SEG + 1) * 2
+        idx_per_ring     = N_SEG * 6
+        verts_per_blades = self.n_blades * 4
+        idx_per_blades   = self.n_blades * 6
+        verts_per_slot   = verts_per_ring + verts_per_blades
+        idx_per_slot     = idx_per_ring + idx_per_blades
 
-        n_verts = MAX_EMIT_CIRCLES * verts_per_circle
-        n_idx   = MAX_EMIT_CIRCLES * idx_per_circle
+        n_slots = self.n_circles
+        n_verts = n_slots * verts_per_slot
+        n_idx   = n_slots * idx_per_slot
 
         verts  = np.zeros((n_verts, 3), dtype=np.float32)
         colors = np.zeros((n_verts, 4), dtype=np.float32)
 
-        # Build indices once — they never change, only positions/colors update
         all_idx = np.zeros(n_idx, dtype=np.uint32)
         seg_i = np.arange(N_SEG, dtype=np.uint32)
-        for slot in range(MAX_EMIT_CIRCLES):
-            v_base = slot * verts_per_circle
-            i_base = slot * idx_per_circle
+        for slot in range(n_slots):
+            v_base = slot * verts_per_slot
+            i_base = slot * idx_per_slot
+
             v0 = v_base + 2 * seg_i
             v1 = v_base + 2 * seg_i + 1
             v2 = v_base + 2 * seg_i + 2
             v3 = v_base + 2 * seg_i + 3
-            slot_idx = np.empty(idx_per_circle, dtype=np.uint32)
-            slot_idx[0::6] = v0;  slot_idx[1::6] = v1;  slot_idx[2::6] = v3
-            slot_idx[3::6] = v0;  slot_idx[4::6] = v3;  slot_idx[5::6] = v2
-            all_idx[i_base:i_base + idx_per_circle] = slot_idx
+            ring_idx = np.empty(idx_per_ring, dtype=np.uint32)
+            ring_idx[0::6] = v0;  ring_idx[1::6] = v1;  ring_idx[2::6] = v3
+            ring_idx[3::6] = v0;  ring_idx[4::6] = v3;  ring_idx[5::6] = v2
+            all_idx[i_base : i_base + idx_per_ring] = ring_idx
 
+            blade_v_base = v_base + verts_per_ring
+            blade_i_base = i_base + idx_per_ring
+            for bi in range(self.n_blades):
+                base = blade_v_base + bi * 4
+                o    = blade_i_base + bi * 6
+                all_idx[o]   = base;     all_idx[o+1] = base + 1
+                all_idx[o+2] = base + 2; all_idx[o+3] = base
+                all_idx[o+4] = base + 2; all_idx[o+5] = base + 3
+
+        if self._emit_geo_ready:
+            self._emit_geo.release()
+        self._emit_geo = RibbonDrawable(self._ctx)
         self._emit_geo.setup(verts, colors, all_idx)
         self._emit_geo_ready = True
 
+        self._verts_per_slot = verts_per_slot
+        self._emit_pool = [None] * n_slots
+
     def _spawn_emit(self, t: float) -> None:
-        """Place a new emitted circle into a free pool slot (or oldest)."""
-        # Find a free slot
+        """Place a new circle+blade entity into a free pool slot (or evict the oldest)."""
         slot = next((i for i, ec in enumerate(self._emit_pool) if ec is None), None)
         if slot is None:
-            # Evict the oldest
             oldest_age = -1.0
             slot = 0
             for i, ec in enumerate(self._emit_pool):
@@ -561,14 +508,20 @@ class CircleAxisDrawing:
                         oldest_age = age
                         slot = i
 
-        cx     = float(self._rng.uniform(-BOUND * 0.85, BOUND * 0.85))
-        radius = float(self._rng.uniform(EMIT_RADIUS_MIN, EMIT_RADIUS_MAX))
+        cx        = float(self._rng.uniform(-BOUND * 0.85, BOUND * 0.85))
+        radius    = float(self._rng.uniform(EMIT_RADIUS_MIN, EMIT_RADIUS_MAX))
+        phase     = float(self._rng.uniform(0.0, 2.0 * np.pi))
+        speed     = float(self._rng.uniform(0.08, 0.28))
+        amplitude = float(self._rng.uniform(0.04, 0.22))
         if self._palette:
             rgb = self._palette[int(self._rng.integers(0, len(self._palette)))]
             hue = colorsys.rgb_to_hsv(*rgb)[0]
         else:
             hue = float(self._rng.uniform(0.0, 1.0))
-        self._emit_pool[slot] = EmitCircle(cx=cx, radius=radius, birth=t, hue=hue)
+        self._emit_pool[slot] = EmitCircle(
+            cx=cx, radius=radius, birth=t, hue=hue,
+            phase=phase, speed=speed, amplitude=amplitude,
+        )
 
     @staticmethod
     def _emit_alpha(age: float) -> float:
@@ -582,41 +535,72 @@ class CircleAxisDrawing:
         return 1.0
 
     def _update_emit_geo(self, t: float) -> None:
-        """Rebuild positions + colors for the emitted circle pool and upload."""
+        """Rebuild positions + colors for the circle+blade pool and upload."""
         if not self._emit_geo_ready:
             return
 
-        verts_per_circle = (N_SEG + 1) * 2
-        n_verts = MAX_EMIT_CIRCLES * verts_per_circle
+        verts_per_ring   = (N_SEG + 1) * 2
+        n_blades         = self.n_blades
+        verts_per_blades = n_blades * 4
+        verts_per_slot   = self._verts_per_slot
+        n_slots          = len(self._emit_pool)
+        n_verts          = n_slots * verts_per_slot
 
         all_pos = np.zeros((n_verts, 3), dtype=np.float32)
         all_col = np.zeros((n_verts, 4), dtype=np.float32)
 
         FAR = np.array([1e6, 1e6, 1e6], dtype=np.float32)
 
+        bi_arr     = np.arange(n_blades, dtype=np.float32)
+        phi_arr    = 2.0 * np.pi * bi_arr / n_blades
+        face_alpha = (np.abs(np.sin(phi_arr)) * 0.35 + 0.65).astype(np.float32)
+        spin       = t * self.blade_spin_speed
+
         for slot, ec in enumerate(self._emit_pool):
-            v_base = slot * verts_per_circle
-            v_end  = v_base + verts_per_circle
+            v_base    = slot * verts_per_slot
+            ring_end  = v_base + verts_per_ring
+            blade_end = ring_end + verts_per_blades
 
             if ec is None:
-                all_pos[v_base:v_end] = FAR
+                all_pos[v_base:blade_end] = FAR
                 continue
 
             age   = t - ec.birth
             alpha = self._emit_alpha(age)
 
-            pts  = _circle_pts(ec.cx, ec.radius, N_SEG)
-            vpos = _ribbon_positions(pts, EMIT_HALF_W)
-            all_pos[v_base:v_end] = vpos
+            # Drift along the central (X) axis; rate scales with amplitude
+            # so a louder/larger drift also oscillates faster.
+            aa = ec.amplitude * self.amplitude
+            cx = ec.cx + aa * np.sin(aa * t * ec.speed + ec.phase)
 
-            # Colour: hue shifts gently with age, bright saturated
+            pts  = _circle_pts(cx, ec.radius, N_SEG)
+            vpos = _ribbon_positions(pts, EMIT_HALF_W)
+            all_pos[v_base:ring_end] = vpos
+
             hue_shift = (ec.hue + age * 0.04) % 1.0
-            t_arr     = np.linspace(0.0, 1.0, verts_per_circle, dtype=np.float32)
-            cols      = np.stack([
+            t_arr = np.linspace(0.0, 1.0, verts_per_ring, dtype=np.float32)
+            cols  = np.stack([
                 _hsv((hue_shift + ti * 0.08) % 1.0, 0.80, 0.90 + 0.10 * ti, alpha)
                 for ti in t_arr
             ])
-            all_col[v_base:v_end] = cols
+            all_col[v_base:ring_end] = cols
+
+            blade_pos = _blade_positions(cx, ec.radius, spin,
+                                          n_blades=n_blades,
+                                          blade_size_factor=self.blade_size_factor)
+            all_pos[ring_end:blade_end] = blade_pos
+
+            blade_cols = np.zeros((verts_per_blades, 4), dtype=np.float32)
+            for bi in range(n_blades):
+                frac = bi / n_blades
+                col = _hsv(
+                    (hue_shift + frac * 0.12) % 1.0,
+                    0.85,
+                    0.75 + 0.25 * frac,
+                    float(face_alpha[bi] * alpha * 0.4),
+                )
+                blade_cols[bi * 4 : bi * 4 + 4] = col
+            all_col[ring_end:blade_end] = blade_cols
 
         self._emit_geo.update(vertices=all_pos, colors=all_col)
 
@@ -624,32 +608,13 @@ class CircleAxisDrawing:
     # Internal animation
     # ------------------------------------------------------------------
 
-    def _animated_positions(self, t: float) -> np.ndarray:
+    def _animated_trav_positions(self, t: float) -> np.ndarray:
         """
-        Rebuild all vertex positions at time t.
+        Rebuild traversal-line vertex positions at time t.
 
-        Order must exactly match build_geometry:
-          for each circle: [ribbon verts] [blade verts]
-          for each trav:   [ribbon verts]
+        Order must exactly match build_geometry: for each trav, [line ribbon verts].
         """
         parts: list[np.ndarray] = []
-
-        for m in self._circle_metas:
-            aa = m.amplitude
-            if self._audio_data is not None:
-                aa = self._audio_data.energy * 0.4
-
-            cx = m.cx + aa * np.sin(aa * t * m.speed + m.phase)
-
-            pts = _circle_pts(cx, m.radius, N_SEG)
-            parts.append(_ribbon_positions(pts, CIRCLE_HALF_W))
-
-            n_blades_this = m.n_blade_verts // 4
-            spin = t * self.blade_spin_speed
-            parts.append(_blade_positions(cx, m.radius, spin,
-                                          n_blades=n_blades_this,
-                                          blade_size_factor=self.blade_size_factor))
-
         for m in self._trav_metas:
             dx  = m.amplitude * np.sin(t * m.speed + m.phase) * 15
             p1  = np.array([m.x1 + dx, m.y, m.z], dtype=np.float32)

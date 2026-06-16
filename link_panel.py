@@ -195,6 +195,7 @@ def _event_completions(lm: LinkManager) -> list[str]:
     srcs = ["audio.onset", "clock.beat"]
     for k in KEY_NAMES:
         srcs.append(f"key.{k}.press")
+        srcs.append(f"key.{k}.release")
     for defn in lm._threshold_defs:
         srcs.append(f"audio.threshold.{defn.name}")
     for n in range(128):
@@ -257,7 +258,7 @@ class _KeyCaptureDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Capture Key")
         self.setStyleSheet(_STYLESHEET)
-        self.setFixedSize(300, 100)
+        self.setFixedSize(300, 120)
         self._result: str | None = None
 
         lo = QVBoxLayout(self)
@@ -266,6 +267,9 @@ class _KeyCaptureDialog(QDialog):
         self._lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lo.addWidget(self._lbl)
 
+        self._release_cb = QCheckBox("Capture release event (off)")
+        lo.addWidget(self._release_cb)
+
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
         lo.addWidget(cancel)
@@ -273,7 +277,8 @@ class _KeyCaptureDialog(QDialog):
     def keyPressEvent(self, event: QKeyEvent) -> None:
         name = _QT_KEY_TO_NAME.get(event.key())
         if name:
-            self._result = f"key.{name}.press"
+            suffix = "release" if self._release_cb.isChecked() else "press"
+            self._result = f"key.{name}.{suffix}"
             self.accept()
         elif event.key() == Qt.Key.Key_Escape:
             self.reject()
@@ -2076,6 +2081,22 @@ class LinkManagerPanel(QWidget):
         self._preset_tab.needs_rebuild.connect(self._rebuild_routing_tabs)
 
         self._auto_load()
+
+        # nn_graph.* / lasers.* / circles.* properties are registered later by
+        # MergedGUI.__init__ on the GL thread, after this panel is already built
+        # on the Qt thread — so the routing tabs above can miss them. Poll for
+        # newly-registered properties and rebuild once they show up.
+        self._known_prop_count = len(pm.all_props())
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(250)
+        self._sync_timer.timeout.connect(self._sync_new_props)
+        self._sync_timer.start()
+
+    def _sync_new_props(self) -> None:
+        count = len(self._pm.all_props())
+        if count != self._known_prop_count:
+            self._known_prop_count = count
+            self._rebuild_routing_tabs()
 
     def _on_changed(self) -> None:
         self._save_timer.start()

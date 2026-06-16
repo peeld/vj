@@ -106,7 +106,7 @@ class CircleAxisGUI(mglw.WindowConfig):
     # ------------------------------------------------------------------
 
     def _on_audio_frame(self, m: audio_metrics.AudioMetrics) -> None:
-        self._drawing.update_audio(m)
+        self._drawing.amplitude = m.energy * 0.4
         self._post.params.sat_boost = m.bass * 4
 
     # ------------------------------------------------------------------

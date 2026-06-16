@@ -22,8 +22,7 @@ import moderngl
 import moderngl_window as mglw
 import warp as wp
 
-
-from param_dialog import start_param_dialog, apply_fullscreen_to_monitor
+from collections.abc import Callable
 
 _pending_monitor: int | None = None
 
@@ -41,10 +40,14 @@ from elements.nn_graph import NNGraph
 from property_manager import PropertyManager, build_default_manager
 from link_manager import LinkManager, KEY_NAMES
 
-# Late-bound audio callbacks registered by MergedGUI after it constructs its
-# scene elements.  AudioPanel calls each entry from the audio thread so that
-# the panel is the single audio stream owner.
-_circles_audio_fns: list = []
+from PySide6.QtGui import QGuiApplication
+
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QFormLayout, QLineEdit,
+    QLabel, QScrollArea, QVBoxLayout, QFrame,
+    QCheckBox, QComboBox, QPushButton,
+)
+from PySide6.QtCore import QTimer, Qt, QSettings
 
 # Module-level PM (params + controls only; element props added in MergedGUI.__init__)
 # Shared with the Qt panels so MidiPanel can show all scene/feedback params
@@ -102,6 +105,182 @@ class SceneControls:
 
 
 _controls = SceneControls()
+
+
+def apply_fullscreen_to_monitor(mglw_wnd, monitor_index: int) -> None:
+    """
+    Switch an mglw window to fullscreen on the given monitor.
+
+    Must be called from the main/render thread.  Typical usage::
+
+        _pending_monitor: int | None = None
+
+        def render(self, time, frametime):
+            global _pending_monitor
+            if _pending_monitor is not None:
+                apply_fullscreen_to_monitor(self.wnd, _pending_monitor)
+                _pending_monitor = None
+            ...
+
+        settings = SettingsPanel(
+            on_monitor_change=lambda idx: globals().__setitem__('_pending_monitor', idx),
+        )
+
+    Supports the pyglet, glfw, and pygame2 mglw backends.
+
+    Args:
+        mglw_wnd      : the ``self.wnd`` WindowConfig attribute
+        monitor_index : 0-based index into the list of attached monitors
+                        (0 = primary / first monitor)
+    """
+    backend = getattr(mglw_wnd, "name", "")
+
+    # ── pyglet ────────────────────────────────────────────────────────────────
+    if backend == "pyglet":
+        try:
+            # Use the display attached to the existing window — works across
+            # all pyglet versions without importing pyglet.canvas / pyglet.display.
+            screens = mglw_wnd._window.display.get_screens()
+            if not screens:
+                print("[param_dialog] apply_fullscreen_to_monitor: no pyglet screens found")
+                return
+            monitor_index = max(0, min(monitor_index, len(screens) - 1))
+            mglw_wnd._window.set_fullscreen(True, screen=screens[monitor_index])
+        except Exception as exc:
+            print(f"[param_dialog] apply_fullscreen_to_monitor (pyglet) failed: {exc}")
+        return
+
+    # ── glfw ──────────────────────────────────────────────────────────────────
+    if backend == "glfw":
+        try:
+            import glfw
+            monitors = glfw.get_monitors()
+            if not monitors:
+                print("[param_dialog] apply_fullscreen_to_monitor: no GLFW monitors found")
+                return
+            monitor_index = max(0, min(monitor_index, len(monitors) - 1))
+            monitor = monitors[monitor_index]
+            mode = glfw.get_video_mode(monitor)
+            glfw.set_window_monitor(
+                mglw_wnd._window, monitor,
+                0, 0, mode.size.width, mode.size.height, mode.refresh_rate,
+            )
+        except Exception as exc:
+            print(f"[param_dialog] apply_fullscreen_to_monitor (glfw) failed: {exc}")
+        return
+
+    # ── pygame2 / SDL2 ────────────────────────────────────────────────────────
+    if backend == "pygame2":
+        try:
+            import pygame._sdl2.video as sdl2
+            # SDL2 display index maps to monitor; recreate window on the target display
+            sdl_win = mglw_wnd._sdl_window
+            sdl_win.position = sdl2.WINDOWPOS_CENTERED_DISPLAY(monitor_index)
+            sdl_win.set_fullscreen(True)
+        except Exception as exc:
+            print(f"[param_dialog] apply_fullscreen_to_monitor (pygame2) failed: {exc}")
+        return
+
+    print(f"[param_dialog] apply_fullscreen_to_monitor: unsupported backend '{backend}'")
+
+
+
+# ── settings panel ─────────────────────────────────────────────────────────────
+
+class SettingsPanel(QWidget):
+    """
+    Application settings, organized into labeled sections.
+
+    on_monitor_change : optional callback(monitor_index: int) invoked when the
+                        user picks a monitor and clicks "Go Fullscreen" in the
+                        Display section.  Use
+                        ``apply_fullscreen_to_monitor(self.wnd, index)`` in the
+                        callback or render loop to apply the switch via GLFW.
+    """
+
+    def __init__(
+        self,
+        on_monitor_change: Callable[[int], None] | None = None,
+        title: str = "Settings",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        # self.setStyleSheet(_STYLESHEET)
+        self.setMinimumWidth(380)
+
+        self._on_monitor_change = on_monitor_change
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+
+        form = QFormLayout()
+        form.setContentsMargins(6, 6, 6, 6)
+        form.setSpacing(4)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        outer.addLayout(form)
+        outer.addStretch()
+
+        self._build_display_section(form)
+
+    # ── Display section ──────────────────────────────────────────────────────
+
+    def _build_display_section(self, form: QFormLayout) -> None:
+        """'Display' section: monitor picker and fullscreen button."""
+        hdr = QLabel("Display")
+        hdr.setObjectName("section_header")
+        form.addRow(hdr)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #2e2e38;")
+        form.addRow(sep)
+
+        self._monitor_combo = QComboBox()
+        for label in self._get_monitor_labels():
+            self._monitor_combo.addItem(label)
+        saved_idx = int(QSettings("WarpApp", "WarpApp").value("display/monitor_index", 0))
+        if 0 <= saved_idx < self._monitor_combo.count():
+            self._monitor_combo.setCurrentIndex(saved_idx)
+        form.addRow(QLabel("Monitor"), self._monitor_combo)
+
+        btn = QPushButton("Go Fullscreen")
+        btn.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #1e2a40; color: #5eaeff;"
+            "  border: 1px solid #38383f; border-radius: 3px; padding: 4px 10px;"
+            "}"
+            "QPushButton:hover { background-color: #243050; }"
+            "QPushButton:pressed { background-color: #2a4070; }"
+        )
+        btn.clicked.connect(self._emit_monitor_change)
+        form.addRow("", btn)
+
+    @staticmethod
+    def _get_monitor_labels() -> list[str]:
+        app = QGuiApplication.instance()
+        screens = app.screens() if app else []
+        labels = []
+        for i, s in enumerate(screens):
+            geo = s.geometry()
+            tag = " [primary]" if s == app.primaryScreen() else ""
+            labels.append(
+                f"Monitor {i}: {s.name()} "
+                f"({geo.width()}×{geo.height()} @ {geo.x()},{geo.y()}){tag}"
+            )
+        if not labels:
+            labels = ["Monitor 0 (unknown)"]
+        return labels
+
+    def _emit_monitor_change(self) -> None:
+        if self._on_monitor_change is not None:
+            idx = self._monitor_combo.currentIndex()
+            QSettings("WarpApp", "WarpApp").setValue("display/monitor_index", idx)
+            self._on_monitor_change(idx)
+
+
+# ── public entry point ────────────────────────────────────────────────────────
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +345,6 @@ class MergedGUI(mglw.WindowConfig):
         self.lm = _lm
         self._held_keys: set[str] = set()
         self.lm.event_bus.subscribe("regen", lambda _: self._regen_all())
-
-        # -- Audio ------------------------------------------------------------
-        # AudioPanel (Qt thread) owns the audio stream; register this scene's
-        # callback so the panel drives circles alongside PM bindings.
-        _circles_audio_fns.append(self._circles.update_audio)
 
         # -- Property manager -------------------------------------------------
         # Extend the shared module-level PM with element-specific properties now
@@ -336,6 +510,7 @@ class MergedGUI(mglw.WindowConfig):
                 self.lm.event_bus.fire(f"key.{key_name}.press")
             elif action == keys.ACTION_RELEASE:
                 self._held_keys.discard(key_name)
+                self.lm.event_bus.fire(f"key.{key_name}.release")
 
         if action != keys.ACTION_PRESS:
             return
@@ -376,7 +551,6 @@ class MergedGUI(mglw.WindowConfig):
 if __name__ == "__main__":
     import threading
     from PySide6.QtWidgets import QApplication
-    from param_dialog import ParamDialog
     from midi_input   import get_router
     from midi_panel   import MidiPanel
     from audio_panel  import AudioPanel
@@ -413,16 +587,7 @@ if __name__ == "__main__":
 
         saved = _load_positions()
 
-        dlg = ParamDialog(
-            [
-                ("Post-FX", _params, {}),
-                ("Scene",   _controls, {
-                    "blend_mode":    ("combo", BLEND_MODES),
-                    "smear_pattern": ("combo", SMEAR_PATTERNS),
-                    "active_effect": ("combo", _EFFECT_NAMES),
-                }),
-            ],
-            title="MergedGUI Params",
+        settings = SettingsPanel(
             on_monitor_change=lambda idx: globals().__setitem__('_pending_monitor', idx),
         )
 
@@ -432,7 +597,6 @@ if __name__ == "__main__":
 
         audio = AudioPanel(
             title           = "Audio Input",
-            extra_on_frame  = lambda m: [fn(m) for fn in _circles_audio_fns],
             source_registry = _lm.source_registry,
         )
 
@@ -454,10 +618,10 @@ if __name__ == "__main__":
             _lm, _pm,
             title="Warp Controls",
             extra_tabs=[
-                ("Params", dlg),
-                ("MIDI",   midi),
-                ("Audio",  audio),
-                ("Colors", colors),
+                ("MIDI",     midi),
+                ("Audio",    audio),
+                ("Colors",   colors),
+                ("Settings", settings),
             ],
         )
         _restore_geometry(links, saved, "ControlPanel")
