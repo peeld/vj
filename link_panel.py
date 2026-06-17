@@ -19,14 +19,14 @@ import pathlib
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QTimer, Signal, QSortFilterProxyModel, QEvent
-from PySide6.QtGui import QColor, QKeyEvent, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QCheckBox, QHeaderView,
     QTabWidget, QFrame, QDoubleSpinBox, QSpinBox,
     QCompleter, QAbstractItemView, QDialog, QDialogButtonBox, QInputDialog,
-    QTableView, QStyledItemDelegate, QAbstractItemDelegate,
+    QTableView, QTreeView, QStyledItemDelegate, QAbstractItemDelegate,
     QTreeWidget, QTreeWidgetItem,
 )
 
@@ -107,7 +107,7 @@ QPushButton#trigger:hover { border-color: #ffb347; }
 QPushButton#pick { color: #5eaeff; border-color: #1e3050; min-width: 20px; padding: 1px 2px; }
 QPushButton#pick:hover { border-color: #5eaeff; }
 
-QTableWidget, QTableView {
+QTableWidget, QTableView, QTreeView {
     background-color: #111118;
     alternate-background-color: #141420;
     color: #c8c8d0;
@@ -116,14 +116,15 @@ QTableWidget, QTableView {
     selection-background-color: #1e3050;
     selection-color: #c8c8d0;
 }
-QTableWidget QHeaderView::section, QTableView QHeaderView::section {
+QTableWidget QHeaderView::section, QTableView QHeaderView::section, QTreeView QHeaderView::section {
     background-color: #1a1a22;
     color: #707078;
     border: none;
     border-bottom: 1px solid #38383f;
     padding: 3px 6px;
 }
-QTableWidget::item, QTableView::item { padding: 2px 4px; }
+QTableWidget::item, QTableView::item, QTreeView::item { padding: 2px 4px; }
+QTreeView::branch { background: #111118; }
 
 QTabWidget::pane {
     border: 1px solid #38383f;
@@ -380,6 +381,12 @@ def _cell(text: str) -> QTableWidgetItem:
 def _bool_cell(flag: bool) -> QTableWidgetItem:
     item = _cell("✓" if flag else "✗")
     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+    return item
+
+
+def _make_inert_item() -> QStandardItem:
+    item = QStandardItem("")
+    item.setFlags(Qt.ItemFlag.ItemIsEnabled)
     return item
 
 
@@ -854,93 +861,136 @@ _FG_RED     = QColor("#e07070")
 
 
 class ChannelsModel(QStandardItemModel):
-    """QStandardItemModel backing the property-bay Channels table.
+    """QStandardItemModel backing the Channels tree view.
 
-    Columns: 0=On  1=Channel  2=Default  3=Expression  4=Live Value
+    Columns: 0=On  1=Channel  2=Default  3=Live Value  4=Expression  5=Pick
+    Top-level items are namespace group headers; child items are param rows.
+    full_key stored in UserRole on each COL_KEY child item.
     """
 
     COL_ON   = 0
     COL_KEY  = 1
     COL_DEF  = 2
-    COL_EXPR = 3
-    COL_LIVE = 4
+    COL_LIVE = 3
+    COL_EXPR = 4
     COL_PICK = 5
 
     def __init__(self, parent=None):
         super().__init__(0, 6, parent)
-        self.setHorizontalHeaderLabels(["✓", "Channel", "Default", "Expression", "Live Value", ""])
+        self.setHorizontalHeaderLabels(["✓", "Channel", "Default", "Live", "Expression", ""])
         self.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.row_for_key: dict[str, int] = {}
+        # dict[full_key] -> (group_QStandardItem, child_row_int)
+        self.row_for_key: dict[str, tuple[QStandardItem, int]] = {}
 
     def populate(self, lm: "LinkManager", pm: "PropertyManager") -> None:
         self.setRowCount(0)
         self.row_for_key.clear()
         link_map = {l.sink_key: l for l in lm._signal_links}
 
-        for row, prop in enumerate(pm.all_props()):
-            key  = prop.key
-            link = link_map.get(key)
-            expr = link.expression if link else ""
+        # Group props by namespace (first dotted segment)
+        groups: dict[str, list] = {}
+        for prop in pm.all_props():
+            ns = prop.key.split(".")[0] if "." in prop.key else "other"
+            groups.setdefault(ns, []).append(prop)
 
-            # Col 0: On checkbox — UserCheckable only when an expression exists
-            on_item = QStandardItem()
-            on_item.setCheckState(
-                Qt.CheckState.Checked
-                if (link and link.enabled and expr)
-                else Qt.CheckState.Unchecked
-            )
-            base_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-            on_item.setFlags(
-                base_flags | Qt.ItemFlag.ItemIsUserCheckable if expr else base_flags
-            )
+        grp_font = QFont()
+        grp_font.setBold(True)
 
-            # Col 1: Key — read-only
-            key_item = QStandardItem(key)
-            key_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        for ns, props in groups.items():
+            grp_item = QStandardItem(ns)
+            grp_item.setFont(grp_font)
+            grp_item.setForeground(QColor("#9898b0"))
+            grp_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            grp_row = [grp_item] + [_make_inert_item() for _ in range(5)]
 
-            # Col 2: Default — editable, seeded from baseline or property default
-            stored = lm.get_baseline(key, prop.default)
-            if isinstance(stored, bool):
-                def_text = str(stored)
-            else:
-                try:
-                    def_text = f"{float(stored):.4f}"
-                except (TypeError, ValueError):
+            for child_row, prop in enumerate(props):
+                key  = prop.key
+                link = link_map.get(key)
+                expr = link.expression if link else ""
+                short = key[len(ns) + 1:] if key.startswith(ns + ".") else key
+
+                # Col 0: On — UserCheckable only when an expression exists
+                on_item = QStandardItem()
+                on_item.setCheckState(
+                    Qt.CheckState.Checked
+                    if (link and link.enabled and expr)
+                    else Qt.CheckState.Unchecked
+                )
+                base_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                on_item.setFlags(
+                    base_flags | Qt.ItemFlag.ItemIsUserCheckable if expr else base_flags
+                )
+
+                # Col 1: short leaf name; full key in UserRole
+                key_item = QStandardItem(short)
+                key_item.setData(key, Qt.ItemDataRole.UserRole)
+                key_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+
+                # Col 2: Default — editable
+                stored = lm.get_baseline(key, prop.default)
+                if isinstance(stored, bool):
                     def_text = str(stored)
-            def_item = QStandardItem(def_text)
-            def_item.setForeground(QColor("#5eaeff"))
-            def_item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsEditable
-            )
+                else:
+                    try:
+                        def_text = f"{float(stored):.4f}"
+                    except (TypeError, ValueError):
+                        def_text = str(stored)
+                def_item = QStandardItem(def_text)
+                def_item.setForeground(QColor("#5eaeff"))
+                def_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEditable
+                )
 
-            # Col 3: Expression — editable, seeded from active link or ""
-            expr_item = QStandardItem(expr)
-            expr_item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsEditable
-            )
+                # Col 3: Live Value — read-only, populated by refresh timer
+                live_item = QStandardItem("")
+                live_item.setForeground(QColor("#5eaeff"))
+                live_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
 
-            # Col 4: Live Value — read-only, populated by the refresh timer
-            live_item = QStandardItem("")
-            live_item.setForeground(QColor("#5eaeff"))
-            live_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                # Col 4: Expression — editable
+                expr_item = QStandardItem(expr)
+                expr_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEditable
+                )
 
-            # Col 5: Pick — placeholder; button set via setIndexWidget
-            pick_item = QStandardItem("")
-            pick_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                # Col 5: Pick — button set via setIndexWidget
+                pick_item = QStandardItem("")
+                pick_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
 
-            self.appendRow([on_item, key_item, def_item, expr_item, live_item, pick_item])
-            self.row_for_key[key] = row
+                grp_item.appendRow([on_item, key_item, def_item, live_item, expr_item, pick_item])
+                self.row_for_key[key] = (grp_item, child_row)
+
+            self.appendRow(grp_row)
 
 
-def _make_channels_proxy(model: ChannelsModel) -> QSortFilterProxyModel:
-    """Create a QSortFilterProxyModel over model, filtering on the Key column."""
-    proxy = QSortFilterProxyModel()
-    proxy.setSourceModel(model)
-    proxy.setFilterKeyColumn(ChannelsModel.COL_KEY)
-    proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-    return proxy
+class _ChannelsTreeProxy(QSortFilterProxyModel):
+    """Tree-aware filter proxy: keeps a group visible when any child matches."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filter_text = ""
+
+    def setFilterFixedString(self, pattern: str) -> None:
+        self._filter_text = pattern.lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent) -> bool:
+        src = self.sourceModel()
+        if not source_parent.isValid():
+            # Group header: visible if any child matches
+            grp_idx = src.index(source_row, 0)
+            for c in range(src.rowCount(grp_idx)):
+                if self.filterAcceptsRow(c, grp_idx):
+                    return True
+            return False
+        # Child row: match full key (UserRole) against filter text
+        key_idx  = src.index(source_row, ChannelsModel.COL_KEY, source_parent)
+        key_item = src.itemFromIndex(key_idx)
+        if key_item is None:
+            return True
+        full_key = key_item.data(Qt.ItemDataRole.UserRole) or ""
+        return not self._filter_text or self._filter_text in full_key.lower()
 
 
 # ── Channels delegate ────────────────────────────────────────────────────────
@@ -964,10 +1014,11 @@ class _ChannelsDelegate(QStyledItemDelegate):
         src = self._proxy.mapToSource(proxy_index)
         if src.column() != ChannelsModel.COL_DEF:
             return None
-        key_item = self._model.item(src.row(), ChannelsModel.COL_KEY)
+        key_item = self._model.itemFromIndex(src.siblingAtColumn(ChannelsModel.COL_KEY))
         if key_item is None:
             return None
-        return self._pm._defs.get(key_item.text())
+        full_key = key_item.data(Qt.ItemDataRole.UserRole) or key_item.text()
+        return self._pm._defs.get(full_key)
 
     def _choices_for(self, proxy_index) -> list | None:
         defn = self._prop_defn_for(proxy_index)
@@ -1040,25 +1091,27 @@ class ChannelsTab(QWidget):
         lo.setContentsMargins(4, 4, 4, 4)
 
         self._model = ChannelsModel(self)
-        self._proxy = _make_channels_proxy(self._model)
+        self._proxy = _ChannelsTreeProxy(self)
+        self._proxy.setSourceModel(self._model)
 
-        self._view = QTableView()
+        self._view = QTreeView()
         self._view.setModel(self._proxy)
         self._view.setAlternatingRowColors(True)
-        self._view.verticalHeader().hide()
         self._view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._view.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self._view.setRootIsDecorated(True)
+        self._view.setUniformRowHeights(True)
         self._delegate = _ChannelsDelegate(self._model, self._proxy, lm, pm, self._view)
         self._delegate.previewChanged.connect(self._on_expr_preview_changed)
         self._delegate.previewEnded.connect(self._on_expr_preview_ended)
         self._view.setItemDelegate(self._delegate)
-        hh = self._view.horizontalHeader()
+        hh = self._view.header()
         hh.setSectionResizeMode(ChannelsModel.COL_ON,   QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(ChannelsModel.COL_KEY,  QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(ChannelsModel.COL_DEF,  QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(ChannelsModel.COL_EXPR, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(ChannelsModel.COL_LIVE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(ChannelsModel.COL_EXPR, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(ChannelsModel.COL_PICK, QHeaderView.ResizeMode.Fixed)
         hh.resizeSection(ChannelsModel.COL_PICK, 26)
 
@@ -1090,46 +1143,50 @@ class ChannelsTab(QWidget):
             self._model.populate(self._lm, self._pm)
         finally:
             self._updating = False
+        self._view.expandAll()
         self._open_persistent_editors()
 
     def _close_persistent_editors(self) -> None:
-        for row in range(self._model.rowCount()):
-            proxy_def = self._proxy.mapFromSource(
-                self._model.index(row, ChannelsModel.COL_DEF)
-            )
-            if proxy_def.isValid() and self._view.isPersistentEditorOpen(proxy_def):
-                self._view.closePersistentEditor(proxy_def)
-            proxy_pick = self._proxy.mapFromSource(
-                self._model.index(row, ChannelsModel.COL_PICK)
-            )
-            if proxy_pick.isValid():
-                self._view.setIndexWidget(proxy_pick, None)
+        for key, (grp_item, child_row) in self._model.row_for_key.items():
+            def_item = grp_item.child(child_row, ChannelsModel.COL_DEF)
+            if def_item is not None:
+                proxy_def = self._proxy.mapFromSource(self._model.indexFromItem(def_item))
+                if proxy_def.isValid() and self._view.isPersistentEditorOpen(proxy_def):
+                    self._view.closePersistentEditor(proxy_def)
+            pick_item = grp_item.child(child_row, ChannelsModel.COL_PICK)
+            if pick_item is not None:
+                proxy_pick = self._proxy.mapFromSource(self._model.indexFromItem(pick_item))
+                if proxy_pick.isValid():
+                    self._view.setIndexWidget(proxy_pick, None)
 
     def _open_persistent_editors(self) -> None:
-        for key, row in self._model.row_for_key.items():
+        for key, (grp_item, child_row) in self._model.row_for_key.items():
             defn = self._pm._defs.get(key)
             if defn is not None and (defn.type is bool or defn.choices):
-                src_index = self._model.index(row, ChannelsModel.COL_DEF)
-                proxy_index = self._proxy.mapFromSource(src_index)
-                if proxy_index.isValid():
-                    self._view.openPersistentEditor(proxy_index)
+                def_item = grp_item.child(child_row, ChannelsModel.COL_DEF)
+                if def_item is not None:
+                    proxy_index = self._proxy.mapFromSource(self._model.indexFromItem(def_item))
+                    if proxy_index.isValid():
+                        self._view.openPersistentEditor(proxy_index)
             btn = QPushButton("⊕")
             btn.setObjectName("pick")
             btn.setFixedSize(22, 20)
             btn.clicked.connect(lambda checked=False, sk=key, b=btn: self._open_picker(b, sk))
-            src_pick = self._model.index(row, ChannelsModel.COL_PICK)
-            proxy_pick = self._proxy.mapFromSource(src_pick)
-            if proxy_pick.isValid():
-                self._view.setIndexWidget(proxy_pick, btn)
+            pick_item = grp_item.child(child_row, ChannelsModel.COL_PICK)
+            if pick_item is not None:
+                proxy_pick = self._proxy.mapFromSource(self._model.indexFromItem(pick_item))
+                if proxy_pick.isValid():
+                    self._view.setIndexWidget(proxy_pick, btn)
 
     def _open_picker(self, anchor: QPushButton, sink_key: str) -> None:
         snap = self._lm.source_registry.snapshot()
 
         def on_select(source_key: str) -> None:
-            row = self._model.row_for_key.get(sink_key)
-            if row is None:
+            entry = self._model.row_for_key.get(sink_key)
+            if entry is None:
                 return
-            expr_item = self._model.item(row, ChannelsModel.COL_EXPR)
+            grp_item, child_row = entry
+            expr_item = grp_item.child(child_row, ChannelsModel.COL_EXPR)
             if expr_item is not None:
                 expr_item.setText(source_key)
 
@@ -1145,9 +1202,9 @@ class ChannelsTab(QWidget):
             return
         self._updating = True
         try:
-            for key, row in self._model.row_for_key.items():
-                expr_item = self._model.item(row, ChannelsModel.COL_EXPR)
-                live_item = self._model.item(row, ChannelsModel.COL_LIVE)
+            for key, (grp_item, child_row) in self._model.row_for_key.items():
+                expr_item = grp_item.child(child_row, ChannelsModel.COL_EXPR)
+                live_item = grp_item.child(child_row, ChannelsModel.COL_LIVE)
                 expr_text = expr_item.text().strip() if expr_item is not None else ""
 
                 if not expr_text:
@@ -1166,7 +1223,7 @@ class ChannelsTab(QWidget):
                     continue
 
                 value_text = display[2:] if display.startswith("→ ") else display
-                on_item = self._model.item(row, ChannelsModel.COL_ON)
+                on_item = grp_item.child(child_row, ChannelsModel.COL_ON)
                 enabled = on_item is not None and on_item.checkState() == Qt.CheckState.Checked
                 if enabled:
                     self._set_cell_style(live_item, value_text, _FG_BLUE, "")
@@ -1229,6 +1286,7 @@ class ChannelsTab(QWidget):
     def _apply_filter(self, text: str) -> None:
         if hasattr(self, "_proxy"):
             self._proxy.setFilterFixedString(text)
+            self._view.expandAll()
 
     def eventFilter(self, obj, event) -> bool:
         if hasattr(self, "_filter_edit") and obj is self._filter_edit:
@@ -1241,22 +1299,27 @@ class ChannelsTab(QWidget):
     # ── itemChanged handler (wired to self._model in Stage 6) ────────────────
 
     def _on_item_changed(self, item: "QStandardItem") -> None:
-        """Commit inline edits from the property-bay table to lm / pm."""
+        """Commit inline edits from the channels tree to lm / pm."""
         if self._updating:
             return
 
         col = item.column()
         row = item.row()
-        key_item = self._model.item(row, ChannelsModel.COL_KEY)
+        parent_item = item.parent()
+        if parent_item is None:
+            return  # group header — ignore
+        key_item = parent_item.child(row, ChannelsModel.COL_KEY)
         if key_item is None:
             return
-        key = key_item.text()
+        key = key_item.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return
         link_map = {l.sink_key: l for l in self._lm._signal_links}
 
         if col == ChannelsModel.COL_EXPR:
             new_expr = item.text().strip()
             link     = link_map.get(key)
-            on_item  = self._model.item(row, ChannelsModel.COL_ON)
+            on_item  = parent_item.child(row, ChannelsModel.COL_ON)
 
             if new_expr:
                 if link:
@@ -1327,7 +1390,7 @@ class ChannelsTab(QWidget):
 
             self._lm.set_baseline(key, val)
             link    = link_map.get(key)
-            on_item = self._model.item(row, ChannelsModel.COL_ON)
+            on_item = parent_item.child(row, ChannelsModel.COL_ON)
             if not (link and link.expression) or \
                     on_item.checkState() == Qt.CheckState.Unchecked:
                 self._pm.set(key, val)
