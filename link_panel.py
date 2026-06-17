@@ -184,6 +184,19 @@ QDialogButtonBox QPushButton { min-width: 70px; }
 
 _LFO_SHAPES = ("sine", "saw", "square", "tri")
 
+_BPM_RATE_MODES = [
+    ("Hz (free)",  "hz"),
+    ("Beat × 1",   "bpm_1"),
+    ("Beat × 2",   "bpm_2"),
+    ("Beat × 4",   "bpm_4"),
+    ("Beat × 8",   "bpm_8"),
+    ("Beat × 16",  "bpm_16"),
+    ("Beat ÷ 2",   "bpm_h2"),
+    ("Beat ÷ 4",   "bpm_h4"),
+    ("Beat ÷ 8",   "bpm_h8"),
+]
+_BPM_MODE_LABEL = {key: label for label, key in _BPM_RATE_MODES}
+
 _PARAMETER_KINDS = ("toggle", "gate", "latch", "pulse", "counter")
 
 _SOURCE_GROUP_ORDER = ["audio", "midi", "clock", "lfo", "env", "p"]
@@ -212,7 +225,10 @@ def _expr_completions(lm: LinkManager) -> list[str]:
 
 
 def _action_completions(lm: LinkManager, pm: "PropertyManager") -> list[str]:
-    actions: list[str] = ["regen", "preset('')"]
+    actions: list[str] = [
+        "regen", "preset('')",
+        "bpm.tap()", "bpm.nudge(+0.5)", "bpm.nudge(-0.5)", "bpm.set(120)",
+    ]
     preset_names = lm.list_link_presets()
     if preset_names:
         for name in preset_names:
@@ -532,18 +548,34 @@ class LFODialog(_BaseDialog):
                                    decimals=3, step=0.1)
         self._row("Rate (Hz):", self._rate)
 
+        self._rate_mode = QComboBox()
+        for label, _ in _BPM_RATE_MODES:
+            self._rate_mode.addItem(label)
+        if defn and defn.rate_mode != "hz":
+            keys = [k for _, k in _BPM_RATE_MODES]
+            idx = keys.index(defn.rate_mode) if defn.rate_mode in keys else 0
+            self._rate_mode.setCurrentIndex(idx)
+        self._rate_mode.currentIndexChanged.connect(self._on_mode_change)
+        self._row("Rate mode:", self._rate_mode)
+
         self._phase = self._spinbox(0.0, 1.0, defn.phase if defn else 0.0,
                                     decimals=3, step=0.01)
         self._row("Phase (0-1):", self._phase)
 
         self._add_buttons()
+        self._on_mode_change(self._rate_mode.currentIndex())
+
+    def _on_mode_change(self, idx: int) -> None:
+        self._rate.setEnabled(idx == 0)
 
     def result_def(self) -> LFODef:
+        _, mode_key = _BPM_RATE_MODES[self._rate_mode.currentIndex()]
         return LFODef(
-            name    = self._name.text().strip(),
-            shape   = self._shape.currentText(),
-            rate_hz = self._rate.value(),
-            phase   = self._phase.value(),
+            name      = self._name.text().strip(),
+            shape     = self._shape.currentText(),
+            rate_hz   = self._rate.value(),
+            phase     = self._phase.value(),
+            rate_mode = mode_key,
         )
 
 
@@ -1446,6 +1478,7 @@ class EventsTab(QWidget):
             event_str = f"midi.note{note}.{'on' if vel > 0 else 'off'}"
             # Marshal back to Qt thread
             QTimer.singleShot(0, lambda: self._open_with_event(event_str))
+            # self._open_with_event(event_str)
 
         router.add_listener(_on_event)
 
@@ -1695,7 +1728,7 @@ class LFOsTab(QWidget):
         tb.addStretch()
         lo.addLayout(tb)
 
-        self._table = _make_table(["Name", "Shape", "Rate (Hz)", "Phase"])
+        self._table = _make_table(["Name", "Shape", "Rate", "Phase"])
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1714,9 +1747,11 @@ class LFOsTab(QWidget):
         defs = self._lm._lfo_defs
         self._table.setRowCount(len(defs))
         for r, d in enumerate(defs):
+            rate_str = (f"{d.rate_hz:.3f} Hz" if d.rate_mode == "hz"
+                        else _BPM_MODE_LABEL.get(d.rate_mode, d.rate_mode))
             self._table.setItem(r, 0, _cell(d.name))
             self._table.setItem(r, 1, _cell(d.shape))
-            self._table.setItem(r, 2, _cell(f"{d.rate_hz:.3f}"))
+            self._table.setItem(r, 2, _cell(rate_str))
             self._table.setItem(r, 3, _cell(f"{d.phase:.3f}"))
 
     def _add(self) -> None:
@@ -2014,17 +2049,13 @@ class PresetsTab(QWidget):
 #  Main panel
 # ─────────────────────────────────────────────────────────────────────────────
 
-class LinkManagerPanel(QWidget):
-    """Main panel: tabs for Channels, Parameters, Events, Envelopes, LFOs, Presets, Sources.
-
-    extra_tabs: optional list of (label, widget) pairs appended after the core tabs.
-    """
+class LinkManagerPanel(QDialog):
+    """Main panel: tabs for Channels, Parameters, Events, Envelopes, LFOs, Presets, Sources."""
 
     _STATE_PATH = pathlib.Path(__file__).with_name("link_state.json")
 
     def __init__(self, lm: LinkManager, pm: "PropertyManager",
-                 title: str = "Link Manager", parent=None,
-                 extra_tabs: "list[tuple[str, QWidget]] | None" = None):
+                 title: str = "Link Manager", parent=None):
         super().__init__(parent)
         self._lm = lm
         self._pm = pm
@@ -2052,9 +2083,6 @@ class LinkManagerPanel(QWidget):
         tabs.addTab(self._lfo_tab,      "LFOs")
         tabs.addTab(self._preset_tab,   "Presets")
         tabs.addTab(self._src_tab,      "Sources")
-
-        for label, widget in (extra_tabs or []):
-            tabs.addTab(widget, label)
 
         lo.addWidget(tabs)
 

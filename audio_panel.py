@@ -1,20 +1,28 @@
 """
 audio_panel.py — Audio input device selector + live metrics monitor
 
-PySide6 panel for selecting an audio input device and viewing live AudioMetrics
-values.  Audio signal routing to scene parameters is handled by LinkManager
-via SignalLinks — use the Link Manager panel to create audio-driven mappings.
+Two PySide6 widgets, split so the device picker can live in Settings while
+the channel meters stay in their own Audio tab:
+
+  AudioDeviceSelector -- device combo + connect/disconnect, owns the
+                         AudioAnalyzer, writes audio.<field> to the
+                         SourceRegistry.
+  AudioPanel          -- live channel meters; fed by AudioDeviceSelector via
+                         update_metrics(), has no device controls of its own.
+
+Audio signal routing to scene parameters is handled by LinkManager via
+SignalLinks — use the Link Manager panel to create audio-driven mappings.
 
 Usage::
 
-    from audio_metrics import AudioAnalyzer, AudioMetrics
-    from audio_panel   import AudioPanel
+    from audio_panel import AudioPanel, AudioDeviceSelector
 
-    panel = AudioPanel(
-        title="Audio Input",
-        source_registry=lm.source_registry,
-    )
+    panel  = AudioPanel(title="Audio Input", source_registry=lm.source_registry)
+    device = AudioDeviceSelector(title="Audio Device",
+                                  source_registry=lm.source_registry,
+                                  on_metrics=panel.update_metrics)
     panel.show()
+    device.show()
 """
 
 from __future__ import annotations
@@ -149,32 +157,28 @@ _METRICS: list[tuple[str, str, bool]] = [
 
 class AudioPanel(QWidget):
     """
-    Live audio input panel.
+    Live audio channels / metrics display.
 
-    Connects to a sounddevice input and streams AudioMetrics values into the
-    SourceRegistry each frame so LinkManager can drive scene parameters via
-    SignalLinks.  Use the Link Manager panel to create audio-driven mappings.
+    Device selection lives in AudioDeviceSelector (see below) -- that widget
+    owns the AudioAnalyzer and pushes each AudioMetrics frame in here via
+    update_metrics(), so this panel only ever renders the channel meters.
 
     Parameters
     ----------
     title : str
         Window title.
-    extra_on_frame : callable | None
-        Optional extra callback called each frame with the latest AudioMetrics.
     source_registry : SourceRegistry | None
-        If provided, all AudioMetrics fields are written as audio.<field> each frame.
+        Unused directly by this panel (kept for API symmetry with the other
+        input panels); SourceRegistry writes happen in AudioDeviceSelector.
     """
 
     def __init__(
         self,
         title           : str = "Audio Input",
-        extra_on_frame  = None,
         source_registry = None,   # SourceRegistry | None
     ):
         super().__init__()
-        self._extra_on_frame  = extra_on_frame
         self._source_registry = source_registry
-        self._analyzer: AudioAnalyzer | None = None
         self._metrics  = AudioMetrics()
 
         self.setWindowTitle(title)
@@ -184,17 +188,10 @@ class AudioPanel(QWidget):
         self.resize(460, 480)
 
         self._build_ui()
-        self._refresh_devices()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self._timer.start(33)
-
-    # ── teardown ──────────────────────────────────────────────────────────────
-
-    def closeEvent(self, event):
-        self._stop_analyzer()
-        super().closeEvent(event)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -203,35 +200,7 @@ class AudioPanel(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(6)
 
-        # ── Device ────────────────────────────────────────────────────────────
-        root.addWidget(_hdr("Device"))
-        root.addWidget(_sep())
-
-        dev_row = QHBoxLayout()
-        self._dev_combo = QComboBox()
-        self._dev_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        dev_row.addWidget(self._dev_combo)
-
-        btn_refresh = QPushButton("↻")
-        btn_refresh.setFixedWidth(28)
-        btn_refresh.clicked.connect(self._refresh_devices)
-        dev_row.addWidget(btn_refresh)
-
-        self._btn_connect = QPushButton("Connect")
-        self._btn_connect.clicked.connect(self._on_connect)
-        dev_row.addWidget(self._btn_connect)
-
-        self._btn_disconnect = QPushButton("Disconnect")
-        self._btn_disconnect.clicked.connect(self._on_disconnect)
-        dev_row.addWidget(self._btn_disconnect)
-        root.addLayout(dev_row)
-
-        self._lbl_status = QLabel("Not connected")
-        self._lbl_status.setObjectName("info")
-        root.addWidget(self._lbl_status)
-
         # ── Live Metrics ──────────────────────────────────────────────────────
-        root.addSpacing(4)
         root.addWidget(_hdr("Live Metrics"))
         root.addWidget(_sep())
 
@@ -266,6 +235,106 @@ class AudioPanel(QWidget):
             root.addLayout(row)
 
         root.addStretch(1)
+
+    # ── external metrics feed ─────────────────────────────────────────────────
+
+    def update_metrics(self, metrics: AudioMetrics) -> None:
+        """Called by AudioDeviceSelector (possibly from the audio thread) on
+        each frame.  Simple assignment is thread-safe in CPython; _poll()
+        reads it back on the Qt timer."""
+        self._metrics = metrics
+
+    # ── poll timer ────────────────────────────────────────────────────────────
+
+    def _poll(self) -> None:
+        m = self._metrics
+        for attr, _label, _pulse in _METRICS:
+            v = getattr(m, attr, 0.0)
+            self._bars[attr].setValue(int(v * 1000))
+            self._values[attr].setText(f"{v:.3f}")
+
+
+# ── device selector ─────────────────────────────────────────────────────────
+
+class AudioDeviceSelector(QWidget):
+    """
+    Audio input device picker + connect/disconnect controls.
+
+    Owns the AudioAnalyzer lifecycle and writes AudioMetrics fields into the
+    SourceRegistry each frame -- the same job AudioPanel used to do itself.
+    Each frame is also forwarded to *on_metrics* (typically
+    AudioPanel.update_metrics) so the channel meters stay in sync without
+    that panel needing to know about devices at all.
+
+    Parameters
+    ----------
+    title : str
+        Window title.
+    source_registry : SourceRegistry | None
+        If provided, all AudioMetrics fields are written as audio.<field> each frame.
+    on_metrics : callable(AudioMetrics) | None
+        Called on every audio frame (and with a blank AudioMetrics on disconnect).
+    """
+
+    _REGISTRY_FIELDS = (
+        "sub_bass", "bass", "low_mid", "mid", "high_mid",
+        "treble", "energy", "brightness", "flux", "kick", "onset",
+    )
+
+    def __init__(
+        self,
+        title           : str = "Audio Device",
+        source_registry = None,   # SourceRegistry | None
+        on_metrics      = None,   # callable(AudioMetrics) | None
+        parent          = None,
+    ):
+        super().__init__(parent)
+        self._source_registry = source_registry
+        self._on_metrics      = on_metrics
+        self._analyzer: AudioAnalyzer | None = None
+
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setStyleSheet(_STYLESHEET)
+
+        self._build_ui()
+        self._refresh_devices()
+
+    # ── teardown ──────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        self._stop_analyzer()
+        super().closeEvent(event)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+
+        dev_row = QHBoxLayout()
+        self._dev_combo = QComboBox()
+        self._dev_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        dev_row.addWidget(self._dev_combo)
+
+        btn_refresh = QPushButton("↻")
+        btn_refresh.setFixedWidth(28)
+        btn_refresh.clicked.connect(self._refresh_devices)
+        dev_row.addWidget(btn_refresh)
+
+        self._btn_connect = QPushButton("Connect")
+        self._btn_connect.clicked.connect(self._on_connect)
+        dev_row.addWidget(self._btn_connect)
+
+        self._btn_disconnect = QPushButton("Disconnect")
+        self._btn_disconnect.clicked.connect(self._on_disconnect)
+        dev_row.addWidget(self._btn_disconnect)
+        root.addLayout(dev_row)
+
+        self._lbl_status = QLabel("Not connected")
+        self._lbl_status.setObjectName("info")
+        root.addWidget(self._lbl_status)
 
     # ── device management ─────────────────────────────────────────────────────
 
@@ -313,7 +382,8 @@ class AudioPanel(QWidget):
         self._lbl_status.setObjectName("info")
         self._lbl_status.setText("Not connected")
         _restyle(self._lbl_status)
-        self._metrics = AudioMetrics()
+        if self._on_metrics is not None:
+            self._on_metrics(AudioMetrics())
 
     def _stop_analyzer(self) -> None:
         if self._analyzer is not None:
@@ -325,13 +395,7 @@ class AudioPanel(QWidget):
 
     # ── audio callback ────────────────────────────────────────────────────────
 
-    _REGISTRY_FIELDS = (
-        "sub_bass", "bass", "low_mid", "mid", "high_mid",
-        "treble", "energy", "brightness", "flux", "kick", "onset",
-    )
-
     def _on_audio_frame(self, metrics: AudioMetrics) -> None:
-        self._metrics = metrics
         if self._source_registry is not None:
             try:
                 for field in self._REGISTRY_FIELDS:
@@ -340,20 +404,11 @@ class AudioPanel(QWidget):
                     )
             except Exception:
                 pass
-        if self._extra_on_frame is not None:
+        if self._on_metrics is not None:
             try:
-                self._extra_on_frame(metrics)
+                self._on_metrics(metrics)
             except Exception:
                 pass
-
-    # ── poll timer ────────────────────────────────────────────────────────────
-
-    def _poll(self) -> None:
-        m = self._metrics
-        for attr, _label, _pulse in _METRICS:
-            v = getattr(m, attr, 0.0)
-            self._bars[attr].setValue(int(v * 1000))
-            self._values[attr].setText(f"{v:.3f}")
 
 
 # ── standalone demo ───────────────────────────────────────────────────────────
@@ -363,5 +418,7 @@ if __name__ == "__main__":
 
     app = QApplication.instance() or QApplication(sys.argv)
     panel = AudioPanel()
+    device = AudioDeviceSelector(on_metrics=panel.update_metrics)
+    device.show()
     panel.show()
     sys.exit(app.exec())

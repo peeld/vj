@@ -333,6 +333,7 @@ def build_default_manager(
     nn_graph,            # NNGraph  (may be None before GL window starts)
     lasers,              # LaserRibbons  (may be None)
     circles,             # CircleAxisDrawing  (may be None)
+    camera = None,       # OrbitCamera  (may be None before GL window starts)
     pm: "PropertyManager | None" = None,
 ) -> "PropertyManager":
     """Construct (or extend) a PropertyManager for gui_merged.
@@ -458,6 +459,22 @@ def build_default_manager(
               widget_hint="combo",
               description="Which post-effect pipeline is active"),
       controls, "active_effect")
+
+    # ── camera (OrbitCamera) ──────────────────────────────────────────────────
+    if camera is not None:
+        _CAM = "camera"
+
+        R(PropDef(f"{_CAM}.orbit_speed", _CAM, "orbit_speed",  "Orbit Speed",
+                  float, 0.22,  -2.0, 2.0,  0.01,
+                  description="Horizontal angular speed of the auto-orbit, rad/s "
+                              "(drivable via Link Manager expressions)"),
+          camera, "_orbit_speed")
+
+        R(PropDef(f"{_CAM}.distance",    _CAM, "dist",         "Distance",
+                  float, 1.0,   1.0,  12.0,  0.1,
+                  description="Camera distance from the origin "
+                              "(drivable via Link Manager expressions)"),
+          camera, "dist")
 
     # ── nn_graph (NNGraph) ────────────────────────────────────────────────────
     if nn_graph is not None:

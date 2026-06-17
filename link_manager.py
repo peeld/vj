@@ -132,26 +132,29 @@ class LFODef:
     Example::
         LFODef(name="slow_sine", shape="sine", rate_hz=0.25, phase=0.0)
     """
-    name    : str
-    shape   : str   = "sine"  # "sine" | "saw" | "square" | "tri"
-    rate_hz : float = 1.0
-    phase   : float = 0.0     # 0-1 initial phase offset
+    name      : str
+    shape     : str   = "sine"  # "sine" | "saw" | "square" | "tri"
+    rate_hz   : float = 1.0
+    phase     : float = 0.0     # 0-1 initial phase offset
+    rate_mode : str   = "hz"    # "hz" | "bpm_1" | "bpm_2" | "bpm_4" | "bpm_8" | "bpm_16" | "bpm_h2" | "bpm_h4" | "bpm_h8"
 
     def to_dict(self) -> dict:
         return {
-            "name"   : self.name,
-            "shape"  : self.shape,
-            "rate_hz": self.rate_hz,
-            "phase"  : self.phase,
+            "name"     : self.name,
+            "shape"    : self.shape,
+            "rate_hz"  : self.rate_hz,
+            "phase"    : self.phase,
+            "rate_mode": self.rate_mode,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "LFODef":
         return cls(
-            name    = d["name"],
-            shape   = d.get("shape",   "sine"),
-            rate_hz = d.get("rate_hz", 1.0),
-            phase   = d.get("phase",   0.0),
+            name      = d["name"],
+            shape     = d.get("shape",     "sine"),
+            rate_hz   = d.get("rate_hz",   1.0),
+            phase     = d.get("phase",     0.0),
+            rate_mode = d.get("rate_mode", "hz"),
         )
 
 
@@ -634,10 +637,9 @@ class LFO:
         self.shape   = shape
         self.rate_hz = rate_hz
         self._phase  = phase % 1.0
+        self.bpm_phase_source: "Callable[[], float] | None" = None
 
-    def tick(self, dt: float) -> float:
-        self._phase = (self._phase + self.rate_hz * dt) % 1.0
-        p = self._phase
+    def _shape_value(self, p: float) -> float:
         if self.shape == "sine":
             return (_math.sin(p * 2.0 * _math.pi) + 1.0) * 0.5
         elif self.shape == "saw":
@@ -647,6 +649,13 @@ class LFO:
         elif self.shape == "tri":
             return 1.0 - abs(p * 2.0 - 1.0)
         return 0.0
+
+    def tick(self, dt: float) -> float:
+        if self.bpm_phase_source is not None:
+            self._phase = self.bpm_phase_source()
+            return self._shape_value(self._phase)
+        self._phase = (self._phase + self.rate_hz * dt) % 1.0
+        return self._shape_value(self._phase)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -684,6 +693,8 @@ class LinkManager:
         # Baseline values: persistent per-property floats written to PM when an
         # expression is disabled or cleared.  Intentionally NOT cleared by clear_state().
         self._baselines: dict[str, float] = {}
+
+        self._bpm_clock = None  # set externally after construction
 
     # ── SignalLink management ─────────────────────────────────────────────────
 
@@ -775,9 +786,18 @@ class LinkManager:
 
     # ── LFO management ────────────────────────────────────────────────────────
 
+    _MODE_MULT = {
+        "bpm_1": 1.0, "bpm_2": 2.0, "bpm_4": 4.0,
+        "bpm_8": 8.0, "bpm_16": 16.0,
+        "bpm_h2": 0.5, "bpm_h4": 0.25, "bpm_h8": 0.125,
+    }
+
     def add_lfo(self, defn: LFODef) -> None:
         """Register an LFODef and create its runtime LFO."""
         lfo = LFO(shape=defn.shape, rate_hz=defn.rate_hz, phase=defn.phase)
+        if defn.rate_mode != "hz" and self._bpm_clock is not None:
+            mult = self._MODE_MULT.get(defn.rate_mode, 1.0)
+            lfo.bpm_phase_source = lambda m=mult: self._bpm_clock.beat_phase(m)
         self._lfos[defn.name] = lfo
         self._lfo_defs.append(defn)
 
@@ -885,6 +905,7 @@ class LinkManager:
             "baselines"       : dict(self._baselines),
             "presets"         : self._presets,
             "preset_triggers" : [l.to_dict() for l in self._preset_triggers],
+            "bpm"             : self._bpm_clock.to_dict() if self._bpm_clock else {},
         }
         _Path(path).write_text(_json.dumps(data, indent=2))
 
@@ -916,6 +937,10 @@ class LinkManager:
             self._presets[name] = snap
         for d in data.get("preset_triggers", []):
             self.add_preset_trigger(EventLink.from_dict(d))
+        if "bpm" in data and self._bpm_clock and data["bpm"]:
+            self._bpm_clock.set_bpm(data["bpm"].get("bpm", 120.0))
+            self._bpm_clock.set_latency_ms(data["bpm"].get("latency_offset_ms", 0.0))
+            self._bpm_clock.tap_event_name = data["bpm"].get("tap_event", "")
 
     # ── Link preset management ────────────────────────────────────────────────
 
@@ -995,6 +1020,9 @@ class LinkManager:
     _RE_SET         = re.compile(r"^set\(([^,]+),\s*(.+)\)$")
     _RE_PRESET      = re.compile(r"""^preset\(['"]([^'"]+)['"]\)$""")
     _RE_LINK_PRESET = re.compile(r"""^link_preset\(['"]([^'"]+)['"]\)$""")
+    _RE_BPM_TAP     = re.compile(r"^bpm\.tap\(\)$")
+    _RE_BPM_NUDGE   = re.compile(r"^bpm\.nudge\(([+-]?[\d.]+)\)$")
+    _RE_BPM_SET     = re.compile(r"^bpm\.set\(([\d.]+)\)$")
 
     def _dispatch_action(self, action: str, pm: Any) -> None:
         action = action.strip()
@@ -1040,6 +1068,21 @@ class LinkManager:
         m = self._RE_LINK_PRESET.match(action)
         if m:
             self.load_link_preset(m.group(1))
+            return
+
+        if self._RE_BPM_TAP.match(action):
+            if self._bpm_clock:
+                self._bpm_clock.tap()
+            return
+        m = self._RE_BPM_NUDGE.match(action)
+        if m:
+            if self._bpm_clock:
+                self._bpm_clock.nudge(float(m.group(1)))
+            return
+        m = self._RE_BPM_SET.match(action)
+        if m:
+            if self._bpm_clock:
+                self._bpm_clock.set_bpm(float(m.group(1)))
             return
 
         if action == "regen":

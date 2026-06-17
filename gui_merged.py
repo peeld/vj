@@ -12,14 +12,13 @@ App-level controls (not user-configurable):
 All other key mappings are configured via the Link Manager panel (EventLinks).
 """
 
-import random
+import pathlib
+import threading
 from dataclasses import dataclass
 
 import moderngl
 import moderngl_window as mglw
 import warp as wp
-
-from collections.abc import Callable
 
 _pending_monitor: int | None = None
 
@@ -30,19 +29,12 @@ from post import (
 from drawlib.camera import OrbitCamera
 
 from elements.base import DrawingElement, FrameContext, ELEMENT_TYPES
-import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons  # noqa: F401 -- registers cloud/nn_graph/circles/lasers
+import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs
 
 from property_manager import PropertyManager, build_default_manager
 from link_manager import LinkManager, KEY_NAMES
 
-from PySide6.QtGui import QGuiApplication
-
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QFormLayout, QLineEdit,
-    QLabel, QScrollArea, QVBoxLayout, QFrame,
-    QCheckBox, QComboBox, QPushButton,
-)
-from PySide6.QtCore import QTimer, Qt, QSettings
+from PySide6.QtCore import QObject, Signal
 
 # Module-level PM (params + controls only; element props added in MergedGUI.__init__)
 # Shared with the Qt panels so MidiPanel can show all scene/feedback params
@@ -52,6 +44,10 @@ _pm: PropertyManager | None = None
 # Module-level LinkManager — owns the SourceRegistry written by audio/MIDI threads
 # and read by the GL thread each frame.
 _lm = LinkManager()
+
+from bpm_clock import BPMClock
+_bpm = BPMClock(event_bus=_lm.event_bus, source_registry=_lm.source_registry)
+_lm._bpm_clock = _bpm
 
 # Current palette from ColorPanel — updated by the Qt listener, read by the GL thread
 # at element spawn / regen time.  Simple list assignment is thread-safe in CPython.
@@ -91,7 +87,6 @@ _params = FeedbackParams(
 
 
 _EFFECT_NAMES = ["feedback", "pass_through", "glitch", "bokeh"]
-
 
 @dataclass
 class SceneControls:
@@ -185,107 +180,25 @@ def apply_fullscreen_to_monitor(mglw_wnd, monitor_index: int) -> None:
 
 
 
-# ── settings panel ─────────────────────────────────────────────────────────────
-
-class SettingsPanel(QWidget):
-    """
-    Application settings, organized into labeled sections.
-
-    on_monitor_change : optional callback(monitor_index: int) invoked when the
-                        user picks a monitor and clicks "Go Fullscreen" in the
-                        Display section.  Use
-                        ``apply_fullscreen_to_monitor(self.wnd, index)`` in the
-                        callback or render loop to apply the switch via GLFW.
-    """
-
-    def __init__(
-        self,
-        on_monitor_change: Callable[[int], None] | None = None,
-        title: str = "Settings",
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        # self.setStyleSheet(_STYLESHEET)
-        self.setMinimumWidth(380)
-
-        self._on_monitor_change = on_monitor_change
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
-
-        form = QFormLayout()
-        form.setContentsMargins(6, 6, 6, 6)
-        form.setSpacing(4)
-        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        outer.addLayout(form)
-        outer.addStretch()
-
-        self._build_display_section(form)
-
-    # ── Display section ──────────────────────────────────────────────────────
-
-    def _build_display_section(self, form: QFormLayout) -> None:
-        """'Display' section: monitor picker and fullscreen button."""
-        hdr = QLabel("Display")
-        hdr.setObjectName("section_header")
-        form.addRow(hdr)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #2e2e38;")
-        form.addRow(sep)
-
-        self._monitor_combo = QComboBox()
-        for label in self._get_monitor_labels():
-            self._monitor_combo.addItem(label)
-        saved_idx = int(QSettings("WarpApp", "WarpApp").value("display/monitor_index", 0))
-        if 0 <= saved_idx < self._monitor_combo.count():
-            self._monitor_combo.setCurrentIndex(saved_idx)
-        form.addRow(QLabel("Monitor"), self._monitor_combo)
-
-        btn = QPushButton("Go Fullscreen")
-        btn.setStyleSheet(
-            "QPushButton {"
-            "  background-color: #1e2a40; color: #5eaeff;"
-            "  border: 1px solid #38383f; border-radius: 3px; padding: 4px 10px;"
-            "}"
-            "QPushButton:hover { background-color: #243050; }"
-            "QPushButton:pressed { background-color: #2a4070; }"
-        )
-        btn.clicked.connect(self._emit_monitor_change)
-        form.addRow("", btn)
-
-    @staticmethod
-    def _get_monitor_labels() -> list[str]:
-        app = QGuiApplication.instance()
-        screens = app.screens() if app else []
-        labels = []
-        for i, s in enumerate(screens):
-            geo = s.geometry()
-            tag = " [primary]" if s == app.primaryScreen() else ""
-            labels.append(
-                f"Monitor {i}: {s.name()} "
-                f"({geo.width()}×{geo.height()} @ {geo.x()},{geo.y()}){tag}"
-            )
-        if not labels:
-            labels = ["Monitor 0 (unknown)"]
-        return labels
-
-    def _emit_monitor_change(self) -> None:
-        if self._on_monitor_change is not None:
-            idx = self._monitor_combo.currentIndex()
-            QSettings("WarpApp", "WarpApp").setValue("display/monitor_index", idx)
-            self._on_monitor_change(idx)
-
-
-# ── public entry point ────────────────────────────────────────────────────────
-
-
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
+
+# Raw key code for ` / GRAVE -- moderngl_window doesn't define a named
+# constant for it, but the code (96) is the same across the pyglet, glfw,
+# and pygame2 backends, so comparing against it directly is safe.
+_BACKTICK_KEY = 96
+
+
+class _PanelSignaller(QObject):
+    """Emitted from the GL thread; slot runs in the Qt thread via QueuedConnection."""
+    show_panel = Signal()
+
+
+# Created inside _run_qt() so it lives in the Qt thread (required for
+# QueuedConnection auto-dispatch when emit() is called from the GL thread).
+_qt_signaller: _PanelSignaller | None = None
+
 
 class MergedGUI(mglw.WindowConfig):
     title        = "Warp -- Merged Scene"
@@ -303,7 +216,7 @@ class MergedGUI(mglw.WindowConfig):
         # draw order follows list order, so this also preserves the original
         # back-to-front draw sequence.
         self.elements: list[DrawingElement] = []
-        for kind in ("cloud", "nn_graph", "circles", "lasers"):
+        for kind in ("cloud", "nn_graph", "circles", "lasers", "falling_discs"):
             self.add_element(kind)
 
         # -- GL state ---------------------------------------------------------
@@ -364,6 +277,7 @@ class MergedGUI(mglw.WindowConfig):
         self.pm = build_default_manager(
             _params, _controls,
             self._first_of_kind("nn_graph"), self._first_of_kind("lasers"), self._first_of_kind("circles"),
+            camera=self.camera,
             pm=_pm,
         )
         _pm = self.pm   # keep module ref in sync
@@ -467,6 +381,9 @@ class MergedGUI(mglw.WindowConfig):
         for _kn in KEY_NAMES:
             reg.update(f"key.{_kn}_hold", 1.0 if _kn in self._held_keys else 0.0)
 
+        # ── BPM clock → source registry (before LFOs so synced LFOs see updated phase) ──
+        _bpm.tick(frame_time)
+
         # ── Tick envelopes + LFOs + parameters → source registry ─────────────
         self.lm.tick_envelopes(frame_time)
         self.lm.tick_lfos(frame_time)
@@ -535,8 +452,13 @@ class MergedGUI(mglw.WindowConfig):
 
     def _draw_scene(self, mvp, ctx: FrameContext) -> None:
         for el in self.elements:
-            if el.visible:
-                el.draw(mvp, ctx)
+            # todo - make the use of el.visible here a different property so we can fast turn off a element,
+            # or slow let the element fade out gracefully when it's deactivated.   The draw element
+            # reacts to 'active' - when it is true it will generate elements, when it is false it will not
+            # generate any new elements and allow the current ones to slowly die off.  Here visibility will
+            # show and hide the element, without affecting the generation or iteration of any elements so we
+            # can flash them on and off.
+            el.draw(mvp, ctx)
 
     # -- Input ----------------------------------------------------------------
 
@@ -586,6 +508,10 @@ class MergedGUI(mglw.WindowConfig):
             self.camera._user_idle = 0.0 if self.camera.orbit_enabled else self.camera._user_idle
             print(f"[merged] orbit: {'ON' if self.camera.orbit_enabled else 'OFF'}")
             return
+        if key == _BACKTICK_KEY:
+            if _qt_signaller is not None:
+                _qt_signaller.show_panel.emit()
+            return
 
         if key == keys.T and self.post_effect_on:
             eff = self._active_effect
@@ -604,108 +530,55 @@ class MergedGUI(mglw.WindowConfig):
 
 
 if __name__ == "__main__":
-    import threading
-    from PySide6.QtWidgets import QApplication
-    from midi_input   import get_router
-    from midi_panel   import MidiPanel
-    from osc_input    import get_router as get_osc_router
-    from osc_panel    import OscPanel
-    from audio_panel  import AudioPanel
-
-    _router     = get_router()
-    _osc_router = get_osc_router()
+    from qt_app import run_qt
 
     # Build base PM now (feedback + scene props only; elements added in GL __init__)
     _pm = build_default_manager(_params, _controls, None, None, None)
 
-    import json, pathlib
-    _POS_FILE = pathlib.Path(__file__).with_name("window_positions.json")
+    _quit_event = threading.Event()
 
-    def _load_positions() -> dict:
-        try:
-            return json.loads(_POS_FILE.read_text())
-        except Exception:
-            return {}
+    def _on_palette_change(palette: list) -> None:
+        global _current_palette
+        _current_palette = palette
 
-    def _save_positions(widgets: dict) -> None:
-        data = {}
-        for name, w in widgets.items():
-            g = w.geometry()
-            data[name] = {"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height()}
-        _POS_FILE.write_text(json.dumps(data, indent=2))
+    def _on_palette_apply(palette: list) -> None:
+        global _current_palette, _pending_palette_apply
+        _current_palette = palette
+        _pending_palette_apply = True
 
-    def _restore_geometry(widget, saved: dict, key: str) -> None:
-        if key in saved:
-            g = saved[key]
-            widget.setGeometry(g["x"], g["y"], g["w"], g["h"])
+    def _set_signaller(s) -> None:
+        global _qt_signaller
+        _qt_signaller = s
 
-    def _run_qt() -> None:
-        """Single Qt thread — one QApplication, one combined control panel."""
-        app = QApplication.instance() or QApplication([])
-
-        saved = _load_positions()
-
-        settings = SettingsPanel(
-            on_monitor_change=lambda idx: globals().__setitem__('_pending_monitor', idx),
-        )
-
-        midi = MidiPanel(_router, title="MIDI Input",
-                         source_registry=_lm.source_registry,
-                         event_bus=_lm.event_bus)
-
-        osc = OscPanel(_osc_router, title="OSC Input",
-                       source_registry=_lm.source_registry,
-                       event_bus=_lm.event_bus)
-
-        audio = AudioPanel(
-            title           = "Audio Input",
-            source_registry = _lm.source_registry,
-        )
-
-        from color_panel import ColorPanel
-
-        def _on_palette_change(palette: list) -> None:
-            global _current_palette
-            _current_palette = palette
-
-        def _on_palette_apply(palette: list) -> None:
-            global _current_palette, _pending_palette_apply
-            _current_palette = palette
-            _pending_palette_apply = True
-
-        colors = ColorPanel(title="Color Harmony", on_change=_on_palette_change, on_apply=_on_palette_apply)
-
-        from elements_panel import ElementsPanel
-        elements_tab = ElementsPanel(
-            event_bus    = _lm.event_bus,
-            get_snapshot = lambda: _element_snapshot,
-            title        = "Scene Elements",
-        )
-
-        from link_panel import LinkManagerPanel
-        links = LinkManagerPanel(
-            _lm, _pm,
-            title="Warp Controls",
-            extra_tabs=[
-                ("Elements", elements_tab),
-                ("MIDI",     midi),
-                ("OSC",      osc),
-                ("Audio",    audio),
-                ("Colors",   colors),
-                ("Settings", settings),
-            ],
-        )
-        _restore_geometry(links, saved, "ControlPanel")
-        links.show()
-
-        app.aboutToQuit.connect(lambda: _save_positions({"ControlPanel": links}))
-
-        app.exec()
-
-    threading.Thread(target=_run_qt, daemon=True, name="qt-ui").start()
+    qt_thread = threading.Thread(
+        target=run_qt, daemon=True, name="qt-ui",
+        kwargs={
+            "lm":                  _lm,
+            "pm_ref":              _pm,
+            "bpm":                 _bpm,
+            "on_monitor_change":   lambda idx: globals().__setitem__('_pending_monitor', idx),
+            "get_element_snapshot": lambda: _element_snapshot,
+            "on_palette_change":   _on_palette_change,
+            "on_palette_apply":    _on_palette_apply,
+            "quit_event":          _quit_event,
+            "set_signaller":       _set_signaller,
+        },
+    )
+    qt_thread.start()
 
     mglw.run_window_config(MergedGUI)
 
-    # After the GL window closes, the PropertyManager is accessible as:
-    #   gui_instance.pm
-    # Use pm.save_json("session.json") to persist presets and mappings.
+    # Give the Qt thread a short chance to quit cleanly (so aboutToQuit / position
+    # saving runs while widgets are still alive), then hard-exit unconditionally.
+    # Signal via a plain threading.Event -- the qt-ui thread's own QTimer notices
+    # it and calls app.quit() on itself. We can't rely on qt_thread.join() actually
+    # completing -- MIDI/OSC panels can do blocking I/O on the GUI thread, so
+    # app.exec() may never return -- and we can't fall through to normal
+    # interpreter shutdown either, since that produced the original cross-thread
+    # teardown errors (and can itself hang). os._exit() skips all of that: no
+    # Python finalization, no waiting on locks.
+    _quit_event.set()
+    qt_thread.join(timeout=2)
+
+    import os
+    os._exit(0)
