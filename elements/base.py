@@ -46,13 +46,13 @@ class DrawingElement(ABC):
 
     def __init__(self) -> None:
         self.name: str = self.kind
-        self.visible: bool = True
+        self.visible: bool = True   # show/hide rendering only; does not affect simulation
+        self.active: bool = True    # when False, stop spawning and let existing particles die off
 
     @abstractmethod
     def step(self, ctx: FrameContext) -> None:
         """Advance simulation for one frame. Called every frame regardless
-        of visibility -- elements decide internally whether to cheapen or
-        pause their own simulation when not visible."""
+        of visible/active -- elements check self.active internally to gate spawning."""
 
     @abstractmethod
     def draw(self, mvp, ctx: FrameContext) -> None:

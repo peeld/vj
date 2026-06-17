@@ -427,7 +427,7 @@ class CircleAxisDrawing(DrawingElement):
                 self._emit_pool[i] = None
 
         # Spawn new circles when active
-        if self.visible:
+        if self.active:
             self._spawn_timer += dt
             while self._spawn_timer >= EMIT_INTERVAL:
                 self._spawn_timer -= EMIT_INTERVAL

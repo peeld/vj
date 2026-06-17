@@ -297,7 +297,7 @@ class LaserRibbons(DrawingElement):
         )
 
         # Spawn (may fire multiple times if dt > spawn_interval)
-        if self.visible:
+        if self.active:
             self._spawn_timer += dt
             while self._spawn_timer >= self.spawn_interval:
                 self._spawn_timer -= self.spawn_interval

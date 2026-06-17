@@ -66,9 +66,9 @@ class CloudElement(DrawingElement):
         """Run physics kernels and upload results to GL buffers.
 
         While visible, dead particles are probabilistically spawned in.
-        While hidden, live particles are probabilistically killed off.
+        While inactive, live particles are probabilistically killed off.
         """
-        if self.visible:
+        if self.active:
             self.cloud_op.spawn_particles()
             self.ball_op.step(ctx.frame_time)
         else:

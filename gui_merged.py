@@ -314,6 +314,7 @@ class MergedGUI(mglw.WindowConfig):
             element.set_palette(_current_palette)
         self.elements.append(element)
         _pm.bind(f"{kind}.visible", element, "visible")
+        _pm.bind(f"{kind}.active",  element, "active")
         print(f"[merged] added element '{element.name}'")
         return element
 
@@ -323,6 +324,7 @@ class MergedGUI(mglw.WindowConfig):
         for i, el in enumerate(self.elements):
             if el.name == name:
                 _pm.unbind(f"{el.kind}.visible")
+                _pm.unbind(f"{el.kind}.active")
                 del self.elements[i]
                 print(f"[merged] removed element '{name}'")
                 return True
@@ -452,13 +454,8 @@ class MergedGUI(mglw.WindowConfig):
 
     def _draw_scene(self, mvp, ctx: FrameContext) -> None:
         for el in self.elements:
-            # todo - make the use of el.visible here a different property so we can fast turn off a element,
-            # or slow let the element fade out gracefully when it's deactivated.   The draw element
-            # reacts to 'active' - when it is true it will generate elements, when it is false it will not
-            # generate any new elements and allow the current ones to slowly die off.  Here visibility will
-            # show and hide the element, without affecting the generation or iteration of any elements so we
-            # can flash them on and off.
-            el.draw(mvp, ctx)
+            if el.visible:
+                el.draw(mvp, ctx)
 
     # -- Input ----------------------------------------------------------------
 

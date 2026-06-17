@@ -361,13 +361,18 @@ def build_default_manager(
             return pm
         return pm.register(prop, obj, attr)
 
-    # ── per-kind visibility (one permanent key per draw kind, drivable from
-    #    Channels regardless of whether an instance is currently live) ──────────
+    # ── per-kind visibility / active (one permanent key per draw kind, drivable
+    #    from Channels regardless of whether an instance is currently live) ──────
     for kind in ELEMENT_TYPES:
         R(PropDef(f"{kind}.visible", kind, "visible", "Visible",
                   bool, True, widget_hint="check",
                   description=f"Show/hide {kind} (drivable via Link Manager "
                               f"expressions)"))
+        R(PropDef(f"{kind}.active", kind, "active", "Active",
+                  bool, True, widget_hint="check",
+                  description=f"Enable/disable spawning for {kind}; when False "
+                              f"stops generating new elements and lets existing "
+                              f"ones die off gracefully"))
 
     # ── feedback (FeedbackParams) ─────────────────────────────────────────────
     _F = "feedback"
