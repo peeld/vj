@@ -16,6 +16,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable
 
+from prop import Node, Prop
+
 
 @dataclass
 class FrameContext:
@@ -34,20 +36,30 @@ class FrameContext:
     cam_up: object
 
 
-class DrawingElement(ABC):
+class DrawingElement(Node, ABC):
     """Base class for a dynamically-managed scene element.
 
     `kind` is the registry key for this type (see ELEMENT_TYPES below).
     `name` defaults to `kind` -- at most one live instance per kind is ever
     permitted, so `kind` alone is already a unique label for removal and UI
     display.
+
+    Subclasses declare their PM section via the section= class keyword, which
+    must match their `kind` string:
+        class CloudElement(DrawingElement, section="cloud"): ...
     """
     kind: str = "element"
 
+    visible = Prop("Visible", bool, True, widget_hint="check",
+                   description="Show/hide rendering; does not affect simulation")
+    active  = Prop("Active",  bool, True, widget_hint="check",
+                   description="Enable/disable spawning; when False stops generating "
+                               "new elements and lets existing ones die off gracefully")
+
     def __init__(self) -> None:
         self.name: str = self.kind
-        self.visible: bool = True   # show/hide rendering only; does not affect simulation
-        self.active: bool = True    # when False, stop spawning and let existing particles die off
+        self.visible: bool = True
+        self.active: bool = True
 
     @abstractmethod
     def step(self, ctx: FrameContext) -> None:
@@ -70,6 +82,11 @@ class DrawingElement(ABC):
 # Populated by each element module at import time via register_element_type(),
 # so a host can discover and construct registered types without hardcoding
 # concrete classes. See elements/readme.md for the registration pattern.
+
+__all__ = [
+    "DrawingElement", "FrameContext", "ELEMENT_TYPES", "register_element_type",
+    "Node", "Prop",
+]
 
 ElementFactory = Callable[..., DrawingElement]
 ELEMENT_TYPES: dict[str, ElementFactory] = {}

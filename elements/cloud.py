@@ -24,14 +24,14 @@ Usage::
 
 import moderngl
 
-from .base import DrawingElement, FrameContext, register_element_type
+from .base import DrawingElement, FrameContext, register_element_type, Prop
 from drawlib.data import BallData, PointCloudData
 from drawlib.operation import BallOperation, PointCloudOperation
 from drawlib.drawable import LinesDrawable, PointsDrawable, ShapeDrawable
 from drawlib.helpers import build_wireframe
 
 
-class CloudElement(DrawingElement):
+class CloudElement(DrawingElement, section="cloud"):
     """Point-cloud + bouncing-ball scene element.
 
     Parameters
@@ -40,6 +40,8 @@ class CloudElement(DrawingElement):
         Active ModernGL context.
     """
     kind = "cloud"
+    ball_size = Prop("Ball Size", float, 1.0, 0.01, 1.0, 0.05,
+                     description="World space radius of the influence ball")
 
     def __init__(self, ctx: moderngl.Context, device=None, **kwargs):
         super().__init__()

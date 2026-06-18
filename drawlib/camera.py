@@ -29,13 +29,15 @@ Usage::
 
 import numpy as np
 
+from prop import Node, Prop
+
 
 def _short_angle(a: float, b: float) -> float:
     """Signed shortest delta from angle a to b (both in degrees)."""
     return (b - a + 180.0) % 360.0 - 180.0
 
 
-class OrbitCamera:
+class OrbitCamera(Node, section="camera"):
     """Spherical orbit camera with optional Lissajous auto-orbit and pose lerp.
 
     Modes
@@ -82,6 +84,16 @@ class OrbitCamera:
     dist_min, dist_max:
         Clamping range for distance.
     """
+
+    _mode_prop    = Prop("Mode", str, "auto_orbit", choices=["auto_orbit", "static"], widget_hint="combo", attr="mode", description="auto_orbit: Lissajous-driven path; static: hold yaw/pitch/dist at set values")
+    yaw           = Prop("Yaw", float, 35.0, -180.0, 180.0, 1.0, description="Horizontal orbit angle in degrees — authoritative in static mode, readable (live) in auto_orbit")
+    pitch         = Prop("Pitch", float, -25.0, -89.0, 89.0, 1.0, description="Vertical tilt in degrees — authoritative in static mode, readable (live) in auto_orbit")
+    dist          = Prop("Distance", float, 1.0, 1.0, 12.0, 0.1, description="Camera distance from the origin")
+    orbit_speed   = Prop("Orbit Speed", float, 0.22, -2.0, 2.0, 0.01, description="Left-right angular speed in rad/s (auto_orbit mode; drivable via Link Manager expressions)")
+    orbit_a       = Prop("Orbit Radius", float, 1.5, 0.5, 12.0, 0.1, description="XZ semi-axis — controls left-right distance amplitude of the orbit path")
+    orbit_b       = Prop("Up-Down Amplitude", float, 0.6, 0.0, 5.0, 0.05, description="Y semi-axis — vertical up-down amplitude of the orbit")
+    orbit_phi     = Prop("Vertical Freq", float, 0.809, 0.1, 5.0, 0.05, description="Up-down frequency multiplier relative to orbit_speed (default ≈ 0.809, golden-ratio drift)")
+    lerp_duration = Prop("Lerp Duration", float, 1.0, 0.1, 10.0, 0.1, description="Default duration (s) for camera.lerp_to() transitions")
 
     def __init__(
         self,

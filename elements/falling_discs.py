@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 import moderngl
 
-from elements.base import DrawingElement, FrameContext, register_element_type
+from elements.base import DrawingElement, FrameContext, register_element_type, Prop
 
 # ── Pool constants ──────────────────────────────────────────────────────────
 _DEFAULT_N      = 200   # disc pool size; changing requires regen()
@@ -143,7 +143,7 @@ def _build_disc_verts(
 
 # ── Element ─────────────────────────────────────────────────────────────────
 
-class FallingDiscsElement(DrawingElement):
+class FallingDiscsElement(DrawingElement, section="falling_discs"):
     """Coloured flat filled circular discs that slowly fall top-to-bottom.
 
     Tunable parameters (all take effect on the next spawn cycle unless noted):

@@ -36,7 +36,7 @@ import numpy as np
 import warp as wp
 import moderngl
 
-from .base import DrawingElement, FrameContext, register_element_type
+from .base import DrawingElement, FrameContext, register_element_type, Prop
 from drawlib.drawable import DynamicTrianglesDrawable
 
 # ── Tuneable constants ────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ def _build_tris(
 
 # ── Element ───────────────────────────────────────────────────────────────────
 
-class LaserRibbons(DrawingElement):
+class LaserRibbons(DrawingElement, section="lasers"):
     """Pool of coloured laser ribbons fired from behind the camera.
 
     Parameters
@@ -179,6 +179,18 @@ class LaserRibbons(DrawingElement):
         Active ModernGL context.
     """
     kind = "lasers"
+    ribbon_speed   = Prop("Ribbon Speed",        float, 7.0,   0.5,  20.0,  0.5,
+                          description="World-space units per second each ribbon travels")
+    ribbon_length  = Prop("Ribbon Length",        float, 0.30,  0.05,  2.0,  0.05,
+                          description="World-space tail length behind the ribbon head")
+    half_width     = Prop("Ribbon Width",         float, 0.018, 0.002, 0.10, 0.002,
+                          description="Half-width of the billboard quad in world space")
+    spawn_interval = Prop("Spawn Interval",       float, 0.045, 0.01,  0.5,  0.005,
+                          description="Seconds between successive ribbon spawns")
+    spawn_spread   = Prop("Spawn Spread",         float, 0.5,   0.0,   3.0,  0.05,
+                          description="Lateral jitter radius at spawn point")
+    max_dist       = Prop("Max Travel Distance",  float, 20.0,  1.0,  50.0,  1.0,
+                          description="Travel distance at which a ribbon is killed")
 
     def __init__(self, ctx: moderngl.Context, device=None, **kwargs):
         super().__init__()

@@ -38,8 +38,11 @@ New parameters
 """
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 import numpy as np
 import warp as wp
+
+from prop import Node, Prop
 
 
 # ═══════════════════════════════════════════════
@@ -47,7 +50,7 @@ import warp as wp
 # ═══════════════════════════════════════════════
 
 @dataclass
-class FeedbackParams:
+class FeedbackParams(Node, section="feedback"):
     # Zoom: >1 pulls toward centre, <1 pushes outward, 1.0 = no movement.
     zoom: float = 1.0                # zoom factor applied each step (1.0 = none)
 
@@ -81,6 +84,17 @@ class FeedbackParams:
     #   < 0  pincushion (pull-in),          try -0.3 – -1.5
     #   0.0  no distortion (default)
     fisheye_strength: float = 0.0
+
+    _zoom_prop:             ClassVar[Prop] = Prop("Zoom", float, 1.0, 0.950, 1.050, 0.001, attr="zoom", description="Zoom factor each feedback step (1.0 = none, >1 = inward, <1 = outward)")
+    _rotation_prop:         ClassVar[Prop] = Prop("Rotation", float, 0.0008, 0.0, 0.01, 0.0001, attr="rotation", description="Radians of rotation per feedback step")
+    _decay_prop:            ClassVar[Prop] = Prop("Decay", float, 0.993, 0.80, 0.999, 0.010, attr="decay", description="Per-step brightness multiplier (lower = shorter trails)")
+    _ripple_strength_prop:  ClassVar[Prop] = Prop("Ripple Strength", float, 0.0, 0.0, 50.0, 0.5, attr="ripple_strength", description="Max pixel displacement of the radial ripple")
+    _ripple_freq_prop:      ClassVar[Prop] = Prop("Ripple Frequency", float, 10.0, 1.0, 30.0, 0.5, attr="ripple_freq", description="Spatial frequency of ripple rings per radius unit")
+    _hue_shift_prop:        ClassVar[Prop] = Prop("Hue Shift", float, 0.005, 0.0, 0.05, 0.002, attr="hue_shift", description="Hue rotation applied to each feedback sample (radians/step)")
+    _chroma_offset_prop:    ClassVar[Prop] = Prop("Chromatic Aberration", float, 0.005, 0.0, 0.05, 0.002, attr="chroma_offset", description="Radial R/B channel offset as fraction of width")
+    _sat_boost_prop:        ClassVar[Prop] = Prop("Saturation Boost", float, 1.12, 1.0, 2.0, 0.05, attr="sat_boost", description="Saturation multiplier on feedback sample (1.0 = flat)")
+    _smear_strength_prop:   ClassVar[Prop] = Prop("Smear Strength", float, 0.0, 0.0, 0.10, 0.005, attr="smear_strength", description="UV offset per step along the smear field direction")
+    _fisheye_strength_prop: ClassVar[Prop] = Prop("Fisheye", float, 0.0, -2.0, 2.0, 0.05, attr="fisheye_strength", description=">0 barrel (wide), <0 pincushion (telephoto), 0 = none")
 
 
 # ═══════════════════════════════════════════════

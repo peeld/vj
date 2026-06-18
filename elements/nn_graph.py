@@ -39,7 +39,7 @@ import warp as wp
 import numpy as np
 import moderngl
 
-from .base import DrawingElement, FrameContext, register_element_type
+from .base import DrawingElement, FrameContext, register_element_type, Prop
 from drawlib.drawable import DynamicLinesDrawable
 
 
@@ -194,7 +194,7 @@ def _build_edges(
 
 # -- NNGraph class -------------------------------------------------------------
 
-class NNGraph(DrawingElement):
+class NNGraph(DrawingElement, section="nn_graph"):
     """
     Animated KNN graph with DFS traversal reveal.
 
@@ -225,6 +225,8 @@ class NNGraph(DrawingElement):
         How many edges to reveal (and separately, to hide) each frame.
     """
     kind = "nn_graph"
+    amplitude = Prop("Drift Amplitude", float, 0.08, 0.0, 0.5, 0.01,
+                     description="Sinusoidal drift radius for each node around its base pos")
 
     def __init__(
         self,
@@ -375,11 +377,11 @@ class NNGraph(DrawingElement):
         )
 
         if not self.active and self._building:
-            self._building = False
+            self.deactivate()
 
         if self.active and not self._building:
-            self._building = True
-
+            self.activate()
+    
         for _ in range(self.edges_per_frame):
             if self._building:
                 self._advance_build()

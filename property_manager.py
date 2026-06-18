@@ -16,9 +16,15 @@ events that recall them) are also managed by LinkManager.
 
 Typical usage (in gui_merged.py)
 ---------------------------------
-    from property_manager import PropertyManager, build_default_manager
+    from property_manager import PropertyManager
+    from elements.base import DrawingElement, ELEMENT_TYPES
 
-    pm = build_default_manager(_params, _controls, nn_graph, laser, circles)
+    pm = PropertyManager()
+    for kind in ELEMENT_TYPES:
+        pm.pre_register_node_class(DrawingElement, kind)
+    pm.register_node(_params)       # FeedbackParams (Node)
+    pm.register_node(_controls)     # SceneControls  (Node)
+    pm.register_node(camera)        # OrbitCamera    (Node, after GL init)
 
     # anywhere — live read/write
     pm.get("feedback.decay")          # -> float
@@ -183,6 +189,81 @@ class PropertyManager:
             obj, attr = self._bindings.pop(key)
             self._values[key] = getattr(obj, attr)
 
+    def register_node(self, node: Any) -> Any:
+        """Register all Prop declarations on a Node instance.
+
+        For each Prop found via node_props(), builds a PropDef and:
+          - key not yet registered: registers + binds to the instance.
+          - key registered but unbound (e.g. pre_register_node_class was
+            called first): latches the stored value onto the instance, then
+            binds (same logic as the R() helper in build_default_manager).
+          - key registered and already bound: no-op.
+
+        Returns node so the call can be used as a one-liner:
+            params = pm.register_node(FeedbackParams())
+        """
+        from prop import Prop as _Prop
+        section = node._node_section
+        if not section:
+            raise ValueError(
+                f"{type(node).__name__} has no _node_section — "
+                f"declare it with section= on the class definition."
+            )
+        for class_attr, prop in type(node).node_props().items():
+            instance_attr = prop.attr if prop.attr is not None else class_attr
+            key = f"{section}.{instance_attr}"
+            if key not in self._defs:
+                pd = PropDef(
+                    key=key, section=section, name=instance_attr,
+                    label=prop.label, type=prop.type, default=prop.default,
+                    min_val=prop.min_val, max_val=prop.max_val, step=prop.step,
+                    choices=prop.choices, widget_hint=prop.widget_hint,
+                    description=prop.description,
+                )
+                self.register(pd, node, instance_attr)
+            elif key not in self._bindings:
+                self.bind(key, node, instance_attr)
+            # else: already registered and bound → no-op
+        return node
+
+    def pre_register_node_class(self, cls: Any, section: str) -> None:
+        """Register Prop declarations from a class without a live instance.
+
+        Keys are registered with their default values but no binding.  When
+        a live instance later calls register_node(), the key is already
+        present so register_node() upgrades to a live binding instead of
+        re-registering — preserving any value that was set in the interim.
+
+        Used at boot time to make element-kind keys (e.g. "cloud.visible")
+        addressable by Link Manager expressions before any element is live.
+        """
+        for class_attr, prop in cls.node_props().items():
+            instance_attr = prop.attr if prop.attr is not None else class_attr
+            key = f"{section}.{instance_attr}"
+            if key not in self._defs:
+                pd = PropDef(
+                    key=key, section=section, name=instance_attr,
+                    label=prop.label, type=prop.type, default=prop.default,
+                    min_val=prop.min_val, max_val=prop.max_val, step=prop.step,
+                    choices=prop.choices, widget_hint=prop.widget_hint,
+                    description=prop.description,
+                )
+                self.register(pd)  # no instance → stored in _values
+
+    def unregister_node(self, node: Any) -> None:
+        """Unbind all keys for node's section, preserving their values.
+
+        Keys remain registered (so Link Manager expressions keep resolving),
+        but no longer proxy to any object.  Calling register_node() with a
+        new instance of the same kind re-binds without re-registering, and
+        the preserved values are latched onto the new instance first.
+        """
+        section = node._node_section
+        for class_attr, prop in type(node).node_props().items():
+            instance_attr = prop.attr if prop.attr is not None else class_attr
+            key = f"{section}.{instance_attr}"
+            self.unbind(key)
+
     # ── Get / Set ─────────────────────────────────────────────────────────────
 
     def get(self, key: str) -> Any:
@@ -321,281 +402,3 @@ class PropertyManager:
         if key not in self._defs:
             raise KeyError(f"Unknown property key: '{key}'. "
                            f"Registered: {list(self._defs)}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Factory:  build the full registry for gui_merged
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_default_manager(
-    params,              # FeedbackParams
-    controls,            # SceneControls
-    cloud,               # Cloud
-    nn_graph,            # NNGraph  (may be None before GL window starts)
-    lasers,              # LaserRibbons  (may be None)
-    circles,             # CircleAxisDrawing  (may be None)
-    camera = None,       # OrbitCamera  (may be None before GL window starts)
-    pm: "PropertyManager | None" = None,
-) -> "PropertyManager":
-    """Construct (or extend) a PropertyManager for gui_merged.
-
-    If *pm* is None a new one is created; otherwise properties are appended
-    to the existing instance.  Element sections (nn_graph / lasers / circles)
-    are skipped when the corresponding argument is None — call again later
-    (passing the same *pm*) once the GL elements exist.
-
-    All properties are bound to live objects so get/set proxy directly.
-    """
-    from post.feedback import BLEND_MODES, SMEAR_PATTERNS, PRESETS
-    from elements.base import ELEMENT_TYPES
-
-    if pm is None:
-        pm = PropertyManager()
-
-    def R(prop, obj=None, attr=None):
-        """Register, skipping keys already present (idempotent re-calls)."""
-        if prop.key in pm._defs:
-            # If a live binding is now available but wasn't before, attach it.
-            if obj is not None and attr is not None and prop.key not in pm._bindings:
-                pm._bindings[prop.key] = (obj, attr)
-                pm._values.pop(prop.key, None)
-            return pm
-        return pm.register(prop, obj, attr)
-
-    # ── per-kind visibility / active (one permanent key per draw kind, drivable
-    #    from Channels regardless of whether an instance is currently live) ──────
-    for kind in ELEMENT_TYPES:
-        R(PropDef(f"{kind}.visible", kind, "visible", "Visible",
-                  bool, True, widget_hint="check",
-                  description=f"Show/hide {kind} (drivable via Link Manager "
-                              f"expressions)"))
-        R(PropDef(f"{kind}.active", kind, "active", "Active",
-                  bool, True, widget_hint="check",
-                  description=f"Enable/disable spawning for {kind}; when False "
-                              f"stops generating new elements and lets existing "
-                              f"ones die off gracefully"))
-
-    # ── feedback (FeedbackParams) ─────────────────────────────────────────────
-    _F = "feedback"
-
-    R(PropDef(f"{_F}.zoom",     _F, "zoom",     "Zoom",
-              float, 1.0,    0.950, 1.050, 0.001,
-              description="Zoom factor each feedback step (1.0 = none, >1 = inward, <1 = outward)"),
-      params, "zoom")
-
-    R(PropDef(f"{_F}.rotation", _F, "rotation", "Rotation",
-              float, 0.0008, 0.0,   0.01,  0.0001,
-              description="Radians of rotation per feedback step"),
-      params, "rotation")
-
-    R(PropDef(f"{_F}.decay",            _F, "decay",            "Decay",
-              float, 0.993,  0.80,  0.999, 0.010,
-              description="Per-step brightness multiplier (lower = shorter trails)"),
-      params, "decay")
-
-    R(PropDef(f"{_F}.ripple_strength",  _F, "ripple_strength",  "Ripple Strength",
-              float, 0.0,    0.0,   50.0,  0.5,
-              description="Max pixel displacement of the radial ripple"),
-      params, "ripple_strength")
-
-    R(PropDef(f"{_F}.ripple_freq",      _F, "ripple_freq",      "Ripple Frequency",
-              float, 10.0,   1.0,   30.0,  0.5,
-              description="Spatial frequency of ripple rings per radius unit"),
-      params, "ripple_freq")
-
-    R(PropDef(f"{_F}.hue_shift",        _F, "hue_shift",        "Hue Shift",
-              float, 0.005,  0.0,   0.05,  0.002,
-              description="Hue rotation applied to each feedback sample (radians/step)"),
-      params, "hue_shift")
-
-    R(PropDef(f"{_F}.chroma_offset",    _F, "chroma_offset",    "Chromatic Aberration",
-              float, 0.005,  0.0,   0.05,  0.002,
-              description="Radial R/B channel offset as fraction of width"),
-      params, "chroma_offset")
-
-    R(PropDef(f"{_F}.sat_boost",        _F, "sat_boost",        "Saturation Boost",
-              float, 1.12,   1.0,   2.0,   0.05,
-              description="Saturation multiplier on feedback sample (1.0 = flat)"),
-      params, "sat_boost")
-
-    R(PropDef(f"{_F}.smear_strength",   _F, "smear_strength",   "Smear Strength",
-              float, 0.0,    0.0,   0.10,  0.005,
-              description="UV offset per step along the smear field direction"),
-      params, "smear_strength")
-
-    R(PropDef(f"{_F}.fisheye_strength", _F, "fisheye_strength", "Fisheye",
-              float, 0.0,    -2.0,  2.0,   0.05,
-              description=">0 barrel (wide), <0 pincushion (telephoto), 0 = none"),
-      params, "fisheye_strength")
-
-    # ── scene (SceneControls) ─────────────────────────────────────────────────
-    # Per-element visibility is no longer here -- it lives on each
-    # DrawingElement instance (.visible) and is managed via the Elements
-    # panel / MergedGUI.add_element()/remove_element(), since the element
-    # list is dynamic rather than a fixed cloud/nn/circles/lasers set.
-    _S = "scene"
-
-    R(PropDef(f"{_S}.scene_alpha",   _S, "scene_alpha",   "Scene Alpha",
-              float, 0.18,   0.02,  1.0,   0.05,
-              description="How strongly the current frame bleeds into feedback"),
-      controls, "scene_alpha")
-
-    R(PropDef(f"{_S}.blend_mode",    _S, "blend_mode",    "Blend Mode",
-              str, "lerp",  choices=BLEND_MODES, widget_hint="combo",
-              description="Compositing operator for scene→feedback injection"),
-      controls, "blend_mode")
-
-    R(PropDef(f"{_S}.smear_pattern", _S, "smear_pattern", "Smear Pattern",
-              str, "outward", choices=SMEAR_PATTERNS, widget_hint="combo",
-              description="Named directional smear vector field"),
-      controls, "smear_pattern")
-
-    R(PropDef(f"{_S}.active_effect", _S, "active_effect", "Active Effect",
-              str, "feedback", choices=["feedback", "pass_through", "glitch", "bokeh"],
-              widget_hint="combo",
-              description="Which post-effect pipeline is active"),
-      controls, "active_effect")
-
-    # ── camera (OrbitCamera) ──────────────────────────────────────────────────
-    if camera is not None:
-        _CAM = "camera"
-
-        R(PropDef(f"{_CAM}.mode",          _CAM, "mode",          "Mode",
-                  str, "auto_orbit", choices=["auto_orbit", "static"],
-                  widget_hint="combo",
-                  description="auto_orbit: Lissajous-driven path; "
-                              "static: hold yaw/pitch/dist at set values"),
-          camera, "mode")
-
-        R(PropDef(f"{_CAM}.yaw",           _CAM, "yaw",           "Yaw",
-                  float, 35.0,  -180.0, 180.0, 1.0,
-                  description="Horizontal orbit angle in degrees — authoritative in "
-                              "static mode, readable (live) in auto_orbit"),
-          camera, "yaw")
-
-        R(PropDef(f"{_CAM}.pitch",         _CAM, "pitch",         "Pitch",
-                  float, -25.0,  -89.0,  89.0, 1.0,
-                  description="Vertical tilt in degrees — authoritative in static "
-                              "mode, readable (live) in auto_orbit"),
-          camera, "pitch")
-
-        R(PropDef(f"{_CAM}.distance",      _CAM, "dist",          "Distance",
-                  float, 1.0,    1.0,   12.0,  0.1,
-                  description="Camera distance from the origin"),
-          camera, "dist")
-
-        R(PropDef(f"{_CAM}.orbit_speed",   _CAM, "orbit_speed",   "Orbit Speed",
-                  float, 0.22,  -2.0,   2.0,   0.01,
-                  description="Left-right angular speed in rad/s (auto_orbit mode; "
-                              "drivable via Link Manager expressions)"),
-          camera, "orbit_speed")
-
-        R(PropDef(f"{_CAM}.orbit_a",       _CAM, "orbit_a",       "Orbit Radius",
-                  float, 1.5,   0.5,   12.0,   0.1,
-                  description="XZ semi-axis — controls left-right distance amplitude "
-                              "of the orbit path"),
-          camera, "orbit_a")
-
-        R(PropDef(f"{_CAM}.orbit_b",       _CAM, "orbit_b",       "Up-Down Amplitude",
-                  float, 0.6,   0.0,    5.0,   0.05,
-                  description="Y semi-axis — vertical up-down amplitude of the orbit"),
-          camera, "orbit_b")
-
-        R(PropDef(f"{_CAM}.orbit_phi",     _CAM, "orbit_phi",     "Vertical Freq",
-                  float, 0.809, 0.1,    5.0,   0.05,
-                  description="Up-down frequency multiplier relative to orbit_speed "
-                              "(default ≈ 0.809, golden-ratio drift)"),
-          camera, "orbit_phi")
-
-        R(PropDef(f"{_CAM}.lerp_duration", _CAM, "lerp_duration", "Lerp Duration",
-                  float, 1.0,   0.1,   10.0,   0.1,
-                  description="Default duration (s) for camera.lerp_to() transitions"),
-          camera, "lerp_duration")
-
-    if cloud is not None:
-
-        _N = "cloud"
-
-        R(PropDef(f"{_N}.ball_size", _N, "ball_size", "Size of the ball",
-                  float, 0.1,   0.01,  1.0,  0.05,
-                  description="World space radius"),
-          cloud, "ball_size")
-
-    # ── nn_graph (NNGraph) ────────────────────────────────────────────────────
-    if nn_graph is not None:
-        _N = "nn_graph"
-
-        R(PropDef(f"{_N}.amplitude", _N, "amplitude", "Drift Amplitude",
-                  float, 0.08,  0.0,  0.5,  0.01,
-                  description="Sinusoidal drift radius for each node around its base pos"),
-          nn_graph, "amplitude")
-
-    # ── lasers (LaserRibbons) ─────────────────────────────────────────────────
-    if lasers is not None:
-        _L = "lasers"
-
-        R(PropDef(f"{_L}.ribbon_speed",   _L, "ribbon_speed",   "Ribbon Speed",
-                  float, 7.0,   0.5,  20.0,  0.5,
-                  description="World-space units per second each ribbon travels"),
-          lasers, "ribbon_speed")
-
-        R(PropDef(f"{_L}.ribbon_length",  _L, "ribbon_length",  "Ribbon Length",
-                  float, 0.30,  0.05, 2.0,   0.05,
-                  description="World-space tail length behind the ribbon head"),
-          lasers, "ribbon_length")
-
-        R(PropDef(f"{_L}.half_width",     _L, "half_width",     "Ribbon Width",
-                  float, 0.018, 0.002, 0.10, 0.002,
-                  description="Half-width of the billboard quad in world space"),
-          lasers, "half_width")
-
-        R(PropDef(f"{_L}.spawn_interval", _L, "spawn_interval", "Spawn Interval",
-                  float, 0.045, 0.01, 0.5,   0.005,
-                  description="Seconds between successive ribbon spawns"),
-          lasers, "spawn_interval")
-
-        R(PropDef(f"{_L}.spawn_spread",   _L, "spawn_spread",   "Spawn Spread",
-                  float, 0.5,   0.0,  3.0,   0.05,
-                  description="Lateral jitter radius at spawn point"),
-          lasers, "spawn_spread")
-
-        R(PropDef(f"{_L}.max_dist",       _L, "max_dist",       "Max Travel Distance",
-                  float, 20.0,  1.0,  50.0,  1.0,
-                  description="Travel distance at which a ribbon is killed"),
-          lasers, "max_dist")
-
-    # ── circles (CircleAxisDrawing) ───────────────────────────────────────────
-    if circles is not None:
-        _C = "circles"
-
-        R(PropDef(f"{_C}.n_circles",         _C, "n_circles",         "Circle Count",
-                  int,   24,    4,    64,    1,
-                  description="Max simultaneous spawned circle+blade ribbons (requires regen)"),
-          circles, "n_circles")
-
-        R(PropDef(f"{_C}.n_trav_lines",      _C, "n_trav_lines",      "Traversal Lines",
-                  int,   35,    0,    100,   1,
-                  description="Number of diagonal traversal line ribbons (requires regen)"),
-          circles, "n_trav_lines")
-
-        R(PropDef(f"{_C}.n_blades",          _C, "n_blades",          "Blade Count",
-                  int,   64,    8,    128,   8,
-                  description="Turbine-blade quads per circle (requires regen)"),
-          circles, "n_blades")
-
-        R(PropDef(f"{_C}.blade_spin_speed",  _C, "blade_spin_speed",  "Blade Spin Speed",
-                  float, 0.2,  -4.0,  4.0,   0.05,
-                  description="Turbine blade rotation speed in radians/second"),
-          circles, "blade_spin_speed")
-
-        R(PropDef(f"{_C}.blade_size_factor", _C, "blade_size_factor", "Blade Size",
-                  float, 0.125, 0.02, 0.4,   0.005,
-                  description="Blade side length as a fraction of circle radius"),
-          circles, "blade_size_factor")
-
-        R(PropDef(f"{_C}.amplitude",         _C, "amplitude",         "Drift Amplitude",
-                  float, 1.0,   0.0,  100.0,   0.05,
-                  description="Global multiplier on each circle's sinusoidal drift amplitude (drivable via Link Manager expressions)"),
-          circles, "amplitude")
-
-    return pm

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 import moderngl
 
-from .base import DrawingElement, FrameContext, register_element_type
+from .base import DrawingElement, FrameContext, register_element_type, Prop
 from drawlib.drawable import RibbonDrawable
 from color_harmony import ColorScheme, generate_palette
 
@@ -327,7 +327,7 @@ def build_geometry(
 # Drawing class (public)
 # ---------------------------------------------------------------------------
 
-class CircleAxisDrawing(DrawingElement):
+class CircleAxisDrawing(DrawingElement, section="circles"):
     """
     Encapsulates all geometry, animation, and draw calls for the circle-axis scene.
 
@@ -345,6 +345,18 @@ class CircleAxisDrawing(DrawingElement):
         drawing.on_key(key, action, keys)      # returns True if key was consumed
     """
     kind = "circles"
+    n_circles         = Prop("Circle Count",    int,   24,    4,   64,   1,
+                             description="Max simultaneous spawned circle+blade ribbons (requires regen)")
+    n_trav_lines      = Prop("Traversal Lines", int,   35,    0,  100,   1,
+                             description="Number of diagonal traversal line ribbons (requires regen)")
+    n_blades          = Prop("Blade Count",     int,   64,    8,  128,   8,
+                             description="Turbine-blade quads per circle (requires regen)")
+    blade_spin_speed  = Prop("Blade Spin Speed", float, 0.2, -4.0,  4.0, 0.05,
+                             description="Turbine blade rotation speed in radians/second")
+    blade_size_factor = Prop("Blade Size",      float, 0.125, 0.02, 0.4, 0.005,
+                             description="Blade side length as a fraction of circle radius")
+    amplitude         = Prop("Drift Amplitude", float, 1.0,   0.0, 100.0, 0.05,
+                             description="Global multiplier on each circle's sinusoidal drift amplitude")
 
     def __init__(self, ctx: moderngl.Context, device=None, **kwargs):
         super().__init__()

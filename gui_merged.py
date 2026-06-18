@@ -15,6 +15,7 @@ All other key mappings are configured via the Link Manager panel (EventLinks).
 import pathlib
 import threading
 from dataclasses import dataclass
+from typing import ClassVar
 
 import moderngl
 import moderngl_window as mglw
@@ -28,10 +29,10 @@ from post import (
 )
 from drawlib.camera import OrbitCamera
 
-from elements.base import DrawingElement, FrameContext, ELEMENT_TYPES
+from elements.base import DrawingElement, FrameContext, ELEMENT_TYPES, Node, Prop
 import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs
 
-from property_manager import PropertyManager, build_default_manager
+from property_manager import PropertyManager
 from link_manager import LinkManager, KEY_NAMES
 
 from PySide6.QtCore import QObject, Signal
@@ -88,7 +89,7 @@ _params = FeedbackParams(
 _EFFECT_NAMES = ["feedback", "pass_through", "glitch", "bokeh"]
 
 @dataclass
-class SceneControls:
+class SceneControls(Node, section="scene"):
     # Per-element visibility lives on each DrawingElement instance (.visible)
     # instead of named booleans here, since the element list is dynamic --
     # see MergedGUI.elements / add_element() / remove_element().
@@ -96,6 +97,11 @@ class SceneControls:
     blend_mode    : str   = "screen"   # screen keeps trail persistence = decay only
     smear_pattern : str   = "outward"
     active_effect : str   = "feedback"
+
+    _scene_alpha_prop:   ClassVar[Prop] = Prop("Scene Alpha", float, 0.18, 0.02, 1.0, 0.05, attr="scene_alpha", description="How strongly the current frame bleeds into feedback")
+    _blend_mode_prop:    ClassVar[Prop] = Prop("Blend Mode", str, "lerp", choices=BLEND_MODES, widget_hint="combo", attr="blend_mode", description="Compositing operator for scene→feedback injection")
+    _smear_pattern_prop: ClassVar[Prop] = Prop("Smear Pattern", str, "outward", choices=SMEAR_PATTERNS, widget_hint="combo", attr="smear_pattern", description="Named directional smear vector field")
+    _active_effect_prop: ClassVar[Prop] = Prop("Active Effect", str, "feedback", choices=["feedback", "pass_through", "glitch", "bokeh"], widget_hint="combo", attr="active_effect", description="Which post-effect pipeline is active")
 
 
 _controls = SceneControls()
@@ -265,22 +271,12 @@ class MergedGUI(mglw.WindowConfig):
         self.lm.event_bus.subscribe("element.set_visible", self._on_set_visible_event)
 
         # -- Property manager -------------------------------------------------
-        # Extend the shared module-level PM with element-specific properties now
-        # that the GL elements exist.  If _pm was already created by the Qt thread
-        # (see __main__), properties that were registered earlier are skipped
-        # (idempotent); only element sections are added here.
-        # NOTE: still bound to the first nn_graph/lasers/circles instance found --
-        # build_default_manager moves to a per-element-instance scheme if/when
-        # the UI needs to bind properties for more than one instance per kind.
+        # Extend the shared module-level PM with camera props now that the GL
+        # camera exists.  feedback/scene/element-kind props already registered
+        # at module init; element-instance props registered by add_element() above.
         global _pm
-        self.pm = build_default_manager(
-            _params, _controls,
-            self._first_of_kind("cloud"),
-            self._first_of_kind("nn_graph"), self._first_of_kind("lasers"), self._first_of_kind("circles"),
-            camera=self.camera,
-            pm=_pm,
-        )
-        _pm = self.pm   # keep module ref in sync
+        _pm.register_node(self.camera)
+        self.pm = _pm
 
         effect_names = "  |  ".join(e.name for e in self._effects)
         print(f"[merged] effects: {effect_names}")
@@ -313,8 +309,7 @@ class MergedGUI(mglw.WindowConfig):
         if _current_palette:
             element.set_palette(_current_palette)
         self.elements.append(element)
-        _pm.bind(f"{kind}.visible", element, "visible")
-        _pm.bind(f"{kind}.active",  element, "active")
+        _pm.register_node(element)
         print(f"[merged] added element '{element.name}'")
         return element
 
@@ -323,21 +318,11 @@ class MergedGUI(mglw.WindowConfig):
         global _pm
         for i, el in enumerate(self.elements):
             if el.name == name:
-                _pm.unbind(f"{el.kind}.visible")
-                _pm.unbind(f"{el.kind}.active")
+                _pm.unregister_node(el)
                 del self.elements[i]
                 print(f"[merged] removed element '{name}'")
                 return True
         return False
-
-    def _first_of_kind(self, kind: str):
-        """Return the first element of *kind*, or None. Used to bind
-        build_default_manager's element-specific properties to a live
-        instance before any per-element-instance UI exists."""
-        for el in self.elements:
-            if el.kind == kind:
-                return el
-        return None
 
     def _on_set_visible_event(self, payload) -> None:
         name, value = payload
@@ -529,8 +514,13 @@ class MergedGUI(mglw.WindowConfig):
 if __name__ == "__main__":
     from qt_app import run_qt
 
-    # Build base PM now (feedback + scene props only; elements added in GL __init__)
-    _pm = build_default_manager(_params, _controls, None,None, None, None)
+    # Build base PM now (feedback + scene + element-kind pre-registration;
+    # element-instance props and camera props are added in GL __init__)
+    _pm = PropertyManager()
+    for _kind in ELEMENT_TYPES:
+        _pm.pre_register_node_class(DrawingElement, _kind)
+    _pm.register_node(_params)
+    _pm.register_node(_controls)
 
     _quit_event = threading.Event()
 
