@@ -9,7 +9,7 @@ rotation/zoom/ripple/fisheye feedback kernel.  To use it:
     loop = FeedbackLoop(width=1280, height=720)
 
     # Each frame:
-    loop.step(bass, mid, treble, time_val)   # feedback: prev → curr
+    loop.step(time_val)                       # feedback: prev → curr
     my_draw_kernel(loop.curr, ...)           # draw anything into curr
     frame_bgr = loop.to_bgr()               # uint8 BGR for OpenCV / display
     loop.advance()                           # curr becomes prev for next frame
@@ -48,19 +48,17 @@ import warp as wp
 
 @dataclass
 class FeedbackParams:
-    # Zoom: pulls every pixel slightly toward the centre each frame.
-    base_zoom: float = 1.003        # zoom factor (>1 = grow inward)
-    zoom_sensitivity: float = 0.04  # extra zoom per unit of bass (0-1)
+    # Zoom: >1 pulls toward centre, <1 pushes outward, 1.0 = no movement.
+    zoom: float = 1.0                # zoom factor applied each step (1.0 = none)
 
     # Rotation around centre.
-    base_rot: float = 0.0004        # radians per frame baseline
-    rot_sensitivity: float = 0.015  # extra rotation per unit of mid (0-1)
+    rotation: float = 0.0004         # radians of rotation per step
 
     # Brightness decay — keeps energy from accumulating forever.
     decay: float = 0.97             # multiply RGB by this each frame (0.95–0.999)
 
-    # Treble-driven radial ripple.
-    ripple_strength: float = 16.0   # max displacement in pixels
+    # Radial ripple.
+    ripple_strength: float = 0.0    # max displacement in pixels (0 = off)
     ripple_freq: float = 12.0       # spatial frequency (rings per radius)
 
     # Hue rotation applied to the prev-frame sample each feedback step.
@@ -193,9 +191,8 @@ def _feedback_kernel(
     prev:  wp.array(dtype=wp.float32),
     curr:  wp.array(dtype=wp.float32),
     w: int, h: int,
-    bass: float, mid: float, treble: float,
-    base_zoom: float, zoom_sensitivity: float,
-    base_rot:  float, rot_sensitivity:  float,
+    zoom: float,
+    rotation: float,
     decay: float,
     ripple_strength: float, ripple_freq: float,
     time_val: float,
@@ -224,20 +221,18 @@ def _feedback_kernel(
     cy = v - 0.5
 
     # ── Zoom toward centre ────────────────────────────────────────────────
-    zoom = base_zoom + bass * zoom_sensitivity
     cx2  = cx * zoom
     cy2  = cy * zoom
 
     # ── Rotation ──────────────────────────────────────────────────────────
-    angle = base_rot + mid * rot_sensitivity
-    cos_a = wp.cos(angle);  sin_a = wp.sin(angle)
+    cos_a = wp.cos(rotation);  sin_a = wp.sin(rotation)
     cx3   = cx2 * cos_a - cy2 * sin_a
     cy3   = cx2 * sin_a + cy2 * cos_a
 
-    # ── Treble ripple (radial) ─────────────────────────────────────────────
+    # ── Radial ripple ─────────────────────────────────────────────────────
     dist  = wp.sqrt(cx3 * cx3 + cy3 * cy3) + 1e-6
     phase = dist * ripple_freq - time_val * 2.0
-    ripple = treble * ripple_strength * wp.sin(phase)
+    ripple = ripple_strength * wp.sin(phase)
     nx = cx3 + (cx3 / dist) * ripple / float(w)
     ny = cy3 + (cy3 / dist) * ripple / float(h)
 
@@ -253,10 +248,12 @@ def _feedback_kernel(
         ny = ny * scale
 
     # ── Screen-space smear ────────────────────────────────────────────────
+    # Subtract sv so the pattern direction matches visual flow direction:
+    # "outward" vectors → sample from closer to centre → content moves outward.
     if smear_strength > 0.0:
         sv = sample_smear_field(smear_field, nx + 0.5, ny + 0.5, smear_gw, smear_gh)
-        nx = nx + sv[0] * smear_strength * smear_strength
-        ny = ny + sv[1] * smear_strength * smear_strength
+        nx = nx - sv[0] * smear_strength * smear_strength
+        ny = ny - sv[1] * smear_strength * smear_strength
 
     # ── Chromatic aberration: sample R further from centre, B closer ──────
     cdx = (cx3 / (dist + 1e-6)) * chroma_offset
@@ -438,9 +435,6 @@ class FeedbackLoop:
 
     def step(
         self,
-        bass:     float = 0.0,
-        mid:      float = 0.0,
-        treble:   float = 0.0,
         time_val: float = 0.0,
         params:   "FeedbackParams | None" = None,
     ) -> None:
@@ -452,9 +446,8 @@ class FeedbackLoop:
             inputs=[
                 self._prev, self._curr,
                 self.width, self.height,
-                float(bass), float(mid), float(treble),
-                float(p.base_zoom),       float(p.zoom_sensitivity),
-                float(p.base_rot),        float(p.rot_sensitivity),
+                float(p.zoom),
+                float(p.rotation),
                 float(p.decay),
                 float(p.ripple_strength), float(p.ripple_freq),
                 float(time_val),

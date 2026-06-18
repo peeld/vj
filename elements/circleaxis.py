@@ -438,8 +438,9 @@ class CircleAxisDrawing(DrawingElement):
     def draw(self, mvp: np.ndarray, ctx: FrameContext) -> None:
         """Update animated positions and issue the draw calls."""
         t = ctx.current_time
+
         # Traversal lines: always-on persistent layer.
-        if self._trav_metas:
+        if self._trav_metas and self.active:
             trav_verts = self._animated_trav_positions(t)
             self._geo.update(vertices=trav_verts)
             self._geo.draw(mvp)

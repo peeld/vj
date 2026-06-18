@@ -157,7 +157,6 @@ def _build_edges(
     visibility: wp.array(dtype=float),
     edge_pos:   wp.array(dtype=wp.vec3),
     edge_col:   wp.array(dtype=wp.vec4),
-    fade_dist:  float,
 ):
     """
     Write flat edge VBO from the KNN snapshot.
@@ -222,8 +221,6 @@ class NNGraph(DrawingElement):
         RNG seed for the initial point layout.
     amplitude:
         Maximum sinusoidal drift of each point from its base position.
-    fade_dist:
-        Kept for API compatibility; no longer used in the revealed-edge path.
     edges_per_frame:
         How many edges to reveal (and separately, to hide) each frame.
     """
@@ -235,12 +232,10 @@ class NNGraph(DrawingElement):
         device:          str,
         seed:            int   = 42,
         amplitude:       float = 0.08,
-        fade_dist:       float = 0.5,
         edges_per_frame: int   = 3,
     ):
         self._device         = device
         self.amplitude       = amplitude
-        self.fade_dist       = fade_dist
         self.edges_per_frame = edges_per_frame
 
         # Live simulation arrays
@@ -379,6 +374,12 @@ class NNGraph(DrawingElement):
             device=self._device,
         )
 
+        if not self.active and self._building:
+            self._building = False
+
+        if self.active and not self._building:
+            self._building = True
+
         for _ in range(self.edges_per_frame):
             if self._building:
                 self._advance_build()
@@ -392,8 +393,7 @@ class NNGraph(DrawingElement):
                 self._wp_pos, self._wp_col,
                 self._wp_knn_snap,   # ← frozen snapshot, not live nn_indices
                 wp_vis,
-                self._wp_edge_pos, self._wp_edge_col,
-                self.fade_dist,
+                self._wp_edge_pos, self._wp_edge_col
             ],
             device=self._device,
         )

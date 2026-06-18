@@ -48,14 +48,16 @@ class CloudElement(DrawingElement):
         self.cloud_op   = PointCloudOperation(self.cloud_data)
         self.ball_op    = BallOperation(self.ball_data)
 
+        self.ball_size = 1.0
+
         self.cloud_draw = PointsDrawable(ctx)
         self.cloud_draw.setup(
             self.cloud_data.positions_numpy(),
             self.cloud_data.colors_numpy(),
         )
 
-        self.wire_draw = LinesDrawable(ctx)
-        self.wire_draw.setup(*build_wireframe(self.cloud_data.cube_half))
+        #self.wire_draw = LinesDrawable(ctx)
+        #self.wire_draw.setup(*build_wireframe(self.cloud_data.cube_half))
 
         self.ball_draw = ShapeDrawable(ctx)
         self.ball_draw.setup(self.ball_data.positions_numpy(), BallData.COLORS)
@@ -68,11 +70,14 @@ class CloudElement(DrawingElement):
         While visible, dead particles are probabilistically spawned in.
         While inactive, live particles are probabilistically killed off.
         """
+        self.ball_op.step(ctx.frame_time)
+
         if self.active:
             self.cloud_op.spawn_particles()
-            self.ball_op.step(ctx.frame_time)
         else:
             self.cloud_op.kill_particles()
+
+        self.cloud_op.influence_radius = self.ball_size
 
         self.cloud_op.step(ctx.time, ctx.frame_time, self.ball_data)
         self.cloud_draw.write_warp(self.cloud_data.wp_pos, self.cloud_data.wp_col)
@@ -81,7 +86,7 @@ class CloudElement(DrawingElement):
     def draw(self, mvp, ctx: FrameContext) -> None:
         """Issue draw calls for the cloud, wireframe, and balls."""
         self.cloud_draw.draw(mvp)
-        self.wire_draw.draw(mvp)
+        # self.wire_draw.draw(mvp)
         # self.ball_draw.draw(mvp, point_size=80.0)
 
     def regen(self) -> None:

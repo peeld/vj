@@ -330,6 +330,7 @@ class PropertyManager:
 def build_default_manager(
     params,              # FeedbackParams
     controls,            # SceneControls
+    cloud,               # Cloud
     nn_graph,            # NNGraph  (may be None before GL window starts)
     lasers,              # LaserRibbons  (may be None)
     circles,             # CircleAxisDrawing  (may be None)
@@ -377,25 +378,15 @@ def build_default_manager(
     # ── feedback (FeedbackParams) ─────────────────────────────────────────────
     _F = "feedback"
 
-    R(PropDef(f"{_F}.base_zoom",        _F, "base_zoom",        "Base Zoom",
-              float, 1.002,  1.000, 1.050, 0.001,
-              description="Zoom factor each feedback step (1.0 = none, >1 = inward)"),
-      params, "base_zoom")
+    R(PropDef(f"{_F}.zoom",     _F, "zoom",     "Zoom",
+              float, 1.0,    0.950, 1.050, 0.001,
+              description="Zoom factor each feedback step (1.0 = none, >1 = inward, <1 = outward)"),
+      params, "zoom")
 
-    R(PropDef(f"{_F}.zoom_sensitivity", _F, "zoom_sensitivity", "Zoom/Bass Sensitivity",
-              float, 0.0,    0.0,   0.2,   0.005,
-              description="Extra zoom added per unit of bass energy"),
-      params, "zoom_sensitivity")
-
-    R(PropDef(f"{_F}.base_rot",         _F, "base_rot",         "Base Rotation",
+    R(PropDef(f"{_F}.rotation", _F, "rotation", "Rotation",
               float, 0.0008, 0.0,   0.01,  0.0001,
               description="Radians of rotation per feedback step"),
-      params, "base_rot")
-
-    R(PropDef(f"{_F}.rot_sensitivity",  _F, "rot_sensitivity",  "Rot/Mid Sensitivity",
-              float, 0.0,    0.0,   0.1,   0.005,
-              description="Extra rotation per unit of mid energy"),
-      params, "rot_sensitivity")
+      params, "rotation")
 
     R(PropDef(f"{_F}.decay",            _F, "decay",            "Decay",
               float, 0.993,  0.80,  0.999, 0.010,
@@ -404,7 +395,7 @@ def build_default_manager(
 
     R(PropDef(f"{_F}.ripple_strength",  _F, "ripple_strength",  "Ripple Strength",
               float, 0.0,    0.0,   50.0,  0.5,
-              description="Max pixel displacement of treble-driven radial ripple"),
+              description="Max pixel displacement of the radial ripple"),
       params, "ripple_strength")
 
     R(PropDef(f"{_F}.ripple_freq",      _F, "ripple_freq",      "Ripple Frequency",
@@ -469,17 +460,66 @@ def build_default_manager(
     if camera is not None:
         _CAM = "camera"
 
-        R(PropDef(f"{_CAM}.orbit_speed", _CAM, "orbit_speed",  "Orbit Speed",
-                  float, 0.22,  -2.0, 2.0,  0.01,
-                  description="Horizontal angular speed of the auto-orbit, rad/s "
-                              "(drivable via Link Manager expressions)"),
-          camera, "_orbit_speed")
+        R(PropDef(f"{_CAM}.mode",          _CAM, "mode",          "Mode",
+                  str, "auto_orbit", choices=["auto_orbit", "static"],
+                  widget_hint="combo",
+                  description="auto_orbit: Lissajous-driven path; "
+                              "static: hold yaw/pitch/dist at set values"),
+          camera, "mode")
 
-        R(PropDef(f"{_CAM}.distance",    _CAM, "dist",         "Distance",
-                  float, 1.0,   1.0,  12.0,  0.1,
-                  description="Camera distance from the origin "
-                              "(drivable via Link Manager expressions)"),
+        R(PropDef(f"{_CAM}.yaw",           _CAM, "yaw",           "Yaw",
+                  float, 35.0,  -180.0, 180.0, 1.0,
+                  description="Horizontal orbit angle in degrees — authoritative in "
+                              "static mode, readable (live) in auto_orbit"),
+          camera, "yaw")
+
+        R(PropDef(f"{_CAM}.pitch",         _CAM, "pitch",         "Pitch",
+                  float, -25.0,  -89.0,  89.0, 1.0,
+                  description="Vertical tilt in degrees — authoritative in static "
+                              "mode, readable (live) in auto_orbit"),
+          camera, "pitch")
+
+        R(PropDef(f"{_CAM}.distance",      _CAM, "dist",          "Distance",
+                  float, 1.0,    1.0,   12.0,  0.1,
+                  description="Camera distance from the origin"),
           camera, "dist")
+
+        R(PropDef(f"{_CAM}.orbit_speed",   _CAM, "orbit_speed",   "Orbit Speed",
+                  float, 0.22,  -2.0,   2.0,   0.01,
+                  description="Left-right angular speed in rad/s (auto_orbit mode; "
+                              "drivable via Link Manager expressions)"),
+          camera, "orbit_speed")
+
+        R(PropDef(f"{_CAM}.orbit_a",       _CAM, "orbit_a",       "Orbit Radius",
+                  float, 1.5,   0.5,   12.0,   0.1,
+                  description="XZ semi-axis — controls left-right distance amplitude "
+                              "of the orbit path"),
+          camera, "orbit_a")
+
+        R(PropDef(f"{_CAM}.orbit_b",       _CAM, "orbit_b",       "Up-Down Amplitude",
+                  float, 0.6,   0.0,    5.0,   0.05,
+                  description="Y semi-axis — vertical up-down amplitude of the orbit"),
+          camera, "orbit_b")
+
+        R(PropDef(f"{_CAM}.orbit_phi",     _CAM, "orbit_phi",     "Vertical Freq",
+                  float, 0.809, 0.1,    5.0,   0.05,
+                  description="Up-down frequency multiplier relative to orbit_speed "
+                              "(default ≈ 0.809, golden-ratio drift)"),
+          camera, "orbit_phi")
+
+        R(PropDef(f"{_CAM}.lerp_duration", _CAM, "lerp_duration", "Lerp Duration",
+                  float, 1.0,   0.1,   10.0,   0.1,
+                  description="Default duration (s) for camera.lerp_to() transitions"),
+          camera, "lerp_duration")
+
+    if cloud is not None:
+
+        _N = "cloud"
+
+        R(PropDef(f"{_N}.ball_size", _N, "ball_size", "Size of the ball",
+                  float, 0.1,   0.01,  1.0,  0.05,
+                  description="World space radius"),
+          cloud, "ball_size")
 
     # ── nn_graph (NNGraph) ────────────────────────────────────────────────────
     if nn_graph is not None:
@@ -489,11 +529,6 @@ def build_default_manager(
                   float, 0.08,  0.0,  0.5,  0.01,
                   description="Sinusoidal drift radius for each node around its base pos"),
           nn_graph, "amplitude")
-
-        R(PropDef(f"{_N}.fade_dist", _N, "fade_dist", "Edge Fade Distance",
-                  float, 0.5,   0.1,  2.0,  0.05,
-                  description="World-space distance at which edge alpha drops to zero"),
-          nn_graph, "fade_dist")
 
     # ── lasers (LaserRibbons) ─────────────────────────────────────────────────
     if lasers is not None:

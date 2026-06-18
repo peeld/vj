@@ -20,13 +20,35 @@ Usage::
 
     # toggle auto-orbit
     cam.orbit_enabled = not cam.orbit_enabled
+    # or via the mode string property
+    cam.mode = "static"   # "auto_orbit" | "static"
+
+    # lerp to a pose
+    cam.lerp_to(yaw=90.0, pitch=-15.0, dist=3.0, duration=2.0)
 """
 
 import numpy as np
 
 
+def _short_angle(a: float, b: float) -> float:
+    """Signed shortest delta from angle a to b (both in degrees)."""
+    return (b - a + 180.0) % 360.0 - 180.0
+
+
 class OrbitCamera:
-    """Spherical orbit camera with optional Lissajous auto-orbit.
+    """Spherical orbit camera with optional Lissajous auto-orbit and pose lerp.
+
+    Modes
+    -----
+    "auto_orbit"  (orbit_enabled=True, default)
+        tick() drives yaw/pitch/dist from a Lissajous path controlled by
+        orbit_speed, orbit_a, orbit_b, and orbit_phi.
+    "static"  (orbit_enabled=False)
+        yaw/pitch/dist are held at whatever value is set externally.
+
+    lerp_to(yaw, pitch, dist, duration)
+        Overrides both modes for the duration of the transition; on completion
+        the camera stays at the target and the previous mode resumes.
 
     Parameters
     ----------
@@ -41,15 +63,18 @@ class OrbitCamera:
     orbit_enabled:
         Start in auto-orbit mode.
     orbit_a:
-        XZ semi-axis of the elliptical orbit path.
+        XZ semi-axis of the elliptical orbit path (left-right distance amplitude).
     orbit_b:
-        Y semi-axis (vertical amplitude).
+        Y semi-axis (vertical / up-down amplitude).
     orbit_speed:
-        Horizontal angular speed in rad/s.
+        Horizontal angular speed in rad/s (left-right orbit frequency).
     orbit_phi:
-        Vertical frequency multiplier (golden-ratio fraction by default -> slow drift).
+        Up-down frequency multiplier — effective vertical frequency is
+        orbit_speed * orbit_phi (default ≈ 0.809, golden-ratio drift).
     orbit_resume_delay:
         Seconds of idle time before auto-orbit reclaims the camera after user input.
+    lerp_duration:
+        Default lerp duration in seconds used by lerp_to() when no duration is given.
     drag_sensitivity:
         Degrees per pixel for mouse drag.
     scroll_sensitivity:
@@ -72,6 +97,7 @@ class OrbitCamera:
         orbit_speed:        float = 0.22,
         orbit_phi:          float = (1 + 5 ** 0.5) / 2 * 0.5,
         orbit_resume_delay: float = 2.0,
+        lerp_duration:      float = 1.0,
         drag_sensitivity:   float = 0.4,
         scroll_sensitivity: float = 0.2,
         dist_min:           float = 1.0,
@@ -86,14 +112,22 @@ class OrbitCamera:
         self._far  = far
 
         # Auto-orbit
-        self.orbit_enabled      = orbit_enabled
-        self._orbit_t           = 0.0
-        self._orbit_a           = orbit_a
-        self._orbit_b           = orbit_b
-        self._orbit_speed       = orbit_speed
-        self._orbit_phi         = orbit_phi
+        self.orbit_enabled       = orbit_enabled
+        self._orbit_t            = 0.0
+        self.orbit_speed         = orbit_speed
+        self.orbit_a             = orbit_a
+        self.orbit_b             = orbit_b
+        self.orbit_phi           = orbit_phi
         self._orbit_resume_delay = orbit_resume_delay
-        self._user_idle         = 0.0
+        self._user_idle          = 0.0
+
+        # Lerp
+        self.lerp_duration = lerp_duration
+        self._lerp_active  = False
+        self._lerp_t       = 0.0
+        self._lerp_src     = (yaw, pitch, distance)
+        self._lerp_dst     = (yaw, pitch, distance)
+        self._lerp_dur     = lerp_duration
 
         # Input
         self._drag_sens   = drag_sensitivity
@@ -101,20 +135,67 @@ class OrbitCamera:
         self._dist_min    = dist_min
         self._dist_max    = dist_max
 
-    # -------------------------------------------------------------------------
+    # ── Mode ──────────────────────────────────────────────────────────────────
+
+    @property
+    def mode(self) -> str:
+        """Camera drive mode: "auto_orbit" or "static"."""
+        return "auto_orbit" if self.orbit_enabled else "static"
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        self.orbit_enabled = (value == "auto_orbit")
+
+    # ── Lerp ──────────────────────────────────────────────────────────────────
+
+    def lerp_to(
+        self,
+        yaw:      float,
+        pitch:    float,
+        dist:     float,
+        duration: float | None = None,
+    ) -> None:
+        """Smoothly transition to (yaw, pitch, dist) over *duration* seconds.
+
+        While the lerp is active it overrides both static and auto-orbit modes.
+        On completion the camera holds the target pose and the previous mode resumes.
+        """
+        self._lerp_src = (self.yaw, self.pitch, self.dist)
+        self._lerp_dst = (yaw, pitch, dist)
+        self._lerp_dur = duration if duration is not None else self.lerp_duration
+        self._lerp_t   = 0.0
+        self._lerp_active = True
+
+    # ── Per-frame update ──────────────────────────────────────────────────────
 
     def tick(self, dt: float) -> None:
-        """Advance auto-orbit by dt seconds (no-op when disabled or user is active)."""
-        if not self.orbit_enabled:
+        """Advance camera state by dt seconds."""
+        if self._lerp_active:
+            self._lerp_t += dt
+            t   = min(self._lerp_t / max(self._lerp_dur, 1e-6), 1.0)
+            t_s = t * t * (3.0 - 2.0 * t)  # smoothstep ease
+
+            sy, sp, sd = self._lerp_src
+            dy, dp, dd = self._lerp_dst
+            self.yaw   = sy + _short_angle(sy, dy) * t_s
+            self.pitch = sp + (dp - sp) * t_s
+            self.dist  = sd + (dd - sd) * t_s
+
+            if t >= 1.0:
+                self._lerp_active = False
             return
+
+        if not self.orbit_enabled:
+            return  # static mode — hold current yaw/pitch/dist
+
         if self._user_idle > 0.0:
             self._user_idle -= dt
             return
 
         self._orbit_t += dt
-        ox = self._orbit_a * np.cos(self._orbit_t * self._orbit_speed)
-        oy = self._orbit_b * np.sin(self._orbit_t * self._orbit_speed * self._orbit_phi)
-        oz = self._orbit_a * np.sin(self._orbit_t * self._orbit_speed)
+        ox = self.orbit_a * np.cos(self._orbit_t * self.orbit_speed)
+        oy = self.orbit_b * np.sin(self._orbit_t * self.orbit_speed * self.orbit_phi)
+        oz = self.orbit_a * np.sin(self._orbit_t * self.orbit_speed)
         d  = float(np.sqrt(ox * ox + oy * oy + oz * oz))
 
         self.dist  = d

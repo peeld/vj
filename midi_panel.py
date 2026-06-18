@@ -253,6 +253,7 @@ class MidiPanel(QWidget):
         try:
             if evt["type"] == "cc":
                 if self._source_registry is not None:
+                    print(f"midi.cc{evt['number']} {evt["value"] / 127.0}")
                     self._source_registry.update(
                         f"midi.cc{evt['number']}", evt["value"] / 127.0
                     )
@@ -263,11 +264,13 @@ class MidiPanel(QWidget):
                     if value > 0:
                         self._source_registry.update(f"midi.note{note}",     1.0)
                         self._source_registry.update(f"midi.note{note}_vel", value / 127.0)
+
                     else:
                         self._source_registry.update(f"midi.note{note}", 0.0)
                         # _vel kept at last note-on value — not updated on note-off
                 if self._event_bus is not None:
                     if value > 0:
+                        print(f"midi.note{note}.on")
                         self._event_bus.fire(f"midi.note{note}.on",  value)
                     else:
                         self._event_bus.fire(f"midi.note{note}.off", 0)

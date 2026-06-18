@@ -73,6 +73,7 @@ class ControlBar(QWidget):
         self._restore_position()
 
     def show_and_raise(self) -> None:
+        print("FOO")
         self.showNormal()
         self.raise_()
         self.activateWindow()

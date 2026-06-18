@@ -16,10 +16,11 @@ Auto-loads link_state.json on startup if the file exists.
 from __future__ import annotations
 
 import pathlib
+import time
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QTimer, Signal, QSortFilterProxyModel, QEvent
-from PySide6.QtGui import QColor, QFont, QKeyEvent, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QBrush, QColor, QFont, QKeyEvent, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QLineEdit,
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QFrame, QDoubleSpinBox, QSpinBox,
     QCompleter, QAbstractItemView, QDialog, QDialogButtonBox, QInputDialog,
     QTableView, QTreeView, QStyledItemDelegate, QAbstractItemDelegate,
-    QTreeWidget, QTreeWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QMenu,
 )
 
 from link_manager import (
@@ -1181,20 +1182,41 @@ class ChannelsTab(QWidget):
     def _open_picker(self, anchor: QPushButton, sink_key: str) -> None:
         snap = self._lm.source_registry.snapshot()
 
-        def on_select(source_key: str) -> None:
+        groups: dict[str, list[str]] = {}
+        for key in sorted(snap.keys()):
+            if key.endswith("_smooth") or key.endswith("_peak"):
+                continue
+            prefix = key.split(".")[0] if "." in key else "other"
+            groups.setdefault(prefix, []).append(key)
+
+        ordered = [g for g in _SOURCE_GROUP_ORDER if g in groups]
+        rest = sorted(k for k in groups if k not in _SOURCE_GROUP_ORDER and k != "other")
+        if "other" in groups:
+            rest.append("other")
+        ordered.extend(rest)
+
+        menu = QMenu(self)
+        for group_name in ordered:
+            submenu = menu.addMenu(group_name)
+            for key in groups[group_name]:
+                short = key[len(group_name) + 1:] if key.startswith(group_name + ".") else key
+                act = submenu.addAction(short)
+                act.setData(key)
+
+        def _on_triggered(action) -> None:
+            full_key = action.data()
+            if not full_key:
+                return
             entry = self._model.row_for_key.get(sink_key)
             if entry is None:
                 return
             grp_item, child_row = entry
             expr_item = grp_item.child(child_row, ChannelsModel.COL_EXPR)
             if expr_item is not None:
-                expr_item.setText(source_key)
+                expr_item.setText(full_key)
 
-        popup = _SourcePickerPopup(snap, on_select)
-        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
-        popup.move(pos)
-        popup.resize(280, 320)
-        popup.show()
+        menu.triggered.connect(_on_triggered)
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
 
     def _refresh_live_values(self) -> None:
         """Update the Live Value column; skips unchanged cells to suppress repaints."""
@@ -1515,7 +1537,15 @@ class EventsTab(QWidget):
         th_hint.setObjectName("info")
         lo.addWidget(th_hint)
 
+        self._recent_events: dict[str, float] = {}
+        self._bus_tokens: list[int] = []
+
         self._rebuild()
+
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(80)
+        self._flash_timer.timeout.connect(self._update_flash)
+        self._flash_timer.start()
 
     # ── MIDI capture ──────────────────────────────────────────────────────────
 
@@ -1535,10 +1565,11 @@ class EventsTab(QWidget):
         def _on_event(evt: dict) -> None:
             if evt.get("type") != "note":
                 return
+            if evt.get("value", 0) == 0:  # skip note-off; wait for note-on
+                return
             router.remove_listener(_on_event)
             note = evt["number"]
-            vel  = evt.get("value", 0)
-            event_str = f"midi.note{note}.{'on' if vel > 0 else 'off'}"
+            event_str = f"midi.note{note}.on"
             # Marshal back to Qt thread
             QTimer.singleShot(0, lambda: self._open_with_event(event_str))
             # self._open_with_event(event_str)
@@ -1600,6 +1631,44 @@ class EventsTab(QWidget):
             self._th_table.setItem(r, 2, _cell(f"{defn.high:.3f}"))
             self._th_table.setItem(r, 3, _cell(f"{defn.low:.3f}"))
             self._th_table.setItem(r, 4, _cell(f"{defn.min_interval_s:.3f}"))
+
+        self._rewire_subscriptions()
+
+    # ── Event flash indicator ─────────────────────────────────────────────────
+
+    def _rewire_subscriptions(self) -> None:
+        for token in self._bus_tokens:
+            self._lm.event_bus.unsubscribe(token)
+        self._bus_tokens.clear()
+        self._recent_events.clear()
+        for link in self._lm._event_links:
+            eid = link.event
+            def _cb(_payload, _eid=eid):
+                QTimer.singleShot(0, lambda e=_eid: self._flash_event(e))
+            self._bus_tokens.append(self._lm.event_bus.subscribe(eid, _cb))
+
+    def _flash_event(self, event_id: str) -> None:
+        self._recent_events[event_id] = time.monotonic()
+
+    _FLASH_DUR = 0.4  # seconds a row stays highlighted after its event fires
+
+    def _update_flash(self) -> None:
+        if not self._recent_events:
+            return
+        now = time.monotonic()
+        links = self._lm._event_links
+        n  = min(self._el_table.rowCount(), len(links))
+        nc = self._el_table.columnCount()
+        _active_bg  = QColor(80, 55, 0)   # dark amber flash
+        _default_bg = QBrush()             # NoBrush → stylesheet alternating rows
+        for r in range(n):
+            last   = self._recent_events.get(links[r].event, 0.0)
+            active = (now - last) < self._FLASH_DUR
+            bg = _active_bg if active else _default_bg
+            for c in range(nc):
+                item = self._el_table.item(r, c)
+                if item is not None:
+                    item.setBackground(bg)
 
     # EventLink CRUD
 

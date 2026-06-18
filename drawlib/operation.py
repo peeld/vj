@@ -14,17 +14,16 @@ from drawlib.kernels import (
 
 
 class PointCloudOperation:
-    INFLUENCE_RADIUS   = 0.35   # world-space units
-    INFLUENCE_STRENGTH = 6.0    # velocity impulse scale
-    DAMPING            = 0.99   # per-frame velocity multiplier
     VEL_THRESH         = 0.005  # below this speed a point is considered stopped
-
     SPAWN_PROB = 0.05   # probability per dead particle per frame to activate
     KILL_PROB  = 0.008  # probability per live particle per frame to deactivate
 
     def __init__(self, data: PointCloudData):
         self.data   = data
         self._frame = 0
+        self.influence_radius = 0.35  # world-space units
+        self.influence_strength = 6.0    # velocity impulse scale
+        self.damping = 0.99  # per-frame velocity multiplier
 
     def apply_ball_influence(self, ball_data: BallData, dt: float):
         """Push points away from each ball within INFLUENCE_RADIUS."""
@@ -35,8 +34,8 @@ class PointCloudOperation:
                 self.data.wp_pos,
                 self.data.wp_vel,
                 ball_data.wp_pos,
-                self.INFLUENCE_RADIUS,
-                self.INFLUENCE_STRENGTH,
+                self.influence_radius,
+                self.influence_strength,
                 dt,
             ],
         )
@@ -50,7 +49,7 @@ class PointCloudOperation:
                 self.data.wp_pos,
                 self.data.wp_vel,
                 dt,
-                self.DAMPING,
+                self.damping,
             ],
         )
 
@@ -64,7 +63,7 @@ class PointCloudOperation:
                 self.data.wp_col,
                 ball_data.wp_pos,
                 ball_data.wp_colors,
-                self.INFLUENCE_RADIUS,
+                self.influence_radius,
             ],
         )
 

@@ -164,8 +164,7 @@ PRESETS: list[EffectPreset] = [
     EffectPreset(
         name="gentle",
         params=FeedbackParams(
-            base_zoom=1.002, zoom_sensitivity=0.0,
-            base_rot=0.0008, rot_sensitivity=0.0,
+            zoom=1.002, rotation=0.0008,
             decay=0.993, ripple_strength=0.0, ripple_freq=10.0,
             hue_shift=0.005, chroma_offset=0.005,
             sat_boost=1.12, smear_strength=0.0, fisheye_strength=0.0,
@@ -176,8 +175,7 @@ PRESETS: list[EffectPreset] = [
     EffectPreset(
         name="tunnel",
         params=FeedbackParams(
-            base_zoom=1.008, zoom_sensitivity=0.0,
-            base_rot=0.001,  rot_sensitivity=0.0,
+            zoom=1.008, rotation=0.001,
             decay=0.97, ripple_strength=0.0, ripple_freq=10.0,
             hue_shift=0.003, chroma_offset=0.008,
             sat_boost=1.2, smear_strength=0.015, fisheye_strength=0.6,
@@ -188,8 +186,7 @@ PRESETS: list[EffectPreset] = [
     EffectPreset(
         name="slow_burn",
         params=FeedbackParams(
-            base_zoom=1.002, zoom_sensitivity=0.0,
-            base_rot=0.0002, rot_sensitivity=0.0,
+            zoom=1.002, rotation=0.0002,
             decay=0.997, ripple_strength=0.0, ripple_freq=10.0,
             hue_shift=0.001, chroma_offset=0.0,
             sat_boost=1.5, smear_strength=0.020, fisheye_strength=0.0,
@@ -200,8 +197,7 @@ PRESETS: list[EffectPreset] = [
     EffectPreset(
         name="deep_sea",
         params=FeedbackParams(
-            base_zoom=1.001, zoom_sensitivity=0.0,
-            base_rot=0.0,    rot_sensitivity=0.0,
+            zoom=1.001, rotation=0.0,
             decay=0.97, ripple_strength=0.0, ripple_freq=10.0,
             hue_shift=0.008, chroma_offset=0.020,
             sat_boost=1.3, smear_strength=0.018, fisheye_strength=-0.4,
@@ -212,8 +208,7 @@ PRESETS: list[EffectPreset] = [
     EffectPreset(
         name="acid",
         params=FeedbackParams(
-            base_zoom=1.005, zoom_sensitivity=0.0,
-            base_rot=0.002,  rot_sensitivity=0.0,
+            zoom=1.005, rotation=0.002,
             decay=0.985, ripple_strength=0.0, ripple_freq=10.0,
             hue_shift=0.015, chroma_offset=0.005,
             sat_boost=1.6, smear_strength=0.010, fisheye_strength=0.0,
@@ -224,8 +219,7 @@ PRESETS: list[EffectPreset] = [
     EffectPreset(
         name="aurora",
         params=FeedbackParams(
-            base_zoom=1.001, zoom_sensitivity=0.0,
-            base_rot=0.0003, rot_sensitivity=0.0,
+            zoom=1.001, rotation=0.0003,
             decay=0.992, ripple_strength=0.0, ripple_freq=10.0,
             hue_shift=0.006, chroma_offset=0.010,
             sat_boost=1.7, smear_strength=0.025, fisheye_strength=0.0,
@@ -381,17 +375,17 @@ class FeedbackPostEffect(PostEffect):
             p.decay = round(min(0.999, p.decay + 0.010), 4)
             print(f"[post] decay: {p.decay:.4f}")
         elif key == keys.Q:
-            p.base_rot = round(max(0.0,  p.base_rot - 0.0001), 5)
-            print(f"[post] base_rot: {p.base_rot:.5f}")
+            p.rotation = round(max(0.0,  p.rotation - 0.0001), 5)
+            print(f"[post] rotation: {p.rotation:.5f}")
         elif key == keys.W:
-            p.base_rot = round(min(0.01, p.base_rot + 0.0001), 5)
-            print(f"[post] base_rot: {p.base_rot:.5f}")
+            p.rotation = round(min(0.01, p.rotation + 0.0001), 5)
+            print(f"[post] rotation: {p.rotation:.5f}")
         elif key == keys.A:
-            p.base_zoom = round(max(1.000, p.base_zoom - 0.001), 4)
-            print(f"[post] base_zoom: {p.base_zoom:.4f}")
+            p.zoom = round(max(0.950, p.zoom - 0.001), 4)
+            print(f"[post] zoom: {p.zoom:.4f}")
         elif key == keys.S:
-            p.base_zoom = round(min(1.050, p.base_zoom + 0.001), 4)
-            print(f"[post] base_zoom: {p.base_zoom:.4f}")
+            p.zoom = round(min(1.050, p.zoom + 0.001), 4)
+            print(f"[post] zoom: {p.zoom:.4f}")
         elif key == keys.H:
             p.hue_shift = round(max(0.0,  p.hue_shift - 0.002), 4)
             print(f"[post] hue_shift: {p.hue_shift:.4f}")

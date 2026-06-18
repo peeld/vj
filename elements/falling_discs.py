@@ -291,20 +291,21 @@ class FallingDiscsElement(DrawingElement):
         total_v = n * _VERTS_PER_DISC
         n_pal   = len(self._palette or self._default_palette())
 
-        wp.launch(
-            _spawn_discs,
-            dim=n,
-            inputs=[
-                self._pos, self._age, self._lifetime, self._radius, self._disc_color,
-                self._rot_speed, self._rot_phase,
-                self._palette_arr, n_pal,
-                self.min_size, self.max_size,
-                self.fall_speed_min, self.fall_speed_max,
-                self.rotation_speed_max,
-                self._frame,
-            ],
-            device=self.device,
-        )
+        if self.active:
+            wp.launch(
+                _spawn_discs,
+                dim=n,
+                inputs=[
+                    self._pos, self._age, self._lifetime, self._radius, self._disc_color,
+                    self._rot_speed, self._rot_phase,
+                    self._palette_arr, n_pal,
+                    self.min_size, self.max_size,
+                    self.fall_speed_min, self.fall_speed_max,
+                    self.rotation_speed_max,
+                    self._frame,
+                ],
+                device=self.device,
+            )
 
         wp.launch(
             _advance_discs,

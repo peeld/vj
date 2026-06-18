@@ -76,8 +76,7 @@ print(f"[warp] device: {DEVICE}")
 # FeedbackParams initialised with the "gentle" preset values.
 # Stored at module level so param_dialog can hold a live reference.
 _params = FeedbackParams(
-    base_zoom=1.002, zoom_sensitivity=0.0,
-    base_rot=0.0008, rot_sensitivity=0.0,
+    zoom=1.002, rotation=0.0008,
     decay=0.993,
     ripple_strength=0.0, ripple_freq=10.0,
     hue_shift=0.005, chroma_offset=0.005,
@@ -276,6 +275,7 @@ class MergedGUI(mglw.WindowConfig):
         global _pm
         self.pm = build_default_manager(
             _params, _controls,
+            self._first_of_kind("cloud"),
             self._first_of_kind("nn_graph"), self._first_of_kind("lasers"), self._first_of_kind("circles"),
             camera=self.camera,
             pm=_pm,
@@ -530,7 +530,7 @@ if __name__ == "__main__":
     from qt_app import run_qt
 
     # Build base PM now (feedback + scene props only; elements added in GL __init__)
-    _pm = build_default_manager(_params, _controls, None, None, None)
+    _pm = build_default_manager(_params, _controls, None,None, None, None)
 
     _quit_event = threading.Event()
 

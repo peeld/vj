@@ -183,6 +183,12 @@ def main():
     params = FeedbackParams()
     loop   = FeedbackLoop(WIDTH, HEIGHT, device=DEVICE, params=params)
 
+    # Audio-to-param mapping coefficients (tweakable at runtime with Z/X R/T).
+    zoom_sens = 0.04
+    rot_sens  = 0.015
+    base_zoom = params.zoom
+    base_rot  = params.rotation
+
     cv2.namedWindow("Warp FFT Feedback", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Warp FFT Feedback", WIDTH, HEIGHT)
 
@@ -202,7 +208,9 @@ def main():
         wp.copy(fft_gpu, wp.array(spec, dtype=wp.float32, device=DEVICE))
 
         # 2. Feedback pass (prev → curr)
-        loop.step(bass, mid, treble, time_val=frame_count * 0.05)
+        params.zoom     = base_zoom + bass * zoom_sens
+        params.rotation = base_rot  + mid  * rot_sens
+        loop.step(time_val=frame_count * 0.05)
 
         # 3. Draw spectrum bars into curr
         wp.launch(
@@ -222,8 +230,8 @@ def main():
                     f"FPS:{fps_display:.1f}  bass:{bass:.2f} mid:{mid:.2f} treb:{treble:.2f}",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
         cv2.putText(frame_bgr,
-                    f"zoom_sens:{params.zoom_sensitivity:.3f}  "
-                    f"rot_sens:{params.rot_sensitivity:.4f}  "
+                    f"zoom_sens:{zoom_sens:.3f}  "
+                    f"rot_sens:{rot_sens:.4f}  "
                     f"decay:{params.decay:.3f}",
                     (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1, cv2.LINE_AA)
         cv2.imshow("Warp FFT Feedback", frame_bgr)
@@ -237,13 +245,13 @@ def main():
         if key in (ord("q"), 27):
             break
         elif key == ord("z"):
-            params.zoom_sensitivity = max(0.0, params.zoom_sensitivity - 0.005)
+            zoom_sens = max(0.0, zoom_sens - 0.005)
         elif key == ord("x"):
-            params.zoom_sensitivity = min(0.3, params.zoom_sensitivity + 0.005)
+            zoom_sens = min(0.3, zoom_sens + 0.005)
         elif key == ord("r"):
-            params.rot_sensitivity = max(0.0, params.rot_sensitivity - 0.001)
+            rot_sens = max(0.0, rot_sens - 0.001)
         elif key == ord("t"):
-            params.rot_sensitivity = min(0.1, params.rot_sensitivity + 0.001)
+            rot_sens = min(0.1, rot_sens + 0.001)
         elif key == ord("d"):
             params.decay = max(0.80, params.decay - 0.005)
         elif key == ord("f"):
