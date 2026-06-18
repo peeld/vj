@@ -338,6 +338,10 @@ class PropertyManager:
         ks = keys if keys is not None else list(self._defs)
         return {k: self.get(k) for k in ks if k in self._defs}
 
+    def snapshot_nondefault(self) -> dict[str, Any]:
+        """Return current values for all properties that differ from their default."""
+        return {k: self.get(k) for k in self._defs if self.get(k) != self._defs[k].default}
+
     def apply_snapshot(self, snap: dict[str, Any]) -> None:
         """Write a snapshot dict back into live properties."""
         for k, v in snap.items():

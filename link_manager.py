@@ -11,6 +11,7 @@ Phase 4: EventBus, threshold detectors, EventLink evaluation.
 
 from __future__ import annotations
 
+import json as _json
 import math as _math
 import queue
 import re
@@ -19,8 +20,10 @@ import time
 import types
 from dataclasses import dataclass, field
 from math import exp as _exp
+from pathlib import Path as _Path
 from typing import Any, Callable
 
+PRESET_DIR = _Path(__file__).with_name("presets")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Keyboard sources
@@ -696,6 +699,8 @@ class LinkManager:
 
         self._bpm_clock = None  # set externally after construction
 
+        self._load_preset_files()
+
     # ── SignalLink management ─────────────────────────────────────────────────
 
     def add_link(self, link: SignalLink) -> None:
@@ -893,8 +898,6 @@ class LinkManager:
 
     def save_state(self, path) -> None:
         """Serialise all routing state, presets, and preset triggers to JSON."""
-        import json as _json
-        from pathlib import Path as _Path
         data = {
             "signal_links"    : [l.to_dict() for l in self._signal_links],
             "envelopes"       : [d.to_dict() for d in self._envelope_defs],
@@ -915,8 +918,6 @@ class LinkManager:
         Presets and preset_triggers in the file are merged (not replaced) into
         the current instance so navigation links accumulate across multiple loads.
         """
-        import json as _json
-        from pathlib import Path as _Path
         data = _json.loads(_Path(path).read_text())
         if replace:
             self.clear_state()
@@ -944,9 +945,11 @@ class LinkManager:
 
     # ── Link preset management ────────────────────────────────────────────────
 
-    def save_link_preset(self, name: str) -> None:
+    def save_link_preset(self, name: str, pm_props: dict | None = None) -> None:
         """Snapshot the current routing state under a named preset."""
-        self._presets[name] = {
+        snap = {
+            "version"      : 1,
+            "pm_props"     : pm_props or {},
             "signal_links" : [l.to_dict() for l in self._signal_links],
             "envelopes"    : [d.to_dict() for d in self._envelope_defs],
             "lfos"         : [d.to_dict() for d in self._lfo_defs],
@@ -954,9 +957,12 @@ class LinkManager:
             "thresholds"   : [d.to_dict() for d in self._threshold_defs],
             "parameters"   : [d.to_dict() for d in self._parameter_defs],
         }
+        self._presets[name] = snap
+        PRESET_DIR.mkdir(exist_ok=True)
+        (PRESET_DIR / f"{name}.json").write_text(_json.dumps(snap, indent=2))
         print(f"[lm] preset saved: '{name}'")
 
-    def load_link_preset(self, name: str) -> None:
+    def load_link_preset(self, name: str, pm: Any = None) -> None:
         """Restore a named preset, replacing current routing state.
 
         _preset_triggers and _presets are left untouched.
@@ -978,13 +984,33 @@ class LinkManager:
             self.add_threshold(ThresholdDef.from_dict(d))
         for d in snap.get("parameters", []):
             self.add_parameter(ParameterDef.from_dict(d))
+        pm_props = snap.get("pm_props", {})
+        if pm is not None and pm_props:
+            for k, v in pm_props.items():
+                if k in pm._defs:
+                    pm.set(k, v)
+                    self._baselines[k] = v
         print(f"[lm] preset loaded: '{name}'")
 
     def delete_link_preset(self, name: str) -> None:
         self._presets.pop(name, None)
+        try:
+            (PRESET_DIR / f"{name}.json").unlink()
+        except FileNotFoundError:
+            pass
 
     def list_link_presets(self) -> list[str]:
         return list(self._presets)
+
+    def _load_preset_files(self) -> None:
+        """Scan PRESET_DIR/*.json and populate self._presets from disk."""
+        PRESET_DIR.mkdir(exist_ok=True)
+        for path in PRESET_DIR.glob("*.json"):
+            try:
+                data = _json.loads(path.read_text())
+                self._presets[path.stem] = data
+            except Exception as exc:
+                print(f"[lm] warning: could not load preset '{path.name}': {exc}")
 
     # ── Preset trigger management ─────────────────────────────────────────────
 
@@ -1067,7 +1093,7 @@ class LinkManager:
 
         m = self._RE_LINK_PRESET.match(action)
         if m:
-            self.load_link_preset(m.group(1))
+            self.load_link_preset(m.group(1), pm=pm)
             return
 
         if self._RE_BPM_TAP.match(action):

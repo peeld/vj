@@ -381,7 +381,7 @@ class NNGraph(DrawingElement, section="nn_graph"):
 
         if self.active and not self._building:
             self.activate()
-    
+
         for _ in range(self.edges_per_frame):
             if self._building:
                 self._advance_build()

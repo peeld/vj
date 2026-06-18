@@ -2094,7 +2094,7 @@ class PresetsTab(QWidget):
         self._trigger_table.doubleClicked.connect(self._edit_trigger)
         lo.addWidget(self._trigger_table)
 
-        info2 = QLabel("Action syntax:  link_preset('name')")
+        info2 = QLabel("Action syntax:  link_preset('name')  — restores routing + properties")
         info2.setObjectName("info")
         lo.addWidget(info2)
 
@@ -2119,7 +2119,8 @@ class PresetsTab(QWidget):
     def _save_preset(self) -> None:
         name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
         if ok and name.strip():
-            self._lm.save_link_preset(name.strip())
+            pm_props = self._pm.snapshot_nondefault()
+            self._lm.save_link_preset(name.strip(), pm_props=pm_props)
             self._rebuild()
             self.changed.emit()
 
@@ -2129,7 +2130,7 @@ class PresetsTab(QWidget):
             return
         item = self._preset_table.item(row, 0)
         if item:
-            self._lm.load_link_preset(item.text())
+            self._lm.load_link_preset(item.text(), pm=self._pm)
             self.needs_rebuild.emit()
             self.changed.emit()
 
@@ -2281,6 +2282,7 @@ class LinkManagerPanel(QDialog):
             return
         try:
             self._lm.load_state(self._STATE_PATH)
+            self._lm._load_preset_files()
             for tab in (self._channels_tab, self._param_tab, self._evt_tab,
                         self._env_tab, self._lfo_tab, self._preset_tab):
                 tab._rebuild()
