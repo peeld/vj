@@ -188,6 +188,10 @@ class BokehEffect(PostEffect):
         t:  float,
         dt: float,
     ) -> moderngl.Texture:
+        # TODO: PBO zero-copy refactor (same pattern as GlitchEffect/FeedbackPostEffect).
+        # Needs two pack PBOs: one for colour (GL_RGBA / GL_UNSIGNED_BYTE) and one for
+        # depth (GL_DEPTH_COMPONENT / GL_FLOAT), both registered READ_ONLY.  Output via
+        # an unpack PBO registered WRITE_DISCARD.  Not done: effect is unused/broken.
         w, h = self._w, self._h
 
         # ── Read colour buffer (RGBA uint8 → float32) ──────────────────

@@ -21,13 +21,49 @@ import numpy as np
 import moderngl
 import warp as wp
 
-from post.base import PostEffect, _QUAD_VERT, _QUAD_FRAG, _QUAD_VERTS, DEVICE
+from post.base import (
+    PostEffect, DEVICE, NULL_OFFSET,
+    _QUAD_VERT, _QUAD_FRAG, _QUAD_VERTS,
+    glBindBuffer, glBindFramebuffer, glBindTexture,
+    glReadPixels, glTexSubImage2D,
+    GL_PIXEL_PACK_BUFFER, GL_PIXEL_UNPACK_BUFFER,
+    GL_RGBA, GL_UNSIGNED_BYTE, GL_TEXTURE_2D,
+    GL_READ_FRAMEBUFFER,
+)
 
 
 N_RECTS = 30
 
 
-# ─── Warp kernel ──────────────────────────────────────────────────────────────
+# ─── Warp kernels ─────────────────────────────────────────────────────────────
+
+@wp.kernel
+def _decode_rgba_u8(
+    src: wp.array(dtype=wp.uint8),
+    dst: wp.array(dtype=wp.float32),
+):
+    """Pack-PBO uint8 RGBA → float32 RGBA (no Y-flip; preserves OpenGL bottom-up order)."""
+    tid  = wp.tid()
+    base = tid * 4
+    dst[base]     = float(src[base])     / 255.0
+    dst[base + 1] = float(src[base + 1]) / 255.0
+    dst[base + 2] = float(src[base + 2]) / 255.0
+    dst[base + 3] = float(src[base + 3]) / 255.0
+
+
+@wp.kernel
+def _pack_rgba_u8(
+    src: wp.array(dtype=wp.float32),
+    dst: wp.array(dtype=wp.uint8),
+):
+    """float32 RGBA → uint8 RGBA; writes directly into the mapped unpack PBO."""
+    tid  = wp.tid()
+    base = tid * 4
+    dst[base]     = wp.uint8(int(wp.clamp(src[base],     0.0, 1.0) * 255.0))
+    dst[base + 1] = wp.uint8(int(wp.clamp(src[base + 1], 0.0, 1.0) * 255.0))
+    dst[base + 2] = wp.uint8(int(wp.clamp(src[base + 2], 0.0, 1.0) * 255.0))
+    dst[base + 3] = wp.uint8(255)
+
 
 @wp.kernel
 def _glitch_kernel(
@@ -93,11 +129,11 @@ class GlitchEffect(PostEffect):
     Parameters
     ----------
     regen_interval : float
-        Seconds between slice regenerations (default 0.06 ≈ 16 fps chaos).
+        Seconds between slice regenerations (default 0.1 s).
     max_offset : int | None
-        Maximum pixel offset.  Defaults to w // 5.
+        Maximum pixel offset.  Defaults to w // 3.
     max_slice_h : int | None
-        Maximum slice height in pixels.  Defaults to h // 30.
+        Maximum slice height in pixels.  Defaults to h // 10.
     """
 
     name = "glitch"
@@ -108,14 +144,19 @@ class GlitchEffect(PostEffect):
         max_offset:    int | None = None,
         max_slice_h:   int | None = None,
     ) -> None:
-        self._ctx:       moderngl.Context      | None = None
-        self._fbo:       moderngl.Framebuffer  | None = None
-        self._out_tex:   moderngl.Texture      | None = None
-        self._quad_prog: moderngl.Program      | None = None
-        self._quad_vao:  moderngl.VertexArray  | None = None
+        self._ctx:         moderngl.Context            | None = None
+        self._fbo:         moderngl.Framebuffer        | None = None
+        self._display_tex: moderngl.Texture            | None = None
+        self._quad_prog:   moderngl.Program            | None = None
+        self._quad_vao:    moderngl.VertexArray        | None = None
 
         self._w = 1
         self._h = 1
+
+        self._pack_pbo:   moderngl.Buffer          | None = None
+        self._reg_pack:   wp.RegisteredGLBuffer    | None = None
+        self._unpack_pbo: moderngl.Buffer          | None = None
+        self._reg_unpack: wp.RegisteredGLBuffer    | None = None
 
         self._src_buf: wp.array | None = None
         self._dst_buf: wp.array | None = None
@@ -157,43 +198,57 @@ class GlitchEffect(PostEffect):
         t:  float,
         dt: float,
     ) -> moderngl.Texture:
-        # Regenerate slices on schedule
         if t - self._last_regen >= self._regen_interval:
             self._regen_rects()
             self._last_regen = t
 
-        # FBO pixels → float32 warp buffer
-        raw   = scene_fbo.color_attachments[0].read()
-        arr   = np.frombuffer(raw, dtype=np.uint8).reshape(self._h, self._w, 4)
-        src_f = (arr.astype(np.float32) * (1.0 / 255.0)).flatten()
-        wp.copy(self._src_buf, wp.array(src_f, dtype=wp.float32, device=DEVICE))
+        w, h = self._w, self._h
+        n    = w * h
 
-        # Run the glitch kernel
+        # FBO → pack PBO (GPU-side DMA, no PCIe transfer)
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, self._pack_pbo.glo)
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL_OFFSET)
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+
+        # Decode: pack PBO uint8 → float32; map() syncs GL→CUDA
+        raw_gpu = self._reg_pack.map(dtype=wp.uint8, shape=(n * 4,))
+        wp.launch(_decode_rgba_u8, dim=n, inputs=[raw_gpu, self._src_buf], device=DEVICE)
+        wp.synchronize_device(DEVICE)
+        self._reg_pack.unmap()
+
+        # Shift slices (float32 → float32)
         wp.launch(
             _glitch_kernel,
-            dim=self._w * self._h,
+            dim=n,
             inputs=[
                 self._src_buf, self._dst_buf,
                 self._rect_x, self._rect_y,
                 self._rect_w, self._rect_h,
                 self._offsets,
-                N_RECTS, self._w, self._h,
+                N_RECTS, w, h,
             ],
             device=DEVICE,
         )
 
-        # Warp buffer → moderngl output texture
-        result   = self._dst_buf.numpy().reshape(self._h, self._w, 4)
-        result_u8 = (np.clip(result, 0.0, 1.0) * 255.0).astype(np.uint8)
-        self._out_tex.write(result_u8.tobytes())
+        # Pack: float32 → unpack PBO uint8; then GPU-side DMA to display texture
+        out_gpu = self._reg_unpack.map(dtype=wp.uint8, shape=(n * 4,))
+        wp.launch(_pack_rgba_u8, dim=n, inputs=[self._dst_buf, out_gpu], device=DEVICE)
+        wp.synchronize_device(DEVICE)
+        self._reg_unpack.unmap()
 
-        return self._out_tex
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._unpack_pbo.glo)
+        glBindTexture(GL_TEXTURE_2D, self._display_tex.glo)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL_OFFSET)
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+
+        return self._display_tex
 
     def blit_to_screen(self, screen: moderngl.Framebuffer) -> None:
         screen.use()
         self._ctx.disable(moderngl.DEPTH_TEST)
         self._ctx.clear(0.0, 0.0, 0.0, 1.0)
-        self._out_tex.use(0)
+        self._display_tex.use(0)
         self._quad_prog["tex"].value = 0
         self._quad_vao.render(moderngl.TRIANGLE_STRIP)
 
@@ -207,11 +262,27 @@ class GlitchEffect(PostEffect):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _build_fbo(self, w: int, h: int) -> None:
-        self._fbo     = self._ctx.framebuffer(
+        # Unregister old CUDA registrations before their GL buffers are released.
+        self._reg_pack   = None
+        self._reg_unpack = None
+
+        self._fbo = self._ctx.framebuffer(
             color_attachments=[self._ctx.texture((w, h), 4)],
             depth_attachment=self._ctx.depth_texture((w, h)),
         )
-        self._out_tex = self._ctx.texture((w, h), 4)
+
+        n = w * h * 4
+        self._pack_pbo   = self._ctx.buffer(reserve=n)
+        self._reg_pack   = wp.RegisteredGLBuffer(
+            self._pack_pbo.glo, device=DEVICE,
+            flags=wp.RegisteredGLBuffer.READ_ONLY)
+
+        self._unpack_pbo = self._ctx.buffer(reserve=n)
+        self._reg_unpack = wp.RegisteredGLBuffer(
+            self._unpack_pbo.glo, device=DEVICE,
+            flags=wp.RegisteredGLBuffer.WRITE_DISCARD)
+
+        self._display_tex = self._ctx.texture((w, h), 4)
 
     def _build_quad(self, ctx: moderngl.Context) -> None:
         vbo = ctx.buffer(_QUAD_VERTS.tobytes())
