@@ -14,6 +14,7 @@ All other key mappings are configured via the Link Manager panel (EventLinks).
 
 import pathlib
 import threading
+import time
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -63,6 +64,10 @@ _pending_palette_apply: bool = False
 # without touching GL objects directly.  Simple list assignment is thread-safe
 # in CPython, same pattern as _current_palette.
 _element_snapshot: list[dict] = []
+
+# Per-frame performance monitor — written by GL thread, read by Qt ControlBar.
+# Created in __main__; None if running without the Qt layer.
+_perf: "PerfMonitor | None" = None
 
 
 wp.init()
@@ -351,6 +356,7 @@ class MergedGUI(mglw.WindowConfig):
     # -- Per-frame ------------------------------------------------------------
 
     def on_render(self, current_time: float, frame_time: float):
+        _t_frame_start = time.perf_counter()
 
         global _pending_monitor, _pending_palette_apply, _element_snapshot
         if _pending_monitor is not None:
@@ -418,24 +424,60 @@ class MergedGUI(mglw.WindowConfig):
             time=self.time, current_time=current_time, frame_time=frame_time,
             cam_eye=cam_eye, cam_fwd=cam_fwd, cam_right=cam_right, cam_up=cam_up,
         )
+
+        # ── Stage: element step (CPU kernel launches + param updates) ─────────
+        _t_step_start = time.perf_counter()
         for el in self.elements:
             el.step(ctx)
+        _t_step_end = time.perf_counter()
 
         _element_snapshot = [
             {"name": el.name, "kind": el.kind, "visible": el.visible}
             for el in self.elements
         ]
 
+        # ── Stage: scene render + post-effect + blit ─────────────────────────
         if self.post_effect_on:
+            _t_scene_start = time.perf_counter()
             eff.bind_scene_fbo()
             self._draw_scene(mvp, ctx)
+            _t_scene_end = time.perf_counter()
+
             eff.process(eff.fbo, current_time, dt=0.0)
+            _t_post_end = time.perf_counter()
+
             eff.blit_to_screen(self.ctx.screen)
+            _t_blit_end = time.perf_counter()
+
+            _scene_ms = (_t_scene_end - _t_scene_start) * 1000.0
+            _post_ms  = (_t_post_end  - _t_scene_end)  * 1000.0
+            _blit_ms  = (_t_blit_end  - _t_post_end)   * 1000.0
+            _eff_name = eff.name
         else:
+            _t_scene_start = time.perf_counter()
             self.ctx.screen.use()
             self.ctx.enable(moderngl.DEPTH_TEST)
             self.ctx.clear(0.04, 0.04, 0.06, 1.0)
             self._draw_scene(mvp, ctx)
+            _t_scene_end = time.perf_counter()
+
+            _scene_ms = (_t_scene_end - _t_scene_start) * 1000.0
+            _post_ms  = 0.0
+            _blit_ms  = 0.0
+            _eff_name = "none"
+
+        # ── Record frame metrics ──────────────────────────────────────────────
+        if _perf is not None:
+            _t_frame_end = time.perf_counter()
+            _perf.record(
+                fps       = 1.0 / max(frame_time, 1e-6),
+                render_ms = (_t_frame_end - _t_frame_start) * 1000.0,
+                step_ms   = (_t_step_end - _t_step_start)   * 1000.0,
+                scene_ms  = _scene_ms,
+                post_ms   = _post_ms,
+                blit_ms   = _blit_ms,
+                effect    = _eff_name,
+            )
 
     def _draw_scene(self, mvp, ctx: FrameContext) -> None:
         for el in self.elements:
@@ -513,6 +555,7 @@ class MergedGUI(mglw.WindowConfig):
 
 if __name__ == "__main__":
     from qt_app import run_qt
+    from perf_monitor import PerfMonitor
 
     # Build base PM now (feedback + scene + element-kind pre-registration;
     # element-instance props and camera props are added in GL __init__)
@@ -521,6 +564,8 @@ if __name__ == "__main__":
         _pm.pre_register_node_class(DrawingElement, _kind)
     _pm.register_node(_params)
     _pm.register_node(_controls)
+
+    _perf = PerfMonitor(log_path=pathlib.Path(__file__).with_name("perf_log.csv"))
 
     _quit_event = threading.Event()
 
@@ -549,6 +594,7 @@ if __name__ == "__main__":
             "on_palette_apply":    _on_palette_apply,
             "quit_event":          _quit_event,
             "set_signaller":       _set_signaller,
+            "perf_monitor":        _perf,
         },
     )
     qt_thread.start()

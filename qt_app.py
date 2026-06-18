@@ -45,6 +45,7 @@ def run_qt(
     on_palette_apply,
     quit_event: threading.Event,
     set_signaller=None,
+    perf_monitor=None,
 ) -> None:
     """Run the Qt event loop. Meant to be called from a daemon thread."""
     from midi_input import get_router
@@ -119,7 +120,14 @@ def run_qt(
     for key, panel in panels.items():
         _restore_geometry(panel, saved, key)
 
-    control_bar = ControlBar(panels)
+    control_bar = ControlBar(
+        panels, lm, pm_ref,
+        midi_router=_router,
+        osc_router=_osc_router,
+        bpm=bpm,
+        get_element_snapshot=get_element_snapshot,
+        perf_monitor=perf_monitor,
+    )
     control_bar.show()
 
     class _Signaller(QObject):

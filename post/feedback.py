@@ -28,7 +28,15 @@ import numpy as np
 import moderngl
 import warp as wp
 
-from post.base import PostEffect, DEVICE, _QUAD_VERT, _QUAD_FRAG, _QUAD_VERTS
+from post.base import (
+    PostEffect, DEVICE, NULL_OFFSET,
+    _QUAD_VERT, _QUAD_FRAG, _QUAD_VERTS,
+    glBindBuffer, glBindFramebuffer, glBindTexture,
+    glReadPixels, glTexSubImage2D,
+    GL_PIXEL_PACK_BUFFER, GL_PIXEL_UNPACK_BUFFER,
+    GL_RGBA, GL_UNSIGNED_BYTE, GL_TEXTURE_2D,
+    GL_READ_FRAMEBUFFER,
+)
 from post.warp_feedback import FeedbackLoop, FeedbackParams, SMEAR_PATTERNS
 
 
@@ -117,16 +125,18 @@ def _decode_rgba_u8_flip(
 
 
 @wp.kernel
-def _pack_rgb_u8(
+def _pack_rgba_u8(
     src: wp.array(dtype=wp.float32),
     dst: wp.array(dtype=wp.uint8),
 ):
+    """Pack float32 RGBA → uint8 RGBA directly into the unpack PBO."""
     tid      = wp.tid()
     src_base = tid * 4
-    dst_base = tid * 3
+    dst_base = tid * 4
     dst[dst_base]     = wp.uint8(int(wp.clamp(src[src_base],     0.0, 1.0) * 255.0))
     dst[dst_base + 1] = wp.uint8(int(wp.clamp(src[src_base + 1], 0.0, 1.0) * 255.0))
     dst[dst_base + 2] = wp.uint8(int(wp.clamp(src[src_base + 2], 0.0, 1.0) * 255.0))
+    dst[dst_base + 3] = wp.uint8(255)
 
 
 @wp.kernel
@@ -276,9 +286,16 @@ class FeedbackPostEffect(PostEffect):
         self._fbo:         moderngl.Framebuffer | None = None
         self._quad_prog:   moderngl.Program     | None = None
         self._quad_vao:    moderngl.VertexArray | None = None
+
+        # float32 RGBA scratch: decoded scene pixels (lives between decode kernel
+        # and feedback/inject kernels; kept as a named buffer for future reuse)
         self._scene_gpu:   wp.array             | None = None
-        self._raw_gpu:     wp.array             | None = None
-        self._result_u8:   wp.array             | None = None
+
+        # PBOs and their CUDA registrations
+        self._pack_pbo:    moderngl.Buffer      | None = None  # FBO → CUDA
+        self._reg_pack:    wp.RegisteredGLBuffer | None = None
+        self._unpack_pbo:  moderngl.Buffer      | None = None  # CUDA → display tex
+        self._reg_unpack:  wp.RegisteredGLBuffer | None = None
 
         # Apply startup preset if requested (params only — no GL yet)
         if preset_idx is not None and 0 <= preset_idx < len(PRESETS):
@@ -289,9 +306,9 @@ class FeedbackPostEffect(PostEffect):
     def setup(self, ctx: moderngl.Context, w: int, h: int) -> None:
         self._ctx  = ctx
         self._loop = FeedbackLoop(w, h, device=DEVICE, params=self.params)
-        self._display_tex = ctx.texture((w, h), 3)
+        self._display_tex = ctx.texture((w, h), 4)
         self._loop.set_smear_pattern(self._smear_pattern_name)
-        self._alloc_scratch(w, h)
+        self._alloc_buffers(w, h)
         self._build_fbo(w, h)
         self._build_quad(ctx)
 
@@ -320,31 +337,51 @@ class FeedbackPostEffect(PostEffect):
     ) -> moderngl.Texture:
         w = scene_fbo.width
         h = scene_fbo.height
+        n = w * h
 
-        raw     = scene_fbo.color_attachments[0].read()
-        raw_cpu = wp.array(np.frombuffer(raw, dtype=np.uint8),
-                           dtype=wp.uint8, copy=False, device="cpu")
-        wp.copy(self._raw_gpu, raw_cpu)
+        # --- FBO → pack PBO (GPU-side DMA, no PCIe transfer) ---
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, scene_fbo.glo)
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, self._pack_pbo.glo)
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL_OFFSET)
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
+
+        # --- Decode: PBO uint8 RGBA → float32 RGBA, flip Y ---
+        # map() syncs GL→CUDA so glReadPixels DMA is guaranteed complete
+        raw_gpu = self._reg_pack.map(dtype=wp.uint8, shape=(n * 4,))
         wp.launch(_decode_rgba_u8_flip,
-                  dim=w * h,
-                  inputs=[self._raw_gpu, self._scene_gpu, w, h],
+                  dim=n,
+                  inputs=[raw_gpu, self._scene_gpu, w, h],
                   device=DEVICE)
+        wp.synchronize_device(DEVICE)
+        self._reg_pack.unmap()
 
+        # --- Feedback loop kernel: prev → curr ---
         self._loop.step(time_val=t, params=self.params)
 
+        # --- Blend scene into feedback buffer ---
         wp.launch(
             _inject_scene,
-            dim=w * h,
+            dim=n,
             inputs=[self._loop.curr, self._scene_gpu,
                     float(self.scene_alpha), self._blend_mode_idx],
             device=DEVICE,
         )
 
-        wp.launch(_pack_rgb_u8,
-                  dim=w * h,
-                  inputs=[self._loop.curr, self._result_u8],
+        # --- Pack: float32 RGBA → uint8 RGBA directly into unpack PBO ---
+        result_gpu = self._reg_unpack.map(dtype=wp.uint8, shape=(n * 4,))
+        wp.launch(_pack_rgba_u8, dim=n,
+                  inputs=[self._loop.curr, result_gpu],
                   device=DEVICE)
-        self._display_tex.write(self._result_u8.numpy().tobytes())
+        wp.synchronize_device(DEVICE)
+        self._reg_unpack.unmap()
+
+        # --- Unpack PBO → display texture (GPU-side DMA, no PCIe transfer) ---
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._unpack_pbo.glo)
+        glBindTexture(GL_TEXTURE_2D, self._display_tex.glo)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                        GL_RGBA, GL_UNSIGNED_BYTE, NULL_OFFSET)
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
 
         self._loop.advance()
         return self._display_tex
@@ -353,9 +390,10 @@ class FeedbackPostEffect(PostEffect):
         self._loop = FeedbackLoop(w, h, device=DEVICE, params=self.params)
         self._loop.set_smear_pattern(self._smear_pattern_name)
         if self._ctx is not None:
-            self._display_tex = self._ctx.texture((w, h), 3)
+            self._release_buffers()
+            self._display_tex = self._ctx.texture((w, h), 4)
             self._build_fbo(w, h)
-        self._alloc_scratch(w, h)
+            self._alloc_buffers(w, h)
 
     def on_key(self, key, action, keys) -> None:
         if action != keys.ACTION_PRESS:
@@ -456,11 +494,33 @@ class FeedbackPostEffect(PostEffect):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _alloc_scratch(self, w: int, h: int) -> None:
+    def _alloc_buffers(self, w: int, h: int) -> None:
+        """Allocate Warp scratch array and PBOs. Requires self._ctx to be set."""
         n = w * h
-        self._raw_gpu   = wp.zeros(n * 4, dtype=wp.uint8,   device=DEVICE)
         self._scene_gpu = wp.zeros(n * 4, dtype=wp.float32, device=DEVICE)
-        self._result_u8 = wp.zeros(n * 3, dtype=wp.uint8,   device=DEVICE)
+
+        # Pack PBO: FBO → CUDA (glReadPixels writes here; CUDA reads it)
+        self._pack_pbo = self._ctx.buffer(reserve=n * 4)
+        self._reg_pack = wp.RegisteredGLBuffer(
+            self._pack_pbo.glo, device=DEVICE,
+            flags=wp.RegisteredGLBuffer.READ_ONLY)
+
+        # Unpack PBO: CUDA writes here; glTexSubImage2D reads it → display texture
+        self._unpack_pbo = self._ctx.buffer(reserve=n * 4)
+        self._reg_unpack = wp.RegisteredGLBuffer(
+            self._unpack_pbo.glo, device=DEVICE,
+            flags=wp.RegisteredGLBuffer.WRITE_DISCARD)
+
+    def _release_buffers(self) -> None:
+        """Unregister PBOs from CUDA and release GL buffers. Call before resize."""
+        self._reg_pack   = None  # __del__ unregisters from CUDA
+        self._reg_unpack = None
+        if self._pack_pbo is not None:
+            self._pack_pbo.release()
+            self._pack_pbo = None
+        if self._unpack_pbo is not None:
+            self._unpack_pbo.release()
+            self._unpack_pbo = None
 
     def _build_fbo(self, w: int, h: int) -> None:
         self._fbo = self._ctx.framebuffer(

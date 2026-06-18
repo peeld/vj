@@ -693,6 +693,9 @@ class LinkManager:
         # Preset triggers: EventLinks that survive preset switches
         self._preset_triggers : list[EventLink]  = []
 
+        self._active_preset     : str | None          = None
+        self._on_preset_loaded  : list                 = []   # list[Callable[[str], None]]
+
         # Baseline values: persistent per-property floats written to PM when an
         # expression is disabled or cleared.  Intentionally NOT cleared by clear_state().
         self._baselines: dict[str, float] = {}
@@ -991,9 +994,14 @@ class LinkManager:
                     pm.set(k, v)
                     self._baselines[k] = v
         print(f"[lm] preset loaded: '{name}'")
+        self._active_preset = name
+        for cb in self._on_preset_loaded:
+            cb(name)
 
     def delete_link_preset(self, name: str) -> None:
         self._presets.pop(name, None)
+        if self._active_preset == name:
+            self._active_preset = None
         try:
             (PRESET_DIR / f"{name}.json").unlink()
         except FileNotFoundError:
@@ -1001,6 +1009,26 @@ class LinkManager:
 
     def list_link_presets(self) -> list[str]:
         return list(self._presets)
+
+    def next_link_preset(self, pm=None) -> None:
+        names = self.list_link_presets()
+        if not names:
+            return
+        try:
+            idx = names.index(self._active_preset)
+        except ValueError:
+            idx = -1
+        self.load_link_preset(names[(idx + 1) % len(names)], pm=pm)
+
+    def prev_link_preset(self, pm=None) -> None:
+        names = self.list_link_presets()
+        if not names:
+            return
+        try:
+            idx = names.index(self._active_preset)
+        except ValueError:
+            idx = 0
+        self.load_link_preset(names[(idx - 1) % len(names)], pm=pm)
 
     def _load_preset_files(self) -> None:
         """Scan PRESET_DIR/*.json and populate self._presets from disk."""
@@ -1046,6 +1074,8 @@ class LinkManager:
     _RE_SET         = re.compile(r"^set\(([^,]+),\s*(.+)\)$")
     _RE_PRESET      = re.compile(r"""^preset\(['"]([^'"]+)['"]\)$""")
     _RE_LINK_PRESET = re.compile(r"""^link_preset\(['"]([^'"]+)['"]\)$""")
+    _RE_NEXT_PRESET = re.compile(r"^link_preset\.next\(\)$")
+    _RE_PREV_PRESET = re.compile(r"^link_preset\.prev\(\)$")
     _RE_BPM_TAP     = re.compile(r"^bpm\.tap\(\)$")
     _RE_BPM_NUDGE   = re.compile(r"^bpm\.nudge\(([+-]?[\d.]+)\)$")
     _RE_BPM_SET     = re.compile(r"^bpm\.set\(([\d.]+)\)$")
@@ -1094,6 +1124,13 @@ class LinkManager:
         m = self._RE_LINK_PRESET.match(action)
         if m:
             self.load_link_preset(m.group(1), pm=pm)
+            return
+
+        if self._RE_NEXT_PRESET.match(action):
+            self.next_link_preset(pm=pm)
+            return
+        if self._RE_PREV_PRESET.match(action):
+            self.prev_link_preset(pm=pm)
             return
 
         if self._RE_BPM_TAP.match(action):

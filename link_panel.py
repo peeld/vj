@@ -230,6 +230,7 @@ def _action_completions(lm: LinkManager, pm: "PropertyManager") -> list[str]:
     actions: list[str] = [
         "regen", "preset('')",
         "bpm.tap()", "bpm.nudge(+0.5)", "bpm.nudge(-0.5)", "bpm.set(120)",
+        "link_preset.next()", "link_preset.prev()",
     ]
     preset_names = lm.list_link_presets()
     if preset_names:
@@ -2106,6 +2107,14 @@ class PresetsTab(QWidget):
         for r, name in enumerate(names):
             self._preset_table.setItem(r, 0, _cell(name))
 
+        active = self._lm._active_preset
+        for r in range(self._preset_table.rowCount()):
+            item = self._preset_table.item(r, 0)
+            if item:
+                font = item.font()
+                font.setBold(item.text() == active)
+                item.setFont(font)
+
         triggers = self._lm._preset_triggers
         self._trigger_table.setRowCount(len(triggers))
         for r, link in enumerate(triggers):
@@ -2241,6 +2250,9 @@ class LinkManagerPanel(QDialog):
             tab.changed.connect(self._on_changed)
 
         self._preset_tab.needs_rebuild.connect(self._rebuild_routing_tabs)
+        self._lm._on_preset_loaded.append(
+            lambda _name: QTimer.singleShot(0, self._rebuild_routing_tabs)
+        )
 
         self._auto_load()
 

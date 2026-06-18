@@ -7,16 +7,29 @@ from here so the boilerplate lives in exactly one place.
 
 from __future__ import annotations
 
+import ctypes
 from abc import ABC, abstractmethod
 
 import numpy as np
 import moderngl
 import warp as wp
+from OpenGL.GL import (
+    glBindBuffer, glBindFramebuffer, glBindTexture,
+    glReadPixels, glTexSubImage2D,
+    GL_PIXEL_PACK_BUFFER, GL_PIXEL_UNPACK_BUFFER,
+    GL_RGBA, GL_UNSIGNED_BYTE, GL_TEXTURE_2D,
+    GL_READ_FRAMEBUFFER,
+)
 
 
 # ── Warp device ────────────────────────────────────────────────────────────────
 wp.init()
 DEVICE: str = "cuda" if wp.get_cuda_device_count() > 0 else "cpu"
+
+# Must be passed as the `data` argument of glReadPixels / glTexSubImage2D when
+# a PBO is bound.  Passing None causes PyOpenGL to allocate a CPU buffer and
+# silently bypass the PBO, defeating zero-copy entirely.
+NULL_OFFSET = ctypes.c_void_p(0)
 
 
 # ── Fullscreen-quad shaders (shared by all effects that blit to screen) ────────
