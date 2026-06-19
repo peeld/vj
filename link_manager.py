@@ -693,6 +693,9 @@ class LinkManager:
         # Preset triggers: EventLinks that survive preset switches
         self._preset_triggers : list[EventLink]  = []
 
+        # Value snapshots: bare channel-value captures (no routing)
+        self._value_snapshots : dict[str, dict]  = {}
+
         self._active_preset     : str | None          = None
         self._on_preset_loaded  : list                 = []   # list[Callable[[str], None]]
 
@@ -738,6 +741,31 @@ class LinkManager:
         defn = pm._defs.get(key)
         prop_default = defn.default if defn is not None else 0.0
         pm.set(key, self.get_baseline(key, prop_default))
+
+    # ── Value snapshots ───────────────────────────────────────────────────────
+
+    def save_value_snapshot(self, name: str, pm: Any) -> None:
+        """Capture all current PM values into a named value snapshot."""
+        self._value_snapshots[name] = pm.snapshot()
+        print(f"[lm] value snapshot saved: '{name}'  ({len(self._value_snapshots[name])} props)")
+
+    def load_value_snapshot(self, name: str, pm: Any) -> None:
+        """Restore a value snapshot: write values to PM and update baselines."""
+        if name not in self._value_snapshots:
+            print(f"[lm] value snapshot '{name}' not found. Available: {list(self._value_snapshots)}")
+            return
+        snap = self._value_snapshots[name]
+        for k, v in snap.items():
+            if k in pm._defs:
+                pm.set(k, v)
+                self._baselines[k] = v
+        print(f"[lm] value snapshot loaded: '{name}'")
+
+    def delete_value_snapshot(self, name: str) -> None:
+        self._value_snapshots.pop(name, None)
+
+    def list_value_snapshots(self) -> list[str]:
+        return list(self._value_snapshots)
 
     # ── Per-frame evaluation ──────────────────────────────────────────────────
 
@@ -911,6 +939,7 @@ class LinkManager:
             "baselines"       : dict(self._baselines),
             "presets"         : self._presets,
             "preset_triggers" : [l.to_dict() for l in self._preset_triggers],
+            "value_snapshots" : self._value_snapshots,
             "bpm"             : self._bpm_clock.to_dict() if self._bpm_clock else {},
         }
         _Path(path).write_text(_json.dumps(data, indent=2))
@@ -939,6 +968,8 @@ class LinkManager:
         self._baselines.update(data.get("baselines", {}))
         for name, snap in data.get("presets", {}).items():
             self._presets[name] = snap
+        for name, snap in data.get("value_snapshots", {}).items():
+            self._value_snapshots[name] = snap
         for d in data.get("preset_triggers", []):
             self.add_preset_trigger(EventLink.from_dict(d))
         if "bpm" in data and self._bpm_clock and data["bpm"]:
@@ -1072,8 +1103,9 @@ class LinkManager:
     _RE_CYCLE       = re.compile(r"^cycle\(([^)]+)\)$")
     _RE_CYCLE_BACK  = re.compile(r"^cycle_back\(([^)]+)\)$")
     _RE_SET         = re.compile(r"^set\(([^,]+),\s*(.+)\)$")
-    _RE_PRESET      = re.compile(r"""^preset\(['"]([^'"]+)['"]\)$""")
-    _RE_LINK_PRESET = re.compile(r"""^link_preset\(['"]([^'"]+)['"]\)$""")
+    _RE_PRESET       = re.compile(r"""^preset\(['"]([^'"]+)['"]\)$""")
+    _RE_LINK_PRESET  = re.compile(r"""^link_preset\(['"]([^'"]+)['"]\)$""")
+    _RE_VALUES_SNAP  = re.compile(r"""^values_snap\(['"]([^'"]+)['"]\)$""")
     _RE_NEXT_PRESET = re.compile(r"^link_preset\.next\(\)$")
     _RE_PREV_PRESET = re.compile(r"^link_preset\.prev\(\)$")
     _RE_BPM_TAP     = re.compile(r"^bpm\.tap\(\)$")
@@ -1124,6 +1156,11 @@ class LinkManager:
         m = self._RE_LINK_PRESET.match(action)
         if m:
             self.load_link_preset(m.group(1), pm=pm)
+            return
+
+        m = self._RE_VALUES_SNAP.match(action)
+        if m:
+            self.load_value_snapshot(m.group(1), pm=pm)
             return
 
         if self._RE_NEXT_PRESET.match(action):

@@ -119,13 +119,21 @@ class VideoElement(DrawingElement, section="video"):
 
     kind = "video"
 
-    opacity = Prop("Opacity", float, 1.0, 0.0, 1.0, 0.05)
-    mode    = Prop("Mode", str, "background",
-                   choices=["background", "3d"], widget_hint="combo")
-    pos_x   = Prop("Pos X", float, 0.0, -10.0, 10.0, 0.1)
-    pos_y   = Prop("Pos Y", float, 0.0, -10.0, 10.0, 0.1)
-    pos_z   = Prop("Pos Z", float, 0.0, -10.0, 10.0, 0.1)
-    scale   = Prop("Scale", float, 1.0,  0.01, 20.0, 0.1)
+    active       = Prop("Active", bool, True, widget_hint="check",
+                        description="Play / pause video playback")
+    opacity      = Prop("Opacity", float, 1.0, 0.0, 1.0, 0.05)
+    mode         = Prop("Mode", str, "background",
+                        choices=["background", "3d"], widget_hint="combo")
+    pos_x        = Prop("Pos X", float, 0.0, -10.0, 10.0, 0.1)
+    pos_y        = Prop("Pos Y", float, 0.0, -10.0, 10.0, 0.1)
+    pos_z        = Prop("Pos Z", float, 0.0, -10.0, 10.0, 0.1)
+    scale        = Prop("Scale", float, 1.0,  0.01, 20.0, 0.1)
+    play_pos     = Prop("Play Pos", float, 0.0, 0.0, 1.0, 0.001,
+                        widget_hint="readonly",
+                        description="Normalised playback position (0–1)")
+    cam_distance = Prop("Cam Distance", float, 0.0, 0.0, 200.0, 0.01,
+                        widget_hint="readonly",
+                        description="Distance from camera to video plane (3D mode only)")
 
     def __init__(self, ctx: moderngl.Context, device: str = "cuda", **kwargs):
         super().__init__()
@@ -141,12 +149,14 @@ class VideoElement(DrawingElement, section="video"):
         self._vao_bg = ctx.vertex_array(self._prog_bg, [(verts, '2f', 'in_position')])
         self._vao_3d = ctx.vertex_array(self._prog_3d, [(verts, '2f', 'in_position')])
 
-        self.opacity = 1.0
-        self.mode    = "background"
-        self.pos_x   = 0.0
-        self.pos_y   = 0.0
-        self.pos_z   = 0.0
-        self.scale   = 1.0
+        self.opacity      = 1.0
+        self.mode         = "background"
+        self.pos_x        = 0.0
+        self.pos_y        = 0.0
+        self.pos_z        = 0.0
+        self.scale        = 1.0
+        self.play_pos     = 0.0
+        self.cam_distance = 0.0
 
     def set_player(self, player) -> None:
         """Wire in a VideoPlayer. Called from Qt thread — only stores the reference;
@@ -161,6 +171,26 @@ class VideoElement(DrawingElement, section="video"):
     def step(self, ctx: FrameContext) -> None:
         if self._player is None:
             return
+
+        # active → play / pause
+        if self._player.playing != self.active:
+            if self.active:
+                self._player.play()
+            else:
+                self._player.pause()
+
+        # play_pos (0–1)
+        dur = self._player.duration
+        self.play_pos = (self._player.position / dur) if dur > 0 else 0.0
+
+        # cam_distance — meaningful only in 3D mode
+        if self.mode == "3d" and ctx.cam_eye is not None:
+            cam = np.asarray(ctx.cam_eye, dtype='f4')
+            pos = np.array([self.pos_x, self.pos_y, self.pos_z], dtype='f4')
+            self.cam_distance = float(np.linalg.norm(cam - pos))
+        else:
+            self.cam_distance = 0.0
+
         if self._surface is None:
             self._surface = VideoGLSurface(
                 self._ctx, self._player.width, self._player.height, self._device)

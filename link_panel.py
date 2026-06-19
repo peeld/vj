@@ -1081,7 +1081,8 @@ class _ChannelsDelegate(QStyledItemDelegate):
 # ── Channels ─────────────────────────────────────────────────────────────────
 
 class ChannelsTab(QWidget):
-    changed = Signal()
+    changed       = Signal()
+    needs_rebuild = Signal()
 
     def __init__(self, lm: LinkManager, pm: "PropertyManager", parent=None):
         super().__init__(parent)
@@ -1129,6 +1130,25 @@ class ChannelsTab(QWidget):
         self._hint.setObjectName("info")
         lo.addWidget(self._hint)
 
+        sep_pre = QFrame()
+        sep_pre.setFrameShape(QFrame.Shape.HLine)
+        sep_pre.setObjectName("sep")
+        lo.addWidget(sep_pre)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        preset_lbl = QLabel("Preset:")
+        preset_lbl.setMinimumWidth(50)
+        preset_row.addWidget(preset_lbl)
+        self._preset_combo = QComboBox()
+        preset_row.addWidget(self._preset_combo, 1)
+        self._preset_menu_btn = QPushButton("☰")
+        self._preset_menu_btn.setFixedWidth(28)
+        self._preset_menu_btn.setToolTip("Save / Load / Delete preset")
+        self._preset_menu_btn.clicked.connect(self._show_preset_menu)
+        preset_row.addWidget(self._preset_menu_btn)
+        lo.addLayout(preset_row)
+
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(100)
         self._live_timer.timeout.connect(self._refresh_live_values)
@@ -1147,6 +1167,8 @@ class ChannelsTab(QWidget):
             self._updating = False
         self._view.expandAll()
         self._open_persistent_editors()
+        if hasattr(self, "_preset_combo"):
+            self._refresh_preset_combo()
 
     def _close_persistent_editors(self) -> None:
         for key, (grp_item, child_row) in self._model.row_for_key.items():
@@ -1284,6 +1306,59 @@ class ChannelsTab(QWidget):
         self._hint.setObjectName("info")
         self._hint.style().unpolish(self._hint)
         self._hint.style().polish(self._hint)
+
+    # ── Preset management ─────────────────────────────────────────────────────
+
+    def _refresh_preset_combo(self) -> None:
+        names = self._lm.list_link_presets()
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.clear()
+        for name in names:
+            self._preset_combo.addItem(name)
+        active = self._lm._active_preset
+        if active and active in names:
+            self._preset_combo.setCurrentIndex(names.index(active))
+        self._preset_combo.blockSignals(False)
+
+    def _show_preset_menu(self) -> None:
+        menu = QMenu(self)
+        save_act = menu.addAction("Save Current As…")
+        load_act = menu.addAction("Load Selected")
+        menu.addSeparator()
+        del_act  = menu.addAction("Delete Selected")
+        chosen = menu.exec(
+            self._preset_menu_btn.mapToGlobal(self._preset_menu_btn.rect().bottomLeft())
+        )
+        if chosen == save_act:
+            self._save_preset()
+        elif chosen == load_act:
+            self._load_preset_from_combo()
+        elif chosen == del_act:
+            self._delete_preset()
+
+    def _save_preset(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
+        if ok and name.strip():
+            self._lm.save_link_preset(name.strip(), pm_props=self._pm.snapshot_nondefault())
+            self._refresh_preset_combo()
+            self.changed.emit()
+
+    def _load_preset_from_combo(self) -> None:
+        name = self._preset_combo.currentText()
+        if not name:
+            return
+        self._lm.load_link_preset(name, pm=self._pm)
+        self._refresh_preset_combo()
+        self.needs_rebuild.emit()
+        self.changed.emit()
+
+    def _delete_preset(self) -> None:
+        name = self._preset_combo.currentText()
+        if not name:
+            return
+        self._lm.delete_link_preset(name)
+        self._refresh_preset_combo()
+        self.changed.emit()
 
     # ── Filter bar (layout inserted by Stage 6) ───────────────────────────────
 
@@ -1472,12 +1547,18 @@ class EventsTab(QWidget):
         choice_btn.setToolTip("Pick an enum sink and one of its choices, then press a key to "
                                "create a key → choice event link.")
         choice_btn.clicked.connect(self._capture_choice)
+        recall_btn = QPushButton("Recall Preset")
+        recall_btn.setObjectName("add")
+        recall_btn.setToolTip("Add an event link that recalls a saved link preset.")
+        recall_btn.clicked.connect(self._recall_preset)
+
         tb1.addWidget(add_el)
         tb1.addWidget(edit_el)
         tb1.addWidget(rm_el)
         tb1.addWidget(midi_btn)
         tb1.addWidget(key_btn)
         tb1.addWidget(choice_btn)
+        tb1.addWidget(recall_btn)
         tb1.addStretch()
 
         self._capture_status = QLabel("")
@@ -1701,6 +1782,41 @@ class EventsTab(QWidget):
         self._lm.remove_event_link(link.event, link.action)
         self._rebuild()
         self.changed.emit()
+
+    def _recall_preset(self) -> None:
+        names = self._lm.list_link_presets()
+        if not names:
+            self._capture_status.setText("no presets saved")
+            return
+        picker = QDialog(self)
+        picker.setWindowTitle("Recall Preset")
+        picker.setStyleSheet(_STYLESHEET)
+        plo = QVBoxLayout(picker)
+        plo.setContentsMargins(12, 12, 12, 12)
+        plo.setSpacing(8)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Preset:"))
+        combo = QComboBox()
+        combo.addItems(names)
+        row.addWidget(combo, 1)
+        plo.addLayout(row)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(picker.accept)
+        btns.rejected.connect(picker.reject)
+        plo.addWidget(btns)
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            preset_name = combo.currentText()
+            if preset_name:
+                prefilled = EventLink(event="", action=f"link_preset('{preset_name}')", enabled=True)
+                dlg = EventLinkDialog(self._lm, self._pm, link=prefilled, parent=self)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    link = dlg.result_link()
+                    if link.event and link.action:
+                        self._lm.add_event_link(link)
+                        self._rebuild()
+                        self.changed.emit()
 
     # Threshold CRUD
 
@@ -2019,174 +2135,6 @@ class ParametersTab(QWidget):
         self.changed.emit()
 
 
-# ── Presets ───────────────────────────────────────────────────────────────────
-
-class PresetsTab(QWidget):
-    changed      = Signal()   # routing or trigger list changed → schedule save
-    needs_rebuild = Signal()  # preset was loaded → other tabs must rebuild
-
-    def __init__(self, lm: LinkManager, pm: "PropertyManager", parent=None):
-        super().__init__(parent)
-        self._lm = lm
-        self._pm = pm
-
-        lo = QVBoxLayout(self)
-        lo.setContentsMargins(4, 4, 4, 4)
-        lo.setSpacing(4)
-
-        # ── Preset list ───────────────────────────────────────────────────────
-        hdr1 = QLabel("Link Presets")
-        hdr1.setObjectName("hdr")
-        lo.addWidget(hdr1)
-
-        tb1 = QHBoxLayout()
-        save_btn = QPushButton("Save Current As…")
-        save_btn.setObjectName("add")
-        save_btn.clicked.connect(self._save_preset)
-        load_btn = QPushButton("Load")
-        load_btn.clicked.connect(self._load_preset)
-        del_btn = QPushButton("Delete")
-        del_btn.setObjectName("remove")
-        del_btn.clicked.connect(self._delete_preset)
-        tb1.addWidget(save_btn)
-        tb1.addWidget(load_btn)
-        tb1.addWidget(del_btn)
-        tb1.addStretch()
-        lo.addLayout(tb1)
-
-        self._preset_table = _make_table(["Name"])
-        self._preset_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch)
-        self._preset_table.doubleClicked.connect(self._load_preset)
-        lo.addWidget(self._preset_table)
-
-        info1 = QLabel("Double-click a preset to load it immediately.")
-        info1.setObjectName("info")
-        lo.addWidget(info1)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setObjectName("sep")
-        lo.addWidget(sep)
-
-        # ── Preset triggers ───────────────────────────────────────────────────
-        hdr2 = QLabel("Preset Triggers  —  survive preset switches")
-        hdr2.setObjectName("hdr")
-        lo.addWidget(hdr2)
-
-        tb2 = QHBoxLayout()
-        add_btn = QPushButton("+ Add Trigger")
-        add_btn.setObjectName("add")
-        add_btn.clicked.connect(self._add_trigger)
-        rm_btn = QPushButton("Remove")
-        rm_btn.setObjectName("remove")
-        rm_btn.clicked.connect(self._remove_trigger)
-        tb2.addWidget(add_btn)
-        tb2.addWidget(rm_btn)
-        tb2.addStretch()
-        lo.addLayout(tb2)
-
-        self._trigger_table = _make_table(["On", "Event", "Action", "Condition"])
-        th = self._trigger_table.horizontalHeader()
-        th.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        th.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self._trigger_table.doubleClicked.connect(self._edit_trigger)
-        lo.addWidget(self._trigger_table)
-
-        info2 = QLabel("Action syntax:  link_preset('name')  — restores routing + properties")
-        info2.setObjectName("info")
-        lo.addWidget(info2)
-
-        self._rebuild()
-
-    def _rebuild(self) -> None:
-        names = self._lm.list_link_presets()
-        self._preset_table.setRowCount(len(names))
-        for r, name in enumerate(names):
-            self._preset_table.setItem(r, 0, _cell(name))
-
-        active = self._lm._active_preset
-        for r in range(self._preset_table.rowCount()):
-            item = self._preset_table.item(r, 0)
-            if item:
-                font = item.font()
-                font.setBold(item.text() == active)
-                item.setFont(font)
-
-        triggers = self._lm._preset_triggers
-        self._trigger_table.setRowCount(len(triggers))
-        for r, link in enumerate(triggers):
-            self._trigger_table.setItem(r, 0, _bool_cell(link.enabled))
-            self._trigger_table.setItem(r, 1, _cell(link.event))
-            self._trigger_table.setItem(r, 2, _cell(link.action))
-            self._trigger_table.setItem(r, 3, _cell(link.condition or ""))
-
-    # Preset CRUD
-
-    def _save_preset(self) -> None:
-        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
-        if ok and name.strip():
-            pm_props = self._pm.snapshot_nondefault()
-            self._lm.save_link_preset(name.strip(), pm_props=pm_props)
-            self._rebuild()
-            self.changed.emit()
-
-    def _load_preset(self) -> None:
-        row = self._preset_table.currentRow()
-        if row < 0:
-            return
-        item = self._preset_table.item(row, 0)
-        if item:
-            self._lm.load_link_preset(item.text(), pm=self._pm)
-            self.needs_rebuild.emit()
-            self.changed.emit()
-
-    def _delete_preset(self) -> None:
-        row = self._preset_table.currentRow()
-        if row < 0:
-            return
-        item = self._preset_table.item(row, 0)
-        if item:
-            self._lm.delete_link_preset(item.text())
-            self._rebuild()
-            self.changed.emit()
-
-    # Preset trigger CRUD
-
-    def _add_trigger(self) -> None:
-        dlg = EventLinkDialog(self._lm, self._pm, parent=self,
-                              action_completions=_trigger_action_completions(self._lm))
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            link = dlg.result_link()
-            if link.event and link.action:
-                self._lm.add_preset_trigger(link)
-                self._rebuild()
-                self.changed.emit()
-
-    def _edit_trigger(self) -> None:
-        row = self._trigger_table.currentRow()
-        if row < 0 or row >= len(self._lm._preset_triggers):
-            return
-        old = self._lm._preset_triggers[row]
-        dlg = EventLinkDialog(self._lm, self._pm, link=old, parent=self,
-                              action_completions=_trigger_action_completions(self._lm))
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._lm._preset_triggers[row] = dlg.result_link()
-            self._rebuild()
-            self.changed.emit()
-
-    def _remove_trigger(self) -> None:
-        row = self._trigger_table.currentRow()
-        if row < 0 or row >= len(self._lm._preset_triggers):
-            return
-        link = self._lm._preset_triggers[row]
-        self._lm.remove_preset_trigger(link.event, link.action)
-        self._rebuild()
-        self.changed.emit()
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main panel
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2215,7 +2163,6 @@ class LinkManagerPanel(QDialog):
         self._evt_tab      = EventsTab(lm, pm)
         self._env_tab      = EnvelopesTab(lm)
         self._lfo_tab      = LFOsTab(lm)
-        self._preset_tab   = PresetsTab(lm, pm)
         self._src_tab      = SourcesTab(lm)
 
         tabs.addTab(self._channels_tab, "Channels")
@@ -2223,7 +2170,6 @@ class LinkManagerPanel(QDialog):
         tabs.addTab(self._evt_tab,      "Events")
         tabs.addTab(self._env_tab,      "Envelopes")
         tabs.addTab(self._lfo_tab,      "LFOs")
-        tabs.addTab(self._preset_tab,   "Presets")
         tabs.addTab(self._src_tab,      "Sources")
 
         lo.addWidget(tabs)
@@ -2246,10 +2192,10 @@ class LinkManagerPanel(QDialog):
         self._save_timer.timeout.connect(self._save_now)
 
         for tab in (self._channels_tab, self._param_tab, self._evt_tab,
-                    self._env_tab, self._lfo_tab, self._preset_tab):
+                    self._env_tab, self._lfo_tab):
             tab.changed.connect(self._on_changed)
 
-        self._preset_tab.needs_rebuild.connect(self._rebuild_routing_tabs)
+        self._channels_tab.needs_rebuild.connect(self._rebuild_routing_tabs)
         self._lm._on_preset_loaded.append(
             lambda _name: QTimer.singleShot(0, self._rebuild_routing_tabs)
         )
@@ -2296,7 +2242,7 @@ class LinkManagerPanel(QDialog):
             self._lm.load_state(self._STATE_PATH)
             self._lm._load_preset_files()
             for tab in (self._channels_tab, self._param_tab, self._evt_tab,
-                        self._env_tab, self._lfo_tab, self._preset_tab):
+                        self._env_tab, self._lfo_tab):
                 tab._rebuild()
             # Push saved baselines into PM for every property that has no active link.
             # Properties WITH an active enabled link will be overridden by evaluate_links

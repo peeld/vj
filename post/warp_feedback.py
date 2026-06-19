@@ -245,7 +245,7 @@ def _feedback_kernel(
 
     # ── Radial ripple ─────────────────────────────────────────────────────
     dist  = wp.sqrt(cx3 * cx3 + cy3 * cy3) + 1e-6
-    phase = dist * ripple_freq - time_val * 2.0
+    phase = dist * ripple_freq - time_val * 0.2
     ripple = ripple_strength * wp.sin(phase)
     nx = cx3 + (cx3 / dist) * ripple / float(w)
     ny = cy3 + (cy3 / dist) * ripple / float(h)

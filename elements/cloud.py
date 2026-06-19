@@ -22,7 +22,9 @@ Usage::
     cloud.regen()
 """
 
+import numpy as np
 import moderngl
+import warp as wp
 
 from .base import DrawingElement, FrameContext, register_element_type, Prop
 from drawlib.data import BallData, PointCloudData
@@ -98,6 +100,17 @@ class CloudElement(DrawingElement, section="cloud"):
             self.cloud_data.positions_numpy(),
             self.cloud_data.colors_numpy(),
         )
+
+    def set_palette(self, palette: list) -> None:
+        """Apply palette to ball interaction colors so new particle spawns pick them up."""
+        if not palette:
+            return
+        n = self.ball_data.num_balls
+        colors = np.array(
+            [[r, g, b, 1.0] for r, g, b in (palette[i % len(palette)] for i in range(n))],
+            dtype=np.float32,
+        )
+        self.ball_data.wp_colors = wp.array(colors, dtype=wp.vec4)
 
 
 register_element_type("cloud", CloudElement)

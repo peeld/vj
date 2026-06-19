@@ -53,7 +53,7 @@ def run_qt(
     from midi_panel import MidiPanel
     from osc_input import get_router as get_osc_router
     from osc_panel import OscPanel
-    from audio_panel import AudioPanel, AudioDeviceSelector
+    from audio_panel import AudioPanel
     from color_panel import ColorPanel
     from elements_panel import ElementsPanel
     from link_panel import LinkManagerPanel
@@ -83,13 +83,11 @@ def run_qt(
 
     audio = AudioPanel(title="Audio Input", source_registry=lm.source_registry)
 
-    audio_device = AudioDeviceSelector(
-        title="Audio Device",
+    settings = SettingsPanel(
+        on_monitor_change=on_monitor_change,
         source_registry=lm.source_registry,
         on_metrics=audio.update_metrics,
     )
-
-    settings = SettingsPanel(on_monitor_change=on_monitor_change)
 
     colors = ColorPanel(
         title="Color Harmony",
@@ -118,7 +116,6 @@ def run_qt(
         "BPM":      bpm_panel,
         "Elements": elements_panel,
         "Audio":    audio,
-        "Device":   audio_device,
         "Colors":   colors,
         "Settings": settings,
         "MIDI":     midi,

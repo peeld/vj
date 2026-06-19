@@ -72,8 +72,12 @@ QLabel#bpm {
     background-color: #2a2a36;
 }
 QLabel#elements {
-    color: #707078;
     padding: 1px 2px;
+}
+QLabel#midi_last {
+    color: #606070;
+    font-size: 11px;
+    padding: 1px 4px;
 }
 QLabel#perf {
     font-size: 11px;
@@ -166,13 +170,16 @@ class ControlBar(QWidget):
         preset_row.addWidget(menu_btn)
         layout.addLayout(preset_row)
 
-        # Row 3: visible elements
+        # Row 3: elements (all shown, grey=inactive / bright=active) + last MIDI event
         self._elements_label = QLabel("")
         self._elements_label.setObjectName("elements")
+        self._midi_last_label = QLabel("")
+        self._midi_last_label.setObjectName("midi_last")
         elements_row = QHBoxLayout()
         elements_row.setContentsMargins(0, 0, 0, 0)
         elements_row.addWidget(self._elements_label)
         elements_row.addStretch()
+        elements_row.addWidget(self._midi_last_label)
         layout.addLayout(elements_row)
 
         # Row 4: performance metrics (hidden when no perf_monitor attached)
@@ -209,6 +216,7 @@ class ControlBar(QWidget):
         self._update_connection_status()
         self._update_bpm_label()
         self._update_elements_row()
+        self._update_midi_last_label()
         self._update_perf_row()
 
     def _update_connection_status(self) -> None:
@@ -234,12 +242,32 @@ class ControlBar(QWidget):
             snapshot = self._get_element_snapshot()
         except Exception:
             return
-        parts = [
-            _KIND_ABBR.get(el["kind"], el["kind"])
-            for el in snapshot
-            if el.get("visible")
-        ]
-        self._elements_label.setText("  ".join(parts))
+        parts = []
+        for el in snapshot:
+            abbr = _KIND_ABBR.get(el["kind"], el["kind"])
+            if el.get("visible"):
+                parts.append(f'<span style="color:#5eaeff;">{abbr}</span>')
+            else:
+                parts.append(f'<span style="color:#3a3a4a;">{abbr}</span>')
+        self._elements_label.setText("&nbsp;&nbsp;".join(parts))
+
+    def _update_midi_last_label(self) -> None:
+        if self._midi_router is None:
+            return
+        evt = self._midi_router.last_event
+        if not evt:
+            return
+        t = evt.get("type", "")
+        ch = evt.get("channel", 0)
+        num = evt.get("number", 0)
+        val = evt.get("value", 0)
+        if t == "cc":
+            text = f"CC{num}:{val} ch{ch + 1}"
+        elif t == "note":
+            text = f"N{num}:{val} ch{ch + 1}"
+        else:
+            return
+        self._midi_last_label.setText(text)
 
     def _update_perf_row(self) -> None:
         if self._perf is None:
