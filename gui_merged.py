@@ -31,7 +31,7 @@ from post import (
 from drawlib.camera import OrbitCamera
 
 from elements.base import DrawingElement, FrameContext, ELEMENT_TYPES, Node, Prop
-import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs
+import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs, elements.video  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs/video
 
 from property_manager import PropertyManager
 from link_manager import LinkManager, KEY_NAMES
@@ -68,6 +68,10 @@ _element_snapshot: list[dict] = []
 # Per-frame performance monitor — written by GL thread, read by Qt ControlBar.
 # Created in __main__; None if running without the Qt layer.
 _perf: "PerfMonitor | None" = None
+
+# Callable that returns the live VideoElement, or None if not in the scene.
+# Set in MergedGUI.__init__ and passed to VideoPanel via run_qt kwargs.
+_get_video_element = lambda: None
 
 
 wp.init()
@@ -266,6 +270,11 @@ class MergedGUI(mglw.WindowConfig):
         # -- Palette ----------------------------------------------------------
         if _current_palette:
             self._apply_palette()
+
+        # -- Video element accessor -------------------------------------------
+        global _get_video_element
+        _get_video_element = lambda: next(
+            (e for e in self.elements if e.kind == "video"), None)
 
         # -- Link manager -----------------------------------------------------
         self.lm = _lm
@@ -595,6 +604,7 @@ if __name__ == "__main__":
             "quit_event":          _quit_event,
             "set_signaller":       _set_signaller,
             "perf_monitor":        _perf,
+            "get_video_element":   lambda: _get_video_element(),
         },
     )
     qt_thread.start()

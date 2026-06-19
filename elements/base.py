@@ -34,6 +34,7 @@ class FrameContext:
     cam_fwd: object
     cam_right: object
     cam_up: object
+    video_texture: object = None   # moderngl.Texture | None — set by MergedGUI each frame
 
 
 class DrawingElement(Node, ABC):

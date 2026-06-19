@@ -46,6 +46,7 @@ def run_qt(
     quit_event: threading.Event,
     set_signaller=None,
     perf_monitor=None,
+    get_video_element=None,
 ) -> None:
     """Run the Qt event loop. Meant to be called from a daemon thread."""
     from midi_input import get_router
@@ -59,6 +60,7 @@ def run_qt(
     from bpm_panel import BpmPanel
     from control_bar import ControlBar
     from settings_panel import SettingsPanel
+    from video_panel import VideoPanel
 
     from PySide6.QtCore import QObject, QTimer, Qt, Signal
     from PySide6.QtWidgets import QApplication
@@ -105,6 +107,12 @@ def run_qt(
 
     bpm_panel = BpmPanel(bpm, event_bus=lm.event_bus)
 
+    video_panel = VideoPanel(
+        get_video_element=get_video_element or (lambda: None),
+        source_registry=lm.source_registry,
+        title="Video",
+    )
+
     panels = {
         "Links":    lm_panel,
         "BPM":      bpm_panel,
@@ -115,6 +123,7 @@ def run_qt(
         "Settings": settings,
         "MIDI":     midi,
         "OSC":      osc,
+        "Video":    video_panel,
     }
 
     for key, panel in panels.items():

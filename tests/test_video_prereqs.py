@@ -29,7 +29,7 @@ try:
     results.append(("av (PyAV)", True, f"v{ver}"))
 
     # Check NVDEC codec availability
-    codecs = [c.name for c in av.codecs_available]
+    codecs = [str(c) for c in av.codecs_available]
     for codec in ("h264_cuvid", "hevc_cuvid", "av1_cuvid"):
         has = codec in codecs
         results.append((f"  codec: {codec}", has,
