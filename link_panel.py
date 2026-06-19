@@ -238,6 +238,12 @@ def _action_completions(lm: LinkManager, pm: "PropertyManager") -> list[str]:
             actions.append(f"link_preset('{name}')")
     else:
         actions.append("link_preset('')")
+    snap_names = lm.list_value_snapshots()
+    if snap_names:
+        for name in snap_names:
+            actions.append(f"values_snap('{name}')")
+    else:
+        actions.append("values_snap('')")
     return actions
 
 
@@ -1137,9 +1143,11 @@ class ChannelsTab(QWidget):
 
         preset_row = QHBoxLayout()
         preset_row.setSpacing(4)
+
         preset_lbl = QLabel("Preset:")
         preset_lbl.setMinimumWidth(50)
         preset_row.addWidget(preset_lbl)
+
         self._preset_combo = QComboBox()
         preset_row.addWidget(self._preset_combo, 1)
         self._preset_menu_btn = QPushButton("☰")
@@ -1147,6 +1155,20 @@ class ChannelsTab(QWidget):
         self._preset_menu_btn.setToolTip("Save / Load / Delete preset")
         self._preset_menu_btn.clicked.connect(self._show_preset_menu)
         preset_row.addWidget(self._preset_menu_btn)
+
+        preset_row.addStretch(1)
+
+        snap_lbl = QLabel("Values:")
+        snap_lbl.setMinimumWidth(50)
+        preset_row.addWidget(snap_lbl)
+
+        self._snapshot_combo = QComboBox()
+        preset_row.addWidget(self._snapshot_combo, 1)
+        self._snapshot_menu_btn = QPushButton("☰")
+        self._snapshot_menu_btn.setFixedWidth(28)
+        self._snapshot_menu_btn.setToolTip("Save / Load / Delete value snapshot")
+        self._snapshot_menu_btn.clicked.connect(self._show_snapshot_menu)
+        preset_row.addWidget(self._snapshot_menu_btn)
         lo.addLayout(preset_row)
 
         self._live_timer = QTimer(self)
@@ -1169,6 +1191,8 @@ class ChannelsTab(QWidget):
         self._open_persistent_editors()
         if hasattr(self, "_preset_combo"):
             self._refresh_preset_combo()
+        if hasattr(self, "_snapshot_combo"):
+            self._refresh_snapshot_combo()
 
     def _close_persistent_editors(self) -> None:
         for key, (grp_item, child_row) in self._model.row_for_key.items():
@@ -1358,6 +1382,54 @@ class ChannelsTab(QWidget):
             return
         self._lm.delete_link_preset(name)
         self._refresh_preset_combo()
+        self.changed.emit()
+
+    # ── Value snapshot management ─────────────────────────────────────────────
+
+    def _refresh_snapshot_combo(self) -> None:
+        names = self._lm.list_value_snapshots()
+        self._snapshot_combo.blockSignals(True)
+        self._snapshot_combo.clear()
+        for name in names:
+            self._snapshot_combo.addItem(name)
+        self._snapshot_combo.blockSignals(False)
+
+    def _show_snapshot_menu(self) -> None:
+        menu = QMenu(self)
+        save_act = menu.addAction("Save Current As…")
+        load_act = menu.addAction("Load Selected")
+        menu.addSeparator()
+        del_act  = menu.addAction("Delete Selected")
+        chosen = menu.exec(
+            self._snapshot_menu_btn.mapToGlobal(self._snapshot_menu_btn.rect().bottomLeft())
+        )
+        if chosen == save_act:
+            self._save_snapshot()
+        elif chosen == load_act:
+            self._load_snapshot_from_combo()
+        elif chosen == del_act:
+            self._delete_snapshot()
+
+    def _save_snapshot(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save Value Snapshot", "Snapshot name:")
+        if ok and name.strip():
+            self._lm.save_value_snapshot(name.strip(), self._pm)
+            self._refresh_snapshot_combo()
+            self.changed.emit()
+
+    def _load_snapshot_from_combo(self) -> None:
+        name = self._snapshot_combo.currentText()
+        if not name:
+            return
+        self._lm.load_value_snapshot(name, self._pm)
+        self.changed.emit()
+
+    def _delete_snapshot(self) -> None:
+        name = self._snapshot_combo.currentText()
+        if not name:
+            return
+        self._lm.delete_value_snapshot(name)
+        self._refresh_snapshot_combo()
         self.changed.emit()
 
     # ── Filter bar (layout inserted by Stage 6) ───────────────────────────────

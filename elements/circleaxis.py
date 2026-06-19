@@ -228,7 +228,7 @@ class EmitCircle:
     cx:        float
     radius:    float
     birth:     float   # absolute time of spawn
-    hue:       float   # HSV hue for colour
+    color:     []      # rgba for color
     phase:     float   # drift phase
     speed:     float   # drift base speed
     amplitude: float   # this circle's own drift-amplitude factor (combined with self.amplitude)
@@ -536,12 +536,15 @@ class CircleAxisDrawing(DrawingElement, section="circles"):
         speed     = float(self._rng.uniform(0.08, 0.28))
         amplitude = float(self._rng.uniform(0.04, 0.22))
         if self._palette:
-            rgb = self._palette[int(self._rng.integers(0, len(self._palette)))]
-            hue = colorsys.rgb_to_hsv(*rgb)[0]
+            r, g,b = self._palette[int(self._rng.integers(0, len(self._palette)))]
+            rgba = [r, g, b, 1.0]
         else:
-            hue = float(self._rng.uniform(0.0, 1.0))
+            r = float(self._rng.uniform(0.0, 1.0))
+            g = float(self._rng.uniform(0.0, 1.0))
+            b = float(self._rng.uniform(0.0, 1.0))
+            rgba = [r, g, b, 1.0]
         self._emit_pool[slot] = EmitCircle(
-            cx=cx, radius=radius, birth=t, hue=hue,
+            cx=cx, radius=radius, birth=t, color=rgba,
             phase=phase, speed=speed, amplitude=amplitude,
         )
 
@@ -599,13 +602,14 @@ class CircleAxisDrawing(DrawingElement, section="circles"):
             vpos = _ribbon_positions(pts, EMIT_HALF_W)
             all_pos[v_base:ring_end] = vpos
 
-            hue_shift = (ec.hue + age * 0.04) % 1.0
-            t_arr = np.linspace(0.0, 1.0, verts_per_ring, dtype=np.float32)
-            cols  = np.stack([
-                _hsv((hue_shift + ti * 0.08) % 1.0, 0.80, 0.90 + 0.10 * ti, alpha)
-                for ti in t_arr
-            ])
-            all_col[v_base:ring_end] = cols
+            #hue_shift = (ec.hue + age * 0.04) % 1.0
+            #t_arr = np.linspace(0.0, 1.0, verts_per_ring, dtype=np.float32)
+            #cols  = np.stack([
+            #    _hsv((hue_shift + ti * 0.08) % 1.0, 0.80, 0.90 + 0.10 * ti, alpha)
+            #    for ti in t_arr
+            #])
+            # all_col[v_base:ring_end] = cols
+            all_col[v_base:ring_end] = ec.color
 
             blade_pos = _blade_positions(cx, ec.radius, spin,
                                           n_blades=n_blades,
@@ -615,13 +619,14 @@ class CircleAxisDrawing(DrawingElement, section="circles"):
             blade_cols = np.zeros((verts_per_blades, 4), dtype=np.float32)
             for bi in range(n_blades):
                 frac = bi / n_blades
-                col = _hsv(
-                    (hue_shift + frac * 0.12) % 1.0,
-                    0.85,
-                    0.75 + 0.25 * frac,
-                    float(face_alpha[bi] * alpha * 0.4),
-                )
-                blade_cols[bi * 4 : bi * 4 + 4] = col
+                #col = _hsv(
+                #    (hue_shift + frac * 0.12) % 1.0,
+                #    0.85,
+                #    0.75 + 0.25 * frac,
+                #    float(face_alpha[bi] * alpha * 0.4),
+                #)
+
+                blade_cols[bi * 4 : bi * 4 + 4] = ec.color
             all_col[ring_end:blade_end] = blade_cols
 
         self._emit_geo.update(vertices=all_pos, colors=all_col)
@@ -645,6 +650,8 @@ class CircleAxisDrawing(DrawingElement, section="circles"):
             parts.append(_ribbon_positions(pts, LINE_HALF_W))
 
         return np.vstack(parts).astype(np.float32)
+
+
 
 
 register_element_type("circles", CircleAxisDrawing)
