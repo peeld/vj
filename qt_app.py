@@ -110,6 +110,8 @@ def run_qt(
         source_registry=lm.source_registry,
         title="Video",
     )
+    # Marshal video.switch(N) EventLink actions to the Qt thread.
+    lm._video_switch_fn = lambda idx: QTimer.singleShot(0, lambda: video_panel.switch_to(idx))
 
     panels = {
         "Links":    lm_panel,
@@ -134,6 +136,9 @@ def run_qt(
         get_element_snapshot=get_element_snapshot,
         perf_monitor=perf_monitor,
     )
+
+    # settings.setParent(control_bar)
+
     control_bar.show()
 
     class _Signaller(QObject):

@@ -89,6 +89,7 @@ _KIND_ABBR: dict[str, str] = {
     "cloud":         "cloud",
     "nn_graph":      "nn",
     "circleaxis":    "axis",
+    "kaleidoscope":  "kaleido",
     "laser_ribbons": "lasers",
     "falling_discs": "discs",
     "tree_graph":    "tree",

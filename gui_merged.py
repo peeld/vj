@@ -31,7 +31,7 @@ from post import (
 from drawlib.camera import OrbitCamera
 
 from elements.base import DrawingElement, FrameContext, ELEMENT_TYPES, Node, Prop
-import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs, elements.video  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs/video
+import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs, elements.video, elements.kaleidoscope  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs/video/kaleidoscope
 
 from property_manager import PropertyManager
 from link_manager import LinkManager, KEY_NAMES
@@ -230,7 +230,7 @@ class MergedGUI(mglw.WindowConfig):
         # draw order follows list order, so this also preserves the original
         # back-to-front draw sequence.
         self.elements: list[DrawingElement] = []
-        for kind in ("cloud", "nn_graph", "circles", "lasers", "falling_discs"):
+        for kind in ("cloud", "nn_graph", "circles", "lasers", "falling_discs", "kaleidoscope"):
             self.add_element(kind)
 
         # -- GL state ---------------------------------------------------------

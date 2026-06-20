@@ -104,6 +104,37 @@ at module scope. Importing the module is what makes the type available —
 the host typically imports every element module up front purely for this
 side effect.
 
+After writing the module you must wire it into three places in the host:
+
+**1. `gui_merged.py`** — add the import to the element-registration line:
+
+```python
+import elements.cloud, elements.nn_graph, elements.circleaxis, \
+    elements.my_element  # noqa: F401 -- registers ...
+```
+
+**2. `elements_panel.py`** — same import line (the panel also needs the
+registry populated so it can list and instantiate every element type):
+
+```python
+import elements.cloud, elements.nn_graph, elements.circleaxis, \
+    elements.my_element  # noqa: F401 -- registers ...
+```
+
+**3. `control_bar.py`** — add a short abbreviation to `_KIND_ABBR` so the
+control bar can display a compact label for your element's toggle button:
+
+```python
+_KIND_ABBR: dict[str, str] = {
+    ...
+    "my_element": "myel",   # ≤ 7 chars works best
+    ...
+}
+```
+
+All three changes are mechanical; the content of the element module itself
+does not need to know about them.
+
 ## Rendering
 
 Rendering uses raw `moderngl` calls — there is no wrapper class involved.
@@ -490,3 +521,6 @@ parameter hooks, and registration.
 - [ ] `set_palette()` stores the palette and applies it lazily.
 - [ ] Tunable values are plain public attributes.
 - [ ] Module calls `register_element_type(kind, factory)` at import time.
+- [ ] Import added to the registration line in `gui_merged.py`.
+- [ ] Import added to the registration line in `elements_panel.py`.
+- [ ] Abbreviation added to `_KIND_ABBR` in `control_bar.py`.

@@ -244,6 +244,8 @@ def _action_completions(lm: LinkManager, pm: "PropertyManager") -> list[str]:
             actions.append(f"values_snap('{name}')")
     else:
         actions.append("values_snap('')")
+    for i in range(4):
+        actions.append(f"video.switch({i})")
     return actions
 
 

@@ -1,20 +1,12 @@
 """
-video_panel.py — Video file picker + playback controls.
+video_panel.py — Multi-slot video playback panel.
 
-VideoPanel owns a VideoPlayer and wires it into a VideoElement via set_player().
-It also publishes video.playing / video.position / video.duration to the
-SourceRegistry each poll cycle so those values are available as link sources.
+Manages a list of VideoPlayer instances; only one plays at a time.
+Switching is instant: pause old, play new, wire VideoElement via set_player().
+Publishes video.playing / video.position / video.duration / video.slot / video.count
+to the SourceRegistry each poll cycle.
 
-Usage::
-
-    from video_panel import VideoPanel
-
-    panel = VideoPanel(
-        get_video_element=lambda: ...,  # callable returning live VideoElement | None
-        source_registry=lm.source_registry,
-        title="Video",
-    )
-    panel.show()
+EventLink action:  video.switch(N)   — switch to slot N (0-based)
 """
 
 from __future__ import annotations
@@ -22,14 +14,15 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore    import QTimer, Qt
+from PySide6.QtGui     import QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QFileDialog, QCheckBox,
-    QFrame, QSizePolicy,
+    QFrame, QListWidget, QListWidgetItem, QAbstractItemView,
 )
 
 
-# ── stylesheet (matches audio_panel dark theme) ────────────────────────────────
+# ── stylesheet ────────────────────────────────────────────────────────────────
 
 _STYLESHEET = """
 QWidget {
@@ -41,10 +34,7 @@ QWidget {
 QLabel           { color: #707078; }
 QLabel#hdr       { color: #c8c8d0; font-weight: bold; padding-top: 4px; }
 QLabel#value     { color: #5eaeff; }
-QLabel#ok        { color: #7ec87e; }
-QLabel#err       { color: #e07070; }
 QLabel#info      { color: #707078; font-style: italic; }
-QLabel#path      { color: #9898a8; font-style: italic; }
 
 QPushButton {
     background-color: #2a2a36;
@@ -68,24 +58,28 @@ QCheckBox::indicator {
 QCheckBox::indicator:checked { background: #2a5080; border-color: #5eaeff; }
 
 QSlider::groove:horizontal {
-    height: 4px;
-    background: #2e2e38;
-    border-radius: 2px;
+    height: 4px; background: #2e2e38; border-radius: 2px;
 }
 QSlider::handle:horizontal {
-    width: 12px; height: 12px;
-    margin: -4px 0;
-    background: #5eaeff;
-    border-radius: 6px;
+    width: 12px; height: 12px; margin: -4px 0;
+    background: #5eaeff; border-radius: 6px;
 }
 QSlider::sub-page:horizontal { background: #2a5080; border-radius: 2px; }
 
-QFrame#sep {
-    color: #2e2e38;
-    max-height: 1px;
-    background-color: #2e2e38;
+QListWidget {
+    background-color: #111118;
+    border: 1px solid #38383f;
+    color: #707078;
 }
+QListWidget::item { padding: 3px 6px; }
+QListWidget::item:selected { background-color: #1e3050; color: #c8c8d0; }
+QListWidget::item:hover { background-color: #1a2030; }
+
+QFrame#sep { color: #2e2e38; max-height: 1px; background-color: #2e2e38; }
 """
+
+_COLOR_ACTIVE   = QColor("#5eaeff")
+_COLOR_INACTIVE = QColor("#505060")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -112,22 +106,18 @@ def _fmt_time(seconds: float) -> str:
 
 class VideoPanel(QWidget):
     """
-    Video playback controls panel.
+    Multi-slot video panel.
 
     Parameters
     ----------
     get_video_element : callable() -> VideoElement | None
-        Called when a file is opened to wire the player into the live element.
-        May return None if the VideoElement hasn't been added to the scene yet.
-    source_registry : SourceRegistry | None
-        Receives video.playing / video.position / video.duration each poll tick.
-    title : str
-        Window title.
+    source_registry   : SourceRegistry | None
+    title             : str
     """
 
     def __init__(
         self,
-        get_video_element = None,   # callable() -> VideoElement | None
+        get_video_element = None,
         source_registry   = None,
         title             : str = "Video",
         parent            = None,
@@ -135,13 +125,14 @@ class VideoPanel(QWidget):
         super().__init__(parent)
         self._get_element = get_video_element or (lambda: None)
         self._registry    = source_registry
-        self._player      = None   # VideoPlayer | None
+        self._slots: list[dict] = []   # {"path": str, "player": VideoPlayer, "name": str}
+        self._active_idx: int   = -1
 
         self.setWindowTitle(title)
         self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
         self.setStyleSheet(_STYLESHEET)
-        self.setMinimumWidth(360)
-        self.resize(420, 200)
+        self.setMinimumWidth(380)
+        self.resize(440, 340)
 
         self._build_ui()
 
@@ -150,58 +141,58 @@ class VideoPanel(QWidget):
         self._poll_timer.timeout.connect(self._update_ui)
         self._poll_timer.start()
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(6)
 
-        # File row
-        root.addWidget(_hdr("Video File"))
+        root.addWidget(_hdr("Video Slots"))
         root.addWidget(_sep())
 
-        file_row = QHBoxLayout()
-        self._open_btn = QPushButton("Open File…")
-        self._open_btn.clicked.connect(self._on_open)
-        file_row.addWidget(self._open_btn)
+        toolbar = QHBoxLayout()
+        self._add_btn = QPushButton("Add File…")
+        self._add_btn.clicked.connect(self._on_add)
+        toolbar.addWidget(self._add_btn)
+        self._remove_btn = QPushButton("Remove")
+        self._remove_btn.clicked.connect(self._on_remove)
+        self._remove_btn.setEnabled(False)
+        toolbar.addWidget(self._remove_btn)
+        toolbar.addStretch(1)
+        root.addLayout(toolbar)
 
-        self._path_label = QLabel("(no file)")
-        self._path_label.setObjectName("path")
-        self._path_label.setWordWrap(False)
-        self._path_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        file_row.addWidget(self._path_label, 1)
-        root.addLayout(file_row)
+        self._slot_list = QListWidget()
+        self._slot_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._slot_list.setMaximumHeight(110)
+        self._slot_list.currentRowChanged.connect(self._on_slot_selected)
+        root.addWidget(self._slot_list)
 
-        # Transport row
         root.addWidget(_sep())
-        transport_row = QHBoxLayout()
+        root.addWidget(_hdr("Playback"))
 
+        transport = QHBoxLayout()
         self._play_btn = QPushButton("Play")
         self._play_btn.clicked.connect(self._on_play)
         self._play_btn.setEnabled(False)
-        transport_row.addWidget(self._play_btn)
-
+        transport.addWidget(self._play_btn)
         self._pause_btn = QPushButton("Pause")
         self._pause_btn.clicked.connect(self._on_pause)
         self._pause_btn.setEnabled(False)
-        transport_row.addWidget(self._pause_btn)
-
+        transport.addWidget(self._pause_btn)
         self._loop_chk = QCheckBox("Loop")
         self._loop_chk.setChecked(True)
         self._loop_chk.stateChanged.connect(self._on_loop_changed)
-        transport_row.addWidget(self._loop_chk)
-        transport_row.addStretch(1)
-        root.addLayout(transport_row)
+        transport.addWidget(self._loop_chk)
+        transport.addStretch(1)
+        root.addLayout(transport)
 
-        # Seek bar + time label
         seek_row = QHBoxLayout()
         self._seek = QSlider(Qt.Horizontal)
         self._seek.setRange(0, 1000)
         self._seek.sliderReleased.connect(self._on_seek)
         self._seek.setEnabled(False)
         seek_row.addWidget(self._seek, 1)
-
         self._time_label = QLabel("0:00 / 0:00")
         self._time_label.setObjectName("value")
         self._time_label.setFixedWidth(80)
@@ -209,87 +200,153 @@ class VideoPanel(QWidget):
         seek_row.addWidget(self._time_label)
         root.addLayout(seek_row)
 
-        # Info row
         self._info_label = QLabel("FPS: —   Size: —")
         self._info_label.setObjectName("info")
         root.addWidget(self._info_label)
 
         root.addStretch(1)
 
+    # ── slot management ───────────────────────────────────────────────────────
+
+    def _active_player(self):
+        if 0 <= self._active_idx < len(self._slots):
+            return self._slots[self._active_idx]["player"]
+        return None
+
+    def switch_to(self, idx: int) -> None:
+        """Activate slot idx. Safe to call from Qt thread only."""
+        if idx < 0 or idx >= len(self._slots):
+            return
+        old = self._active_player()
+        if old is not None:
+            old.pause()
+        self._active_idx = idx
+        new = self._active_player()
+        if new is not None:
+            new.play()
+            el = self._get_element()
+            if el is not None:
+                el.set_player(new)
+        self._refresh_list()
+        self._update_controls()
+
+    def _add_slot(self, path: str) -> None:
+        from video_player import VideoPlayer
+        player = VideoPlayer(path, loop=self._loop_chk.isChecked())
+        player.pause()   # inactive until switched to
+        self._slots.append({"path": path, "player": player, "name": os.path.basename(path)})
+        self._refresh_list()
+        if self._active_idx < 0:
+            self.switch_to(len(self._slots) - 1)
+        self._remove_btn.setEnabled(True)
+
+    def _remove_selected_slot(self) -> None:
+        row = self._slot_list.currentRow()
+        if row < 0 or row >= len(self._slots):
+            return
+        slot = self._slots.pop(row)
+        slot["player"].close()
+
+        if not self._slots:
+            self._active_idx = -1
+            el = self._get_element()
+            if el is not None:
+                el.set_player(None)
+        elif self._active_idx >= len(self._slots):
+            self.switch_to(len(self._slots) - 1)
+        elif self._active_idx == row:
+            self.switch_to(min(row, len(self._slots) - 1))
+        elif self._active_idx > row:
+            self._active_idx -= 1
+
+        self._refresh_list()
+        self._update_controls()
+        self._remove_btn.setEnabled(bool(self._slots))
+
+    def _refresh_list(self) -> None:
+        self._slot_list.blockSignals(True)
+        self._slot_list.clear()
+        for i, slot in enumerate(self._slots):
+            active = (i == self._active_idx)
+            item   = QListWidgetItem(f" {'●' if active else '◌'}  {slot['name']}")
+            item.setForeground(QBrush(_COLOR_ACTIVE if active else _COLOR_INACTIVE))
+            self._slot_list.addItem(item)
+        if 0 <= self._active_idx < self._slot_list.count():
+            self._slot_list.setCurrentRow(self._active_idx)
+        self._slot_list.blockSignals(False)
+
+    def _update_controls(self) -> None:
+        p = self._active_player()
+        has = p is not None
+        self._play_btn.setEnabled(has)
+        self._pause_btn.setEnabled(has)
+        self._seek.setEnabled(has)
+        if has:
+            self._info_label.setText(f"FPS: {p.fps:.2f}   Size: {p.width}×{p.height}")
+        else:
+            self._info_label.setText("FPS: —   Size: —")
+            self._time_label.setText("0:00 / 0:00")
+
     # ── event handlers ────────────────────────────────────────────────────────
 
-    def _on_open(self) -> None:
+    def _on_add(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Video", "",
             "Video (*.mp4 *.mov *.mkv *.avi *.webm);;All files (*)",
         )
-        if not path:
-            return
-        self._load(path)
+        if path:
+            self._add_slot(path)
 
-    def _load(self, path: str) -> None:
-        from video_player import VideoPlayer
-        if self._player is not None:
-            self._player.close()
+    def _on_remove(self) -> None:
+        self._remove_selected_slot()
 
-        self._player = VideoPlayer(path, loop=self._loop_chk.isChecked())
-        short = os.path.basename(path)
-        self._path_label.setText(short)
-        self._info_label.setText(
-            f"FPS: {self._player.fps:.2f}   "
-            f"Size: {self._player.width}×{self._player.height}"
-        )
-
-        el = self._get_element()
-        if el is not None:
-            el.set_player(self._player)
-
-        self._player.play()
-        self._play_btn.setEnabled(True)
-        self._pause_btn.setEnabled(True)
-        self._seek.setEnabled(True)
+    def _on_slot_selected(self, row: int) -> None:
+        if row >= 0 and row != self._active_idx:
+            self.switch_to(row)
 
     def _on_play(self) -> None:
-        if self._player:
-            self._player.play()
+        p = self._active_player()
+        if p:
+            p.play()
 
     def _on_pause(self) -> None:
-        if self._player:
-            self._player.pause()
+        p = self._active_player()
+        if p:
+            p.pause()
 
     def _on_loop_changed(self, state: int) -> None:
-        if self._player:
-            self._player._loop = bool(state)
+        loop = bool(state)
+        for slot in self._slots:
+            slot["player"]._loop = loop
 
     def _on_seek(self) -> None:
-        if self._player and self._player.duration > 0:
-            t = (self._seek.value() / 1000.0) * self._player.duration
-            self._player.seek(t)
-            el = self._get_element()
-            if el is not None:
-                el.set_player(self._player)
+        p = self._active_player()
+        if p and p.duration > 0:
+            t = (self._seek.value() / 1000.0) * p.duration
+            p.seek(t)
 
     # ── poll timer ────────────────────────────────────────────────────────────
 
     def _update_ui(self) -> None:
-        if self._player is None:
+        p = self._active_player()
+        if p is None:
             return
 
-        pos      = self._player.position
-        duration = self._player.duration
-        playing  = self._player.playing
+        pos      = p.position
+        duration = p.duration
+        playing  = p.playing
 
         if self._registry is not None:
             try:
                 self._registry.update("video.playing",  1.0 if playing else 0.0)
                 self._registry.update("video.position", pos)
                 self._registry.update("video.duration", duration)
+                self._registry.update("video.slot",     float(self._active_idx))
+                self._registry.update("video.count",    float(len(self._slots)))
             except Exception:
                 pass
 
-        self._time_label.setText(
-            f"{_fmt_time(pos)} / {_fmt_time(duration)}"
-        )
+        self._time_label.setText(f"{_fmt_time(pos)} / {_fmt_time(duration)}")
 
         if duration > 0 and not self._seek.isSliderDown():
             self._seek.blockSignals(True)
@@ -299,8 +356,8 @@ class VideoPanel(QWidget):
     # ── cleanup ───────────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
-        if self._player is not None:
-            self._player.close()
+        for slot in self._slots:
+            slot["player"].close()
         super().closeEvent(event)
 
 

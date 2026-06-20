@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from elements.base import ELEMENT_TYPES
-import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs
+import elements.cloud, elements.nn_graph, elements.circleaxis, elements.laser_ribbons, elements.falling_discs, elements.kaleidoscope  # noqa: F401 -- registers cloud/nn_graph/circles/lasers/falling_discs/kaleidoscope
 
 
 # ── stylesheet (matches color_panel.py / audio_panel.py dark theme) ───────────

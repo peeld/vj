@@ -699,6 +699,9 @@ class LinkManager:
         self._active_preset     : str | None          = None
         self._on_preset_loaded  : list                 = []   # list[Callable[[str], None]]
 
+        # Set externally (qt_app.py) to wire video slot switching via EventLinks.
+        self._video_switch_fn = None   # Callable[[int], None] | None
+
         # Baseline values: persistent per-property floats written to PM when an
         # expression is disabled or cleared.  Intentionally NOT cleared by clear_state().
         self._baselines: dict[str, float] = {}
@@ -1106,11 +1109,12 @@ class LinkManager:
     _RE_PRESET       = re.compile(r"""^preset\(['"]([^'"]+)['"]\)$""")
     _RE_LINK_PRESET  = re.compile(r"""^link_preset\(['"]([^'"]+)['"]\)$""")
     _RE_VALUES_SNAP  = re.compile(r"""^values_snap\(['"]([^'"]+)['"]\)$""")
-    _RE_NEXT_PRESET = re.compile(r"^link_preset\.next\(\)$")
-    _RE_PREV_PRESET = re.compile(r"^link_preset\.prev\(\)$")
-    _RE_BPM_TAP     = re.compile(r"^bpm\.tap\(\)$")
-    _RE_BPM_NUDGE   = re.compile(r"^bpm\.nudge\(([+-]?[\d.]+)\)$")
-    _RE_BPM_SET     = re.compile(r"^bpm\.set\(([\d.]+)\)$")
+    _RE_NEXT_PRESET    = re.compile(r"^link_preset\.next\(\)$")
+    _RE_PREV_PRESET    = re.compile(r"^link_preset\.prev\(\)$")
+    _RE_BPM_TAP        = re.compile(r"^bpm\.tap\(\)$")
+    _RE_BPM_NUDGE      = re.compile(r"^bpm\.nudge\(([+-]?[\d.]+)\)$")
+    _RE_BPM_SET        = re.compile(r"^bpm\.set\(([\d.]+)\)$")
+    _RE_VIDEO_SWITCH   = re.compile(r"^video\.switch\((\d+)\)$")
 
     def _dispatch_action(self, action: str, pm: Any) -> None:
         action = action.strip()
@@ -1183,6 +1187,12 @@ class LinkManager:
         if m:
             if self._bpm_clock:
                 self._bpm_clock.set_bpm(float(m.group(1)))
+            return
+
+        m = self._RE_VIDEO_SWITCH.match(action)
+        if m:
+            if self._video_switch_fn is not None:
+                self._video_switch_fn(int(m.group(1)))
             return
 
         if action == "regen":
