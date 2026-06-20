@@ -237,93 +237,6 @@ class ThresholdDef:
         )
 
 
-@dataclass
-class ParameterDef:
-    """Event-driven stateful source; output available as p.<name>.
-
-    Kinds:
-      toggle  — flip 0↔1 on each trigger
-      gate    — 1.0 on trigger; 0.0 on off_event
-      latch   — 1.0 on trigger (stays 1 until off_event; trigger doesn't re-toggle)
-      pulse   — 1.0 on trigger; returns to 0.0 after pulse_ms milliseconds
-      counter — increments 0..wrap_at-1 on each trigger; normalized 0-1 output;
-                if snap_n > 0, output is quantized to snap_n discrete steps
-    """
-    name      : str
-    kind      : str          # "toggle" | "gate" | "latch" | "pulse" | "counter"
-    trigger   : str          # event id for the primary trigger
-    off_event : str | None = None   # gate/latch: event that resets to 0
-    wrap_at   : int         = 8     # counter: wraps at this count
-    pulse_ms  : float       = 100.0 # pulse: duration in ms before returning to 0
-    snap_n    : int         = 0     # counter: number of discrete output steps (0 = continuous)
-
-    def to_dict(self) -> dict:
-        return {
-            "name"     : self.name,
-            "kind"     : self.kind,
-            "trigger"  : self.trigger,
-            "off_event": self.off_event,
-            "wrap_at"  : self.wrap_at,
-            "pulse_ms" : self.pulse_ms,
-            "snap_n"   : self.snap_n,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "ParameterDef":
-        return cls(
-            name      = d["name"],
-            kind      = d["kind"],
-            trigger   = d["trigger"],
-            off_event = d.get("off_event"),
-            wrap_at   = d.get("wrap_at",  8),
-            pulse_ms  = d.get("pulse_ms", 100.0),
-            snap_n    = d.get("snap_n",   0),
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  _ParameterState — runtime state for a ParameterDef (not serialized)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _ParameterState:
-    """Holds the mutable runtime state for one ParameterDef."""
-
-    def __init__(self, defn: ParameterDef) -> None:
-        self._defn             = defn
-        self._value            : float = 0.0
-        self._counter          : int   = 0
-        self._pulse_remaining  : float = 0.0
-
-    def on_trigger(self, _payload=None) -> None:
-        kind = self._defn.kind
-        if kind == "toggle":
-            self._value = 0.0 if self._value > 0.5 else 1.0
-        elif kind == "gate":
-            self._value = 1.0
-        elif kind == "latch":
-            self._value = 1.0
-        elif kind == "pulse":
-            self._value           = 1.0
-            self._pulse_remaining = self._defn.pulse_ms / 1000.0
-        elif kind == "counter":
-            self._counter = (self._counter + 1) % self._defn.wrap_at
-            raw = self._counter / self._defn.wrap_at
-            if self._defn.snap_n > 0:
-                self._value = round(raw * self._defn.snap_n) / self._defn.snap_n
-            else:
-                self._value = raw
-
-    def on_off_event(self, _payload=None) -> None:
-        self._value = 0.0
-
-    def tick(self, dt: float) -> float:
-        if self._defn.kind == "pulse" and self._pulse_remaining > 0.0:
-            self._pulse_remaining -= dt
-            if self._pulse_remaining <= 0.0:
-                self._pulse_remaining = 0.0
-                self._value           = 0.0
-        return self._value
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Source Registry
@@ -682,9 +595,7 @@ class LinkManager:
         self._threshold_state : dict[str, bool]        = {}  # name -> currently_above_high
         self._threshold_last_t: dict[str, float]       = {}  # name -> perf_counter of last fire
         self._envelope_sub_tokens: dict[str, list[int]] = {}  # name -> EventBus tokens
-        self._parameter_defs      : list[ParameterDef]           = []
-        self._parameter_states    : dict[str, _ParameterState]   = {}  # name → state
-        self._parameter_sub_tokens: dict[str, list[int]]          = {}  # name → EventBus tokens
+        self._p_values: dict[str, Any] = {}        # p.* parameter store (any type)
 
         self._const_ns = types.SimpleNamespace()  # user-defined named constants
 
@@ -698,6 +609,7 @@ class LinkManager:
 
         self._active_preset     : str | None          = None
         self._on_preset_loaded  : list                 = []   # list[Callable[[str], None]]
+        self._mode: str = "expression"  # "expression" | "value"
 
         # Set externally (qt_app.py) to wire video slot switching via EventLinks.
         self._video_switch_fn = None   # Callable[[int], None] | None
@@ -762,6 +674,7 @@ class LinkManager:
             if k in pm._defs:
                 pm.set(k, v)
                 self._baselines[k] = v
+        self._mode = "value"
         print(f"[lm] value snapshot loaded: '{name}'")
 
     def delete_value_snapshot(self, name: str) -> None:
@@ -772,15 +685,25 @@ class LinkManager:
 
     # ── Per-frame evaluation ──────────────────────────────────────────────────
 
+    def set_mode(self, mode: str) -> None:
+        if mode in ("expression", "value"):
+            self._mode = mode
+
+    def get_mode(self) -> str:
+        return self._mode
+
     def evaluate_links(self, pm: Any, dt: float) -> None:
         """Evaluate all enabled SignalLinks and write results to PM.
 
         Called from the GL thread once per frame, after source registry writes
         (clock, keyboard) and before drawing.
         """
+        if self._mode != "expression":
+            return
         snap      = self.source_registry.snapshot()
         shared_ns = {**_flat_to_ns(snap), **EVAL_MATH_NS,
                      "dt": dt, "const": self._const_ns}
+        shared_ns["p"] = types.SimpleNamespace(**self._p_values)
 
         for link in self._signal_links:
             if not link.enabled:
@@ -881,29 +804,6 @@ class LinkManager:
             elif was_above and val < defn.low:
                 self._threshold_state[defn.name] = False
 
-    # ── Parameter management ──────────────────────────────────────────────────
-
-    def add_parameter(self, defn: ParameterDef) -> None:
-        """Register a ParameterDef, create its runtime state, and wire event subscriptions."""
-        state = _ParameterState(defn)
-        self._parameter_states[defn.name] = state
-        self._parameter_defs.append(defn)
-        tokens = [self.event_bus.subscribe(defn.trigger, state.on_trigger)]
-        if defn.off_event:
-            tokens.append(self.event_bus.subscribe(defn.off_event, state.on_off_event))
-        self._parameter_sub_tokens[defn.name] = tokens
-
-    def remove_parameter(self, name: str) -> None:
-        for token in self._parameter_sub_tokens.pop(name, []):
-            self.event_bus.unsubscribe(token)
-        self._parameter_states.pop(name, None)
-        self._parameter_defs = [d for d in self._parameter_defs if d.name != name]
-
-    def tick_parameters(self, dt: float) -> None:
-        """Advance all parameter states and write p.<name> into the source registry."""
-        for name, state in self._parameter_states.items():
-            self.source_registry.update(f"p.{name}", state.tick(dt))
-
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def clear_state(self) -> None:
@@ -924,11 +824,7 @@ class LinkManager:
         self._threshold_defs.clear()
         self._threshold_state.clear()
         self._threshold_last_t.clear()
-        for name in list(self._parameter_states):
-            for token in self._parameter_sub_tokens.pop(name, []):
-                self.event_bus.unsubscribe(token)
-        self._parameter_defs.clear()
-        self._parameter_states.clear()
+        self._p_values.clear()
 
     def save_state(self, path) -> None:
         """Serialise all routing state, presets, and preset triggers to JSON."""
@@ -938,12 +834,12 @@ class LinkManager:
             "lfos"            : [d.to_dict() for d in self._lfo_defs],
             "event_links"     : [l.to_dict() for l in self._event_links],
             "thresholds"      : [d.to_dict() for d in self._threshold_defs],
-            "parameters"      : [d.to_dict() for d in self._parameter_defs],
             "baselines"       : dict(self._baselines),
             "presets"         : self._presets,
             "preset_triggers" : [l.to_dict() for l in self._preset_triggers],
             "value_snapshots" : self._value_snapshots,
             "bpm"             : self._bpm_clock.to_dict() if self._bpm_clock else {},
+            "mode"            : self._mode,
         }
         _Path(path).write_text(_json.dumps(data, indent=2))
 
@@ -966,8 +862,6 @@ class LinkManager:
             self.add_event_link(EventLink.from_dict(d))
         for d in data.get("thresholds", []):
             self.add_threshold(ThresholdDef.from_dict(d))
-        for d in data.get("parameters", []):
-            self.add_parameter(ParameterDef.from_dict(d))
         self._baselines.update(data.get("baselines", {}))
         for name, snap in data.get("presets", {}).items():
             self._presets[name] = snap
@@ -979,6 +873,7 @@ class LinkManager:
             self._bpm_clock.set_bpm(data["bpm"].get("bpm", 120.0))
             self._bpm_clock.set_latency_ms(data["bpm"].get("latency_offset_ms", 0.0))
             self._bpm_clock.tap_event_name = data["bpm"].get("tap_event", "")
+        self._mode = data.get("mode", "expression")
 
     # ── Link preset management ────────────────────────────────────────────────
 
@@ -992,7 +887,6 @@ class LinkManager:
             "lfos"         : [d.to_dict() for d in self._lfo_defs],
             "event_links"  : [l.to_dict() for l in self._event_links],
             "thresholds"   : [d.to_dict() for d in self._threshold_defs],
-            "parameters"   : [d.to_dict() for d in self._parameter_defs],
         }
         self._presets[name] = snap
         PRESET_DIR.mkdir(exist_ok=True)
@@ -1019,14 +913,13 @@ class LinkManager:
             self.add_event_link(EventLink.from_dict(d))
         for d in snap.get("thresholds", []):
             self.add_threshold(ThresholdDef.from_dict(d))
-        for d in snap.get("parameters", []):
-            self.add_parameter(ParameterDef.from_dict(d))
         pm_props = snap.get("pm_props", {})
         if pm is not None and pm_props:
             for k, v in pm_props.items():
                 if k in pm._defs:
                     pm.set(k, v)
                     self._baselines[k] = v
+        self._mode = "expression"
         print(f"[lm] preset loaded: '{name}'")
         self._active_preset = name
         for cb in self._on_preset_loaded:
@@ -1090,6 +983,27 @@ class LinkManager:
 
     def add_event_link(self, link: EventLink) -> None:
         self._event_links.append(link)
+        self._init_p_slot(link.action)
+
+    def _init_p_slot(self, action: str) -> None:
+        action = action.strip()
+        for regex in (self._RE_P_TOGGLE, self._RE_P_GATE_ON, self._RE_P_GATE_OFF):
+            m = regex.match(action)
+            if m:
+                name = m.group(1)
+                if name not in self._p_values:
+                    self._p_values[name] = 0.0
+                return
+        m = self._RE_SET.match(action)
+        if m:
+            key = m.group(1).strip()
+            if key.startswith("p."):
+                name = key[2:]
+                if name not in self._p_values:
+                    try:
+                        self._p_values[name] = eval(m.group(2).strip(), {"__builtins__": {}}, {})
+                    except Exception:
+                        self._p_values[name] = m.group(2).strip()
 
     def remove_event_link(self, event: str, action: str) -> None:
         self._event_links = [
@@ -1099,7 +1013,12 @@ class LinkManager:
 
     # ── Action dispatcher ─────────────────────────────────────────────────────
 
-    # Deprecated: toggle/cycle/cycle_back/set are superseded by Parameters (p.*).
+    _RE_P_TOGGLE   = re.compile(r"""^toggle\(['"]p\.([^'"]+)['"]\)$""")
+    _RE_P_GATE_ON  = re.compile(r"""^gate_on\(['"]p\.([^'"]+)['"]\)$""")
+    _RE_P_GATE_OFF = re.compile(r"""^gate_off\(['"]p\.([^'"]+)['"]\)$""")
+    _RE_SNAP_BIND  = re.compile(r"^snap_bind\(\)$")
+
+    # Deprecated: toggle/cycle/cycle_back/set operate on PM properties, not p.*.
     # Handlers retained for backward-compat with saved link_state.json files.
     # These actions no longer appear in _action_completions() suggestions.
     _RE_TOGGLE      = re.compile(r"^toggle\(([^)]+)\)$")
@@ -1118,6 +1037,22 @@ class LinkManager:
 
     def _dispatch_action(self, action: str, pm: Any) -> None:
         action = action.strip()
+
+        m = self._RE_P_TOGGLE.match(action)
+        if m:
+            name = m.group(1)
+            self._p_values[name] = 0.0 if self._p_values.get(name, 0.0) > 0.5 else 1.0
+            return
+
+        m = self._RE_P_GATE_ON.match(action)
+        if m:
+            self._p_values[m.group(1)] = 1.0
+            return
+
+        m = self._RE_P_GATE_OFF.match(action)
+        if m:
+            self._p_values[m.group(1)] = 0.0
+            return
 
         m = self._RE_TOGGLE.match(action)
         if m:
@@ -1145,11 +1080,19 @@ class LinkManager:
         if m:
             key     = m.group(1).strip()
             val_str = m.group(2).strip()
-            try:
-                val = eval(val_str, {"__builtins__": {}}, {})
-            except Exception:
-                val = val_str
-            pm.set(key, val)
+            if key.startswith("p."):
+                try:
+                    val = eval(val_str, {"__builtins__": {}},
+                               {"p": types.SimpleNamespace(**self._p_values)})
+                except Exception:
+                    val = val_str
+                self._p_values[key[2:]] = val
+            else:
+                try:
+                    val = eval(val_str, {"__builtins__": {}}, {})
+                except Exception:
+                    val = val_str
+                pm.set(key, val)
             return
 
         m = self._RE_PRESET.match(action)
@@ -1195,6 +1138,10 @@ class LinkManager:
                 self._video_switch_fn(int(m.group(1)))
             return
 
+        if self._RE_SNAP_BIND.match(action):
+            self.event_bus.fire("_snap_bind")
+            return
+
         if action == "regen":
             # Fires "regen" as an event; subscribers (e.g. MergedGUI) handle it.
             self.event_bus.fire("regen")
@@ -1232,6 +1179,7 @@ class LinkManager:
 
         snap = self.source_registry.snapshot()
         ns   = {**_flat_to_ns(snap), **EVAL_MATH_NS}
+        ns["p"] = types.SimpleNamespace(**self._p_values)
 
         for event_id, _payload in fired:
             self._fire_links(self._preset_triggers, event_id, ns, pm)

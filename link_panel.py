@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 
 from link_manager import (
     LinkManager, SignalLink, EnvelopeDef, LFODef, EventLink, ThresholdDef,
-    ParameterDef, EVAL_MATH_NS, _flat_to_ns, KEY_NAMES,
+    EVAL_MATH_NS, _flat_to_ns, KEY_NAMES,
 )
 
 if TYPE_CHECKING:
@@ -177,6 +177,9 @@ QFrame#sep {
     background-color: #2e2e38;
 }
 
+QPushButton#mode_btn         { min-width: 90px; color: #555560; border-color: #2a2a38; }
+QPushButton#mode_btn:checked { color: #7ec87e; border-color: #3a5a3a; background-color: #1e2a1e; }
+
 QDialog { background-color: #1a1a22; }
 QDialogButtonBox QPushButton { min-width: 70px; }
 """
@@ -199,12 +202,19 @@ _BPM_RATE_MODES = [
 ]
 _BPM_MODE_LABEL = {key: label for label, key in _BPM_RATE_MODES}
 
-_PARAMETER_KINDS = ("toggle", "gate", "latch", "pulse", "counter")
-
 _SOURCE_GROUP_ORDER = ["audio", "midi", "clock", "lfo", "env", "p"]
 
 
 # ── helper: completion lists ──────────────────────────────────────────────────
+
+import re as _re
+_RE_P_ACTION = _re.compile(r"""^(?:toggle|gate_on|gate_off)\(['"]p\.([^'"]+)['"]\)$""")
+
+
+def _p_name_from_action(action: str) -> str | None:
+    m = _RE_P_ACTION.match(action.strip())
+    return m.group(1) if m else None
+
 
 def _event_completions(lm: LinkManager) -> list[str]:
     srcs = ["audio.onset", "clock.beat"]
@@ -229,8 +239,10 @@ def _expr_completions(lm: LinkManager) -> list[str]:
 def _action_completions(lm: LinkManager, pm: "PropertyManager") -> list[str]:
     actions: list[str] = [
         "regen", "preset('')",
+        "snap_bind()",
         "bpm.tap()", "bpm.nudge(+0.5)", "bpm.nudge(-0.5)", "bpm.set(120)",
         "link_preset.next()", "link_preset.prev()",
+        "toggle('p.')", "gate_on('p.')", "gate_off('p.')",
     ]
     preset_names = lm.list_link_presets()
     if preset_names:
@@ -315,6 +327,79 @@ class _KeyCaptureDialog(QDialog):
         return self._result
 
 
+class _AssignSnapshotCaptureDialog(QDialog):
+    """Modal: save current values as a named snapshot, then wait for the next
+    key press or MIDI note-on to assign that snapshot's recall to that input."""
+
+    def __init__(self, snap_name: str, lm: LinkManager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Assign Snapshot Recall")
+        self.setStyleSheet(_STYLESHEET)
+        self.setFixedSize(380, 150)
+        self._result_event: str | None = None
+        self._midi_router = None
+        self._midi_listener = None
+
+        lo = QVBoxLayout(self)
+        lo.setSpacing(8)
+
+        lbl = QLabel(f"Snapshot <b>'{snap_name}'</b> saved.\n\nPress a key or play a MIDI note to assign recall.")
+        lbl.setObjectName("hdr")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setWordWrap(True)
+        lo.addWidget(lbl)
+
+        self._status = QLabel("Waiting for input…")
+        self._status.setObjectName("info")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lo.addWidget(self._status)
+
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        lo.addWidget(cancel)
+
+        try:
+            from midi_input import get_router
+            self._midi_router = get_router()
+
+            def _on_midi(evt: dict) -> None:
+                if evt.get("type") != "note" or evt.get("value", 0) == 0:
+                    return
+                self._midi_listener = None
+                self._midi_router.remove_listener(_on_midi)
+                self._result_event = f"midi.note{evt['number']}.on"
+                QTimer.singleShot(0, self, self.accept)
+
+            self._midi_listener = _on_midi
+            self._midi_router.add_listener(_on_midi)
+        except Exception:
+            pass
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        name = _QT_KEY_TO_NAME.get(event.key())
+        if name:
+            self._result_event = f"key.{name}.press"
+            self._cleanup_midi()
+            self.accept()
+        elif event.key() == Qt.Key.Key_Escape:
+            self.reject()
+
+    def reject(self) -> None:
+        self._cleanup_midi()
+        super().reject()
+
+    def _cleanup_midi(self) -> None:
+        if self._midi_router and self._midi_listener:
+            try:
+                self._midi_router.remove_listener(self._midi_listener)
+            except Exception:
+                pass
+            self._midi_listener = None
+
+    def captured_event(self) -> str | None:
+        return self._result_event
+
+
 class _ChoiceCaptureDialog(QDialog):
     """Modal: pick an enum sink, then one of its valid choice values."""
 
@@ -369,8 +454,10 @@ def _eval_preview(expr: str, lm: LinkManager) -> tuple[str, bool]:
     if not expr.strip():
         return ("", False)
     try:
+        import types as _types
         snap = lm.source_registry.snapshot()
         ns = {**_flat_to_ns(snap), **EVAL_MATH_NS, "dt": 0.016, "const": lm._const_ns}
+        ns["p"] = _types.SimpleNamespace(**lm._p_values)
         ns.setdefault("smooth", lambda x, tau=0.0: x)
         result = eval(expr, {"__builtins__": {}}, ns)
         if isinstance(result, float):
@@ -381,6 +468,12 @@ def _eval_preview(expr: str, lm: LinkManager) -> tuple[str, bool]:
 
 
 # ── helper: table cell ────────────────────────────────────────────────────────
+
+def _fmt_p_val(val) -> str:
+    if isinstance(val, float) and val in (0.0, 1.0):
+        return str(int(val))
+    return str(val)
+
 
 def _cell(text: str) -> QTableWidgetItem:
     item = QTableWidgetItem(str(text))
@@ -445,26 +538,57 @@ class _BaseDialog(QDialog):
 # ── Event Link ────────────────────────────────────────────────────────────────
 
 class EventLinkDialog(_BaseDialog):
+    link_added = Signal(object)   # emits EventLink when Add is clicked in add mode
+
     def __init__(self, lm: LinkManager, pm: "PropertyManager",
                  link: EventLink | None = None, parent=None,
                  action_completions: list[str] | None = None):
-        super().__init__("Event Link" if link is None else "Edit Event Link", parent)
+        super().__init__("Add Event Link" if link is None else "Edit Event Link", parent)
+        self._lm = lm
+        self._pm = pm
+        self._is_add_mode = link is None
 
+        # ── Event row ──────────────────────────────────────────────────────
         self._event = QLineEdit()
         self._event.setPlaceholderText("midi.note36.on")
         if link:
             self._event.setText(link.event)
         self._event.setCompleter(_make_completer(_event_completions(lm), self))
-        self._row("Event:", self._event)
+        event_row = self._row("Event:", self._event)
 
+        midi_btn = QPushButton("midi")
+        midi_btn.setObjectName("pick")
+        midi_btn.setFixedWidth(38)
+        midi_btn.setToolTip("Wait for the next MIDI note-on and fill the event field.")
+        midi_btn.clicked.connect(self._capture_midi)
+        event_row.addWidget(midi_btn)
+
+        key_btn = QPushButton("key")
+        key_btn.setObjectName("pick")
+        key_btn.setFixedWidth(32)
+        key_btn.setToolTip("Press a key to fill the event field.")
+        key_btn.clicked.connect(self._capture_key)
+        event_row.addWidget(key_btn)
+
+        # ── Action row ──────────────────────────────────────────────────────
         self._action = QLineEdit()
         self._action.setPlaceholderText("regen")
         if link:
             self._action.setText(link.action)
         actions = action_completions if action_completions is not None else _action_completions(lm, pm)
         self._action.setCompleter(_make_completer(actions, self))
-        self._row("Action:", self._action)
+        action_row = self._row("Action:", self._action)
 
+        action_menu_btn = QPushButton("▾")
+        action_menu_btn.setObjectName("pick")
+        action_menu_btn.setFixedWidth(26)
+        action_menu_btn.setToolTip("Browse available actions.")
+        action_menu_btn.clicked.connect(
+            lambda: self._show_action_menu(action_menu_btn)
+        )
+        action_row.addWidget(action_menu_btn)
+
+        # ── Condition row ───────────────────────────────────────────────────
         self._condition = QLineEdit()
         self._condition.setPlaceholderText("(optional)  midi.cc7 > 0.5")
         if link and link.condition:
@@ -476,7 +600,154 @@ class EventLinkDialog(_BaseDialog):
         self._enabled.setChecked(link.enabled if link else True)
         self._layout.addWidget(self._enabled)
 
-        self._add_buttons()
+        self._status = QLabel("")
+        self._status.setObjectName("info")
+        self._layout.addWidget(self._status)
+
+        if self._is_add_mode:
+            btn_row = QHBoxLayout()
+            self._add_btn = QPushButton("Add")
+            self._add_btn.setObjectName("add")
+            self._add_btn.setDefault(True)
+            self._add_btn.clicked.connect(self._do_add)
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(self.reject)
+            btn_row.addStretch()
+            btn_row.addWidget(self._add_btn)
+            btn_row.addWidget(close_btn)
+            self._layout.addLayout(btn_row)
+        else:
+            self._add_buttons()
+
+    def _do_add(self) -> None:
+        link = self.result_link()
+        if not link.event or not link.action:
+            self._set_status("event and action are required", error=True)
+            return
+        self.link_added.emit(link)
+        self._event.clear()
+        self._action.clear()
+        self._condition.clear()
+        self._enabled.setChecked(True)
+        self._set_status(f"added: {link.event}  →  {link.action}", error=False)
+
+    def _set_status(self, text: str, error: bool) -> None:
+        self._status.setText(text)
+        self._status.setObjectName("err" if error else "ok")
+        self._status.style().unpolish(self._status)
+        self._status.style().polish(self._status)
+
+    def _capture_midi(self) -> None:
+        try:
+            from midi_input import get_router
+            router = get_router()
+        except Exception:
+            self._set_status("no MIDI router", error=True)
+            return
+        self._set_status("waiting for MIDI note…", error=False)
+
+        def _on_event(evt: dict) -> None:
+            if evt.get("type") != "note" or evt.get("value", 0) == 0:
+                return
+            router.remove_listener(_on_event)
+            note = evt["number"]
+            # Pass self as context so Qt marshals the call to the Qt main thread
+            # (this callback fires from the MIDI background thread).
+            QTimer.singleShot(0, self, lambda: self._fill_event(f"midi.note{note}.on"))
+
+        router.add_listener(_on_event)
+
+    def _fill_event(self, text: str) -> None:
+        self._event.setText(text)
+        self._status.setText("")
+
+    def _capture_key(self) -> None:
+        dlg = _KeyCaptureDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            event_str = dlg.captured_event()
+            if event_str:
+                self._event.setText(event_str)
+
+    def _derive_p_name(self) -> str:
+        """Derive a p.* parameter name from the current event field text."""
+        event = self._event.text().strip().lower()
+        if not event:
+            return "name"
+        parts = event.split(".")
+        if parts[-1] in ("on", "off", "press", "release"):
+            parts = parts[:-1]
+        parts = parts[1:]
+        name = "_".join(parts) if parts else "name"
+        name = _re.sub(r"[^a-z0-9_]", "_", name) or "name"
+        return name
+
+    def _show_action_menu(self, btn: QPushButton) -> None:
+        menu = QMenu(self)
+
+        menu.addAction("regen").setData("regen")
+
+        menu.addSeparator()
+        bpm = menu.addMenu("BPM")
+        for label, val in [
+            ("tap",        "bpm.tap()"),
+            ("nudge +0.5", "bpm.nudge(+0.5)"),
+            ("nudge -0.5", "bpm.nudge(-0.5)"),
+            ("set 120",    "bpm.set(120)"),
+        ]:
+            bpm.addAction(label).setData(val)
+
+        menu.addSeparator()
+        presets = menu.addMenu("Presets")
+        presets.addAction("next").setData("link_preset.next()")
+        presets.addAction("prev").setData("link_preset.prev()")
+        preset_names = self._lm.list_link_presets()
+        if preset_names:
+            presets.addSeparator()
+            for name in preset_names:
+                presets.addAction(name).setData(f"link_preset('{name}')")
+
+        menu.addSeparator()
+        p_name = self._derive_p_name()
+        params = menu.addMenu("Parameters")
+        for label, fn in [
+            ("toggle",   "toggle"),
+            ("gate on",  "gate_on"),
+            ("gate off", "gate_off"),
+        ]:
+            params.addAction(label).setData(f"{fn}('p.{p_name}')")
+
+        enum_props = [d for d in self._pm.all_props() if d.choices]
+        if enum_props:
+            menu.addSeparator()
+            set_menu = menu.addMenu("Set value")
+            for defn in enum_props:
+                prop_sub = set_menu.addMenu(defn.key)
+                for choice in defn.choices:
+                    prop_sub.addAction(str(choice)).setData(
+                        f"set({defn.key}, {str(choice)!r})"
+                    )
+
+        menu.addSeparator()
+        vals = menu.addMenu("Values")
+        vals.addAction("snap_bind  — capture values & assign to next input").setData("snap_bind()")
+        snap_names = self._lm.list_value_snapshots()
+        if snap_names:
+            vals.addSeparator()
+            for name in snap_names:
+                vals.addAction(name).setData(f"values_snap('{name}')")
+
+        menu.addSeparator()
+        vid = menu.addMenu("Video")
+        for i in range(4):
+            vid.addAction(f"switch {i}").setData(f"video.switch({i})")
+
+        def _on_triggered(action) -> None:
+            text = action.data()
+            if text:
+                self._action.setText(text)
+
+        menu.triggered.connect(_on_triggered)
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def result_link(self) -> EventLink:
         return EventLink(
@@ -645,91 +916,6 @@ class ThresholdDialog(_BaseDialog):
             min_interval_s = self._min_interval.value(),
         )
 
-
-# ── Parameter ─────────────────────────────────────────────────────────────────
-
-class ParameterDialog(_BaseDialog):
-    def __init__(self, lm: LinkManager, defn: ParameterDef | None = None, parent=None):
-        super().__init__("Parameter" if defn is None else "Edit Parameter", parent)
-        self.setMinimumWidth(420)
-
-        self._name = QLineEdit()
-        self._name.setPlaceholderText("scene_toggle")
-        if defn:
-            self._name.setText(defn.name)
-        self._row("Name:", self._name)
-
-        self._kind = QComboBox()
-        self._kind.addItems(list(_PARAMETER_KINDS))
-        if defn:
-            idx = self._kind.findText(defn.kind)
-            if idx >= 0:
-                self._kind.setCurrentIndex(idx)
-        self._row("Kind:", self._kind)
-
-        self._trigger = QLineEdit()
-        self._trigger.setPlaceholderText("audio.onset")
-        if defn:
-            self._trigger.setText(defn.trigger)
-        self._trigger.setCompleter(_make_completer(_event_completions(lm), self))
-        self._row("Trigger:", self._trigger)
-
-        self._off_event = QLineEdit()
-        self._off_event.setPlaceholderText("midi.note36.off")
-        if defn and defn.off_event:
-            self._off_event.setText(defn.off_event)
-        self._off_event.setCompleter(_make_completer(_event_completions(lm), self))
-        self._off_event_widget = self._cond_row("Off Event:", self._off_event)
-
-        self._wrap_at = QSpinBox()
-        self._wrap_at.setRange(2, 64)
-        self._wrap_at.setValue(defn.wrap_at if defn else 8)
-        self._wrap_at_widget = self._cond_row("Wrap At:", self._wrap_at)
-
-        self._pulse_ms = QDoubleSpinBox()
-        self._pulse_ms.setRange(1.0, 10000.0)
-        self._pulse_ms.setSingleStep(10.0)
-        self._pulse_ms.setDecimals(1)
-        self._pulse_ms.setValue(defn.pulse_ms if defn else 100.0)
-        self._pulse_ms_widget = self._cond_row("Pulse (ms):", self._pulse_ms)
-
-        self._snap_n = QSpinBox()
-        self._snap_n.setRange(0, 16)
-        self._snap_n.setValue(defn.snap_n if defn else 0)
-        self._snap_n_widget = self._cond_row("Snap N:", self._snap_n)
-
-        self._add_buttons()
-
-        self._kind.currentTextChanged.connect(self._update_visibility)
-        self._update_visibility(self._kind.currentText())
-
-    def _cond_row(self, label: str, widget: QWidget) -> QWidget:
-        container = QWidget()
-        r = QHBoxLayout(container)
-        r.setContentsMargins(0, 0, 0, 0)
-        lbl = QLabel(label)
-        lbl.setMinimumWidth(110)
-        r.addWidget(lbl)
-        r.addWidget(widget, 1)
-        self._layout.addWidget(container)
-        return container
-
-    def _update_visibility(self, kind: str) -> None:
-        self._off_event_widget.setVisible(kind in ("gate", "latch"))
-        self._wrap_at_widget.setVisible(kind == "counter")
-        self._pulse_ms_widget.setVisible(kind == "pulse")
-        self._snap_n_widget.setVisible(kind == "counter")
-
-    def result_def(self) -> ParameterDef:
-        return ParameterDef(
-            name      = self._name.text().strip(),
-            kind      = self._kind.currentText(),
-            trigger   = self._trigger.text().strip(),
-            off_event = self._off_event.text().strip() or None,
-            wrap_at   = self._wrap_at.value(),
-            pulse_ms  = self._pulse_ms.value(),
-            snap_n    = self._snap_n.value(),
-        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -952,10 +1138,13 @@ class ChannelsModel(QStandardItemModel):
                     | Qt.ItemFlag.ItemIsEditable
                 )
 
-                # Col 3: Live Value — read-only, populated by refresh timer
+                # Col 3: Live Value — editable in value mode, read-only in expression mode
                 live_item = QStandardItem("")
                 live_item.setForeground(QColor("#5eaeff"))
-                live_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                _live_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                if lm.get_mode() == "value":
+                    _live_flags |= Qt.ItemFlag.ItemIsEditable
+                live_item.setFlags(_live_flags)
 
                 # Col 4: Expression — editable
                 expr_item = QStandardItem(expr)
@@ -1020,15 +1209,20 @@ class _ChannelsDelegate(QStyledItemDelegate):
         self._lm    = lm
         self._pm    = pm
 
-    def _prop_defn_for(self, proxy_index):
+    def _defn_at(self, proxy_index):
+        """Return PM prop def for the row at any column."""
         src = self._proxy.mapToSource(proxy_index)
-        if src.column() != ChannelsModel.COL_DEF:
-            return None
         key_item = self._model.itemFromIndex(src.siblingAtColumn(ChannelsModel.COL_KEY))
         if key_item is None:
             return None
         full_key = key_item.data(Qt.ItemDataRole.UserRole) or key_item.text()
         return self._pm._defs.get(full_key)
+
+    def _prop_defn_for(self, proxy_index):
+        src = self._proxy.mapToSource(proxy_index)
+        if src.column() != ChannelsModel.COL_DEF:
+            return None
+        return self._defn_at(proxy_index)
 
     def _choices_for(self, proxy_index) -> list | None:
         defn = self._prop_defn_for(proxy_index)
@@ -1046,6 +1240,20 @@ class _ChannelsDelegate(QStyledItemDelegate):
             editor.textChanged.connect(self._emit_preview)
             editor.destroyed.connect(lambda *_: self.previewEnded.emit())
             return editor
+        if src.column() == ChannelsModel.COL_LIVE:
+            if self._lm.get_mode() != "value":
+                return None
+            defn = self._defn_at(index)
+            if defn is not None and defn.type is bool:
+                cb = QCheckBox(parent)
+                cb.clicked.connect(lambda _checked: self.commitData.emit(cb))
+                return cb
+            if defn is not None and defn.choices:
+                combo = QComboBox(parent)
+                combo.addItems([str(c) for c in defn.choices])
+                combo.activated.connect(lambda _: self.commitData.emit(combo))
+                return combo
+            return QLineEdit(parent)
         if self._is_bool_for(index):
             cb = QCheckBox(parent)
             cb.clicked.connect(lambda _checked: self.commitData.emit(cb))
@@ -1143,6 +1351,24 @@ class ChannelsTab(QWidget):
         sep_pre.setObjectName("sep")
         lo.addWidget(sep_pre)
 
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(4)
+        mode_lbl = QLabel("Mode:")
+        mode_lbl.setMinimumWidth(50)
+        mode_row.addWidget(mode_lbl)
+        self._expr_btn = QPushButton("Expression")
+        self._expr_btn.setObjectName("mode_btn")
+        self._expr_btn.setCheckable(True)
+        self._vals_mode_btn = QPushButton("Values")
+        self._vals_mode_btn.setObjectName("mode_btn")
+        self._vals_mode_btn.setCheckable(True)
+        self._expr_btn.clicked.connect(lambda: self._set_mode("expression"))
+        self._vals_mode_btn.clicked.connect(lambda: self._set_mode("value"))
+        mode_row.addWidget(self._expr_btn)
+        mode_row.addWidget(self._vals_mode_btn)
+        mode_row.addStretch()
+        lo.addLayout(mode_row)
+
         preset_row = QHBoxLayout()
         preset_row.setSpacing(4)
 
@@ -1195,6 +1421,8 @@ class ChannelsTab(QWidget):
             self._refresh_preset_combo()
         if hasattr(self, "_snapshot_combo"):
             self._refresh_snapshot_combo()
+        if hasattr(self, "_expr_btn"):
+            self._refresh_mode_buttons()
 
     def _close_persistent_editors(self) -> None:
         for key, (grp_item, child_row) in self._model.row_for_key.items():
@@ -1271,12 +1499,22 @@ class ChannelsTab(QWidget):
         """Update the Live Value column; skips unchanged cells to suppress repaints."""
         if not hasattr(self, "_model"):
             return
+        is_value = self._lm.get_mode() == "value"
         self._updating = True
         try:
             for key, (grp_item, child_row) in self._model.row_for_key.items():
                 expr_item = grp_item.child(child_row, ChannelsModel.COL_EXPR)
                 live_item = grp_item.child(child_row, ChannelsModel.COL_LIVE)
                 expr_text = expr_item.text().strip() if expr_item is not None else ""
+
+                if is_value:
+                    try:
+                        new_text = f"{self._pm.get(key):.4f}"
+                    except (TypeError, ValueError):
+                        new_text = str(self._pm.get(key))
+                    self._set_cell_style(live_item, new_text, _FG_BLUE, "")
+                    self._set_cell_style(expr_item, None, _FG_GREY, "")
+                    continue
 
                 if not expr_text:
                     try:
@@ -1424,6 +1662,8 @@ class ChannelsTab(QWidget):
         if not name:
             return
         self._lm.load_value_snapshot(name, self._pm)
+        self._refresh_mode_buttons()
+        self._apply_mode_visuals()
         self.changed.emit()
 
     def _delete_snapshot(self) -> None:
@@ -1433,6 +1673,32 @@ class ChannelsTab(QWidget):
         self._lm.delete_value_snapshot(name)
         self._refresh_snapshot_combo()
         self.changed.emit()
+
+    # ── Mode toggle ───────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode: str) -> None:
+        self._lm.set_mode(mode)
+        self._refresh_mode_buttons()
+        self._apply_mode_visuals()
+        self.changed.emit()
+
+    def _refresh_mode_buttons(self) -> None:
+        is_expr = self._lm.get_mode() == "expression"
+        self._expr_btn.setChecked(is_expr)
+        self._vals_mode_btn.setChecked(not is_expr)
+
+    def _apply_mode_visuals(self) -> None:
+        """Update Live column editability after a mode change without full rebuild."""
+        is_value = self._lm.get_mode() == "value"
+        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        self._updating = True
+        try:
+            for _key, (grp_item, child_row) in self._model.row_for_key.items():
+                live_item = grp_item.child(child_row, ChannelsModel.COL_LIVE)
+                if live_item is not None:
+                    live_item.setFlags(base | Qt.ItemFlag.ItemIsEditable if is_value else base)
+        finally:
+            self._updating = False
 
     # ── Filter bar (layout inserted by Stage 6) ───────────────────────────────
 
@@ -1579,11 +1845,50 @@ class ChannelsTab(QWidget):
                 self._lm.apply_baseline(key, self._pm)
             self.changed.emit()
 
+        elif col == ChannelsModel.COL_LIVE:
+            if self._lm.get_mode() != "value":
+                return
+            text = item.text().strip()
+            defn = self._pm._defs.get(key)
+            val = None
+            parsed = False
+            if defn is not None and defn.type is bool:
+                if text.lower() in ("true", "1", "yes", "on"):
+                    val, parsed = True, True
+                elif text.lower() in ("false", "0", "no", "off"):
+                    val, parsed = False, True
+            elif defn is not None and defn.choices and text in [str(c) for c in defn.choices]:
+                val, parsed = text, True
+            if not parsed:
+                try:
+                    val = float(text)
+                    parsed = True
+                except ValueError:
+                    pass
+            if not parsed:
+                self._updating = True
+                try:
+                    current = self._pm.get(key)
+                    if isinstance(current, bool):
+                        item.setText(str(current))
+                    else:
+                        try:
+                            item.setText(f"{float(current):.4f}")
+                        except (TypeError, ValueError):
+                            item.setText(str(current))
+                finally:
+                    self._updating = False
+                return
+            self._pm.set(key, val)
+            self._lm.set_baseline(key, val)
+            self.changed.emit()
+
 
 # ── Events (EventLinks + Thresholds) ─────────────────────────────────────────
 
 class EventsTab(QWidget):
-    changed = Signal()
+    changed        = Signal()
+    snapshot_saved = Signal()  # emitted when a snapshot is created here
 
     def __init__(self, lm: LinkManager, pm: "PropertyManager", parent=None):
         super().__init__(parent)
@@ -1608,45 +1913,29 @@ class EventsTab(QWidget):
         rm_el = QPushButton("Remove")
         rm_el.setObjectName("remove")
         rm_el.clicked.connect(self._remove_event_link)
-        midi_btn = QPushButton("+ Midi")
-        midi_btn.setObjectName("add")
-        midi_btn.setToolTip("Wait for the next MIDI note, then open a new event link pre-filled with that event.")
-        midi_btn.clicked.connect(self._capture_midi)
-        key_btn = QPushButton("+ Key")
-        key_btn.setObjectName("add")
-        key_btn.setToolTip("Press a key to create an event link pre-filled with that key event.")
-        key_btn.clicked.connect(self._capture_key)
-        choice_btn = QPushButton("+ Choice")
-        choice_btn.setObjectName("add")
-        choice_btn.setToolTip("Pick an enum sink and one of its choices, then press a key to "
-                               "create a key → choice event link.")
-        choice_btn.clicked.connect(self._capture_choice)
-        recall_btn = QPushButton("Recall Preset")
-        recall_btn.setObjectName("add")
-        recall_btn.setToolTip("Add an event link that recalls a saved link preset.")
-        recall_btn.clicked.connect(self._recall_preset)
-
+        snap_bind_btn = QPushButton("Snap → Bind")
+        snap_bind_btn.setObjectName("trigger")
+        snap_bind_btn.setToolTip(
+            "Capture current parameter values as a new snapshot,\n"
+            "then press a key or MIDI note to assign recall of that snapshot."
+        )
+        snap_bind_btn.clicked.connect(self._create_and_assign_snapshot)
         tb1.addWidget(add_el)
         tb1.addWidget(edit_el)
         tb1.addWidget(rm_el)
-        tb1.addWidget(midi_btn)
-        tb1.addWidget(key_btn)
-        tb1.addWidget(choice_btn)
-        tb1.addWidget(recall_btn)
+        tb1.addSpacing(12)
+        tb1.addWidget(snap_bind_btn)
         tb1.addStretch()
-
-        self._capture_status = QLabel("")
-        self._capture_status.setObjectName("ok")
-        tb1.addWidget(self._capture_status)
 
         lo.addLayout(tb1)
 
-        self._el_table = _make_table(["On", "Event", "Action", "Condition"])
+        self._el_table = _make_table(["On", "Event", "Action", "Condition", "Value"])
         el_hh = self._el_table.horizontalHeader()
         el_hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         el_hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         el_hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         el_hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        el_hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self._el_table.doubleClicked.connect(self._edit_event_link)
         lo.addWidget(self._el_table)
 
@@ -1696,6 +1985,12 @@ class EventsTab(QWidget):
         self._recent_events: dict[str, float] = {}
         self._bus_tokens: list[int] = []
 
+        # Permanent subscription for snap_bind() action fired from event links.
+        # Uses QTimer to hop back to the Qt thread (drain() runs on the GL thread).
+        def _on_snap_bind(_payload):
+            QTimer.singleShot(0, self._create_and_assign_snapshot)
+        self._snap_bind_token = self._lm.event_bus.subscribe("_snap_bind", _on_snap_bind)
+
         self._rebuild()
 
         self._flash_timer = QTimer(self)
@@ -1703,70 +1998,10 @@ class EventsTab(QWidget):
         self._flash_timer.timeout.connect(self._update_flash)
         self._flash_timer.start()
 
-    # ── MIDI capture ──────────────────────────────────────────────────────────
-
-    def _capture_midi(self) -> None:
-        try:
-            from midi_input import get_router
-            router = get_router()
-        except Exception:
-            self._capture_status.setText("no MIDI router")
-            return
-
-        self._capture_status.setText("waiting for MIDI…")
-        self._capture_status.setObjectName("info")
-        self._capture_status.style().unpolish(self._capture_status)
-        self._capture_status.style().polish(self._capture_status)
-
-        def _on_event(evt: dict) -> None:
-            if evt.get("type") != "note":
-                return
-            if evt.get("value", 0) == 0:  # skip note-off; wait for note-on
-                return
-            router.remove_listener(_on_event)
-            note = evt["number"]
-            event_str = f"midi.note{note}.on"
-            # Marshal back to Qt thread
-            QTimer.singleShot(0, lambda: self._open_with_event(event_str))
-            # self._open_with_event(event_str)
-
-        router.add_listener(_on_event)
-
-    def _capture_key(self) -> None:
-        dlg = _KeyCaptureDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            event_str = dlg.captured_event()
-            if event_str:
-                self._open_with_event(event_str)
-
-    def _capture_choice(self) -> None:
-        if not any(d.choices for d in self._pm.all_props()):
-            self._capture_status.setText("no enum sinks")
-            return
-        choice_dlg = _ChoiceCaptureDialog(self._pm, self)
-        if choice_dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        picked = choice_dlg.result()
-        if picked is None:
-            return
-        sink_key, choice = picked
-
-        key_dlg = _KeyCaptureDialog(self)
-        if key_dlg.exec() == QDialog.DialogCode.Accepted:
-            event_str = key_dlg.captured_event()
-            if event_str:
-                self._open_with_event(event_str, f"set({sink_key}, {choice!r})")
-
-    def _open_with_event(self, event_str: str, action_str: str = "") -> None:
-        self._capture_status.setText("")
-        prefilled = EventLink(event=event_str, action=action_str, enabled=True)
-        dlg = EventLinkDialog(self._lm, self._pm, link=prefilled, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            link = dlg.result_link()
-            if link.event and link.action:
-                self._lm.add_event_link(link)
-                self._rebuild()
-                self.changed.emit()
+        self._val_timer = QTimer(self)
+        self._val_timer.setInterval(100)
+        self._val_timer.timeout.connect(self._refresh_value_column)
+        self._val_timer.start()
 
     # ── rebuild ───────────────────────────────────────────────────────────────
 
@@ -1778,6 +2013,9 @@ class EventsTab(QWidget):
             self._el_table.setItem(r, 1, _cell(link.event))
             self._el_table.setItem(r, 2, _cell(link.action))
             self._el_table.setItem(r, 3, _cell(link.condition or ""))
+            p_name = _p_name_from_action(link.action)
+            val_text = _fmt_p_val(self._lm._p_values.get(p_name, 0.0)) if p_name else ""
+            self._el_table.setItem(r, 4, _cell(val_text))
 
         defs = self._lm._threshold_defs
         self._th_table.setRowCount(len(defs))
@@ -1802,6 +2040,18 @@ class EventsTab(QWidget):
             def _cb(_payload, _eid=eid):
                 QTimer.singleShot(0, lambda e=_eid: self._flash_event(e))
             self._bus_tokens.append(self._lm.event_bus.subscribe(eid, _cb))
+
+    def _refresh_value_column(self) -> None:
+        links = self._lm._event_links
+        n = min(self._el_table.rowCount(), len(links))
+        for r in range(n):
+            p_name = _p_name_from_action(links[r].action)
+            if p_name is None:
+                continue
+            new_text = _fmt_p_val(self._lm._p_values.get(p_name, 0.0))
+            item = self._el_table.item(r, 4)
+            if item is not None and item.text() != new_text:
+                item.setText(new_text)
 
     def _flash_event(self, event_id: str) -> None:
         self._recent_events[event_id] = time.monotonic()
@@ -1830,12 +2080,13 @@ class EventsTab(QWidget):
 
     def _add_event_link(self) -> None:
         dlg = EventLinkDialog(self._lm, self._pm, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            link = dlg.result_link()
-            if link.event and link.action:
-                self._lm.add_event_link(link)
-                self._rebuild()
-                self.changed.emit()
+        dlg.link_added.connect(self._on_dialog_link_added)
+        dlg.exec()
+
+    def _on_dialog_link_added(self, link) -> None:
+        self._lm.add_event_link(link)
+        self._rebuild()
+        self.changed.emit()
 
     def _edit_event_link(self) -> None:
         row = self._el_table.currentRow()
@@ -1857,40 +2108,30 @@ class EventsTab(QWidget):
         self._rebuild()
         self.changed.emit()
 
-    def _recall_preset(self) -> None:
-        names = self._lm.list_link_presets()
-        if not names:
-            self._capture_status.setText("no presets saved")
-            return
-        picker = QDialog(self)
-        picker.setWindowTitle("Recall Preset")
-        picker.setStyleSheet(_STYLESHEET)
-        plo = QVBoxLayout(picker)
-        plo.setContentsMargins(12, 12, 12, 12)
-        plo.setSpacing(8)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Preset:"))
-        combo = QComboBox()
-        combo.addItems(names)
-        row.addWidget(combo, 1)
-        plo.addLayout(row)
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.accepted.connect(picker.accept)
-        btns.rejected.connect(picker.reject)
-        plo.addWidget(btns)
-        if picker.exec() == QDialog.DialogCode.Accepted:
-            preset_name = combo.currentText()
-            if preset_name:
-                prefilled = EventLink(event="", action=f"link_preset('{preset_name}')", enabled=True)
-                dlg = EventLinkDialog(self._lm, self._pm, link=prefilled, parent=self)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    link = dlg.result_link()
-                    if link.event and link.action:
-                        self._lm.add_event_link(link)
-                        self._rebuild()
-                        self.changed.emit()
+    # ── Snapshot capture & bind ───────────────────────────────────────────────
+
+    def _next_snapshot_name(self) -> str:
+        existing = set(self._lm.list_value_snapshots())
+        i = 1
+        while f"snapshot-{i}" in existing:
+            i += 1
+        return f"snapshot-{i}"
+
+    def _create_and_assign_snapshot(self) -> None:
+        name = self._next_snapshot_name()
+        self._lm.save_value_snapshot(name, self._pm)
+        self.snapshot_saved.emit()
+        self.changed.emit()
+
+        dlg = _AssignSnapshotCaptureDialog(name, self._lm, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            event_str = dlg.captured_event()
+            if event_str:
+                self._lm.add_event_link(
+                    EventLink(event=event_str, action=f"values_snap('{name}')", enabled=True)
+                )
+                self._rebuild()
+                self.changed.emit()
 
     # Threshold CRUD
 
@@ -2109,112 +2350,13 @@ class LFOsTab(QWidget):
         self.changed.emit()
 
 
-# ── Parameters ────────────────────────────────────────────────────────────────
-
-class ParametersTab(QWidget):
-    changed = Signal()
-
-    def __init__(self, lm: LinkManager, parent=None):
-        super().__init__(parent)
-        self._lm = lm
-
-        lo = QVBoxLayout(self)
-        lo.setContentsMargins(4, 4, 4, 4)
-
-        tb = QHBoxLayout()
-        add_btn = QPushButton("+ Add")
-        add_btn.setObjectName("add")
-        add_btn.clicked.connect(self._add)
-        edit_btn = QPushButton("Edit")
-        edit_btn.clicked.connect(self._edit)
-        rm_btn = QPushButton("Remove")
-        rm_btn.setObjectName("remove")
-        rm_btn.clicked.connect(self._remove)
-        tb.addWidget(add_btn)
-        tb.addWidget(edit_btn)
-        tb.addWidget(rm_btn)
-        tb.addStretch()
-        lo.addLayout(tb)
-
-        self._table = _make_table(["Name", "Kind", "Trigger", "Off Event", "State"])
-        hh = self._table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.doubleClicked.connect(self._edit)
-        lo.addWidget(self._table)
-
-        info = QLabel("p.<name> values visible in Sources tab.")
-        info.setObjectName("info")
-        lo.addWidget(info)
-
-        self._live_timer = QTimer(self)
-        self._live_timer.setInterval(100)
-        self._live_timer.timeout.connect(self._refresh_state_column)
-        self._live_timer.start()
-
-        self._rebuild()
-
-    def _rebuild(self) -> None:
-        defs = self._lm._parameter_defs
-        self._table.setRowCount(len(defs))
-        for r, d in enumerate(defs):
-            self._table.setItem(r, 0, _cell(d.name))
-            self._table.setItem(r, 1, _cell(d.kind))
-            self._table.setItem(r, 2, _cell(d.trigger))
-            self._table.setItem(r, 3, _cell(d.off_event or ""))
-            self._table.setItem(r, 4, _cell(""))
-
-    def _refresh_state_column(self) -> None:
-        snap = self._lm.source_registry.snapshot()
-        defs = self._lm._parameter_defs
-        for r, d in enumerate(defs):
-            val = snap.get(f"p.{d.name}", 0.0)
-            new_text = f"{val:.4f}"
-            item = self._table.item(r, 4)
-            if item is not None and item.text() != new_text:
-                item.setText(new_text)
-
-    def _add(self) -> None:
-        dlg = ParameterDialog(self._lm, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            defn = dlg.result_def()
-            if defn.name and defn.trigger:
-                self._lm.add_parameter(defn)
-                self._rebuild()
-                self.changed.emit()
-
-    def _edit(self) -> None:
-        row = self._table.currentRow()
-        if row < 0 or row >= len(self._lm._parameter_defs):
-            return
-        old = self._lm._parameter_defs[row]
-        dlg = ParameterDialog(self._lm, defn=old, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_def = dlg.result_def()
-            self._lm.remove_parameter(old.name)
-            self._lm.add_parameter(new_def)
-            self._rebuild()
-            self.changed.emit()
-
-    def _remove(self) -> None:
-        row = self._table.currentRow()
-        if row < 0 or row >= len(self._lm._parameter_defs):
-            return
-        defn = self._lm._parameter_defs[row]
-        self._lm.remove_parameter(defn.name)
-        self._rebuild()
-        self.changed.emit()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main panel
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LinkManagerPanel(QDialog):
-    """Main panel: tabs for Channels, Parameters, Events, Envelopes, LFOs, Presets, Sources."""
+    """Main panel: tabs for Channels, Events, Envelopes, LFOs, Sources."""
 
     _STATE_PATH = pathlib.Path(__file__).with_name("link_state.json")
 
@@ -2233,14 +2375,12 @@ class LinkManagerPanel(QDialog):
 
         tabs = QTabWidget()
         self._channels_tab = ChannelsTab(lm, pm)
-        self._param_tab    = ParametersTab(lm)
         self._evt_tab      = EventsTab(lm, pm)
         self._env_tab      = EnvelopesTab(lm)
         self._lfo_tab      = LFOsTab(lm)
         self._src_tab      = SourcesTab(lm)
 
         tabs.addTab(self._channels_tab, "Channels")
-        tabs.addTab(self._param_tab,    "Parameters")
         tabs.addTab(self._evt_tab,      "Events")
         tabs.addTab(self._env_tab,      "Envelopes")
         tabs.addTab(self._lfo_tab,      "LFOs")
@@ -2265,10 +2405,10 @@ class LinkManagerPanel(QDialog):
         self._save_timer.setInterval(5000)
         self._save_timer.timeout.connect(self._save_now)
 
-        for tab in (self._channels_tab, self._param_tab, self._evt_tab,
-                    self._env_tab, self._lfo_tab):
+        for tab in (self._channels_tab, self._evt_tab, self._env_tab, self._lfo_tab):
             tab.changed.connect(self._on_changed)
 
+        self._evt_tab.snapshot_saved.connect(self._channels_tab._refresh_snapshot_combo)
         self._channels_tab.needs_rebuild.connect(self._rebuild_routing_tabs)
         self._lm._on_preset_loaded.append(
             lambda _name: QTimer.singleShot(0, self._rebuild_routing_tabs)
@@ -2298,8 +2438,7 @@ class LinkManagerPanel(QDialog):
 
     def _rebuild_routing_tabs(self) -> None:
         """Rebuild all routing tabs after a preset load changes the routing state."""
-        for tab in (self._channels_tab, self._param_tab, self._evt_tab,
-                    self._env_tab, self._lfo_tab):
+        for tab in (self._channels_tab, self._evt_tab, self._env_tab, self._lfo_tab):
             tab._rebuild()
 
     def _save_now(self) -> None:
@@ -2315,8 +2454,7 @@ class LinkManagerPanel(QDialog):
         try:
             self._lm.load_state(self._STATE_PATH)
             self._lm._load_preset_files()
-            for tab in (self._channels_tab, self._param_tab, self._evt_tab,
-                        self._env_tab, self._lfo_tab):
+            for tab in (self._channels_tab, self._evt_tab, self._env_tab, self._lfo_tab):
                 tab._rebuild()
             # Push saved baselines into PM for every property that has no active link.
             # Properties WITH an active enabled link will be overridden by evaluate_links

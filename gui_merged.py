@@ -386,10 +386,9 @@ class MergedGUI(mglw.WindowConfig):
         # ── BPM clock → source registry (before LFOs so synced LFOs see updated phase) ──
         _bpm.tick(frame_time)
 
-        # ── Tick envelopes + LFOs + parameters → source registry ─────────────
+        # ── Tick envelopes + LFOs → source registry ──────────────────────────
         self.lm.tick_envelopes(frame_time)
         self.lm.tick_lfos(frame_time)
-        self.lm.tick_parameters(frame_time)
 
         # ── Threshold detectors → EventBus ────────────────────────────────────
         self.lm.tick_thresholds()
